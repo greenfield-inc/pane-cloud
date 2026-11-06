@@ -169,8 +169,8 @@ importers:
   packages/billing:
     dependencies:
       pane-cloud-contract:
-        specifier: github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract
-        version: https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5#path:/packages/pane-cloud-contract
+        specifier: github:greenfield-inc/Pane#84e3698e7975ad4712b18bd6c7c644f17996573a&path:/packages/pane-cloud-contract
+        version: https://codeload.github.com/greenfield-inc/Pane/tar.gz/84e3698e7975ad4712b18bd6c7c644f17996573a#path:/packages/pane-cloud-contract
       pg:
         specifier: ^8.13.1
         version: 8.23.1
@@ -202,6 +202,9 @@ importers:
 
   packages/service:
     dependencies:
+      '@pane-cloud/billing':
+        specifier: workspace:*
+        version: link:../billing
       pane-cloud-contract:
         specifier: github:greenfield-inc/Pane#84e3698e7975ad4712b18bd6c7c644f17996573a&path:/packages/pane-cloud-contract
         version: https://codeload.github.com/greenfield-inc/Pane/tar.gz/84e3698e7975ad4712b18bd6c7c644f17996573a#path:/packages/pane-cloud-contract

@@ -18,6 +18,7 @@ import {
   type Team,
 } from 'pane-cloud-contract';
 import type { PoolClient } from 'pg';
+import type { Billing } from './billing';
 import { type Db, transaction } from './db';
 import type { Github } from './github';
 import { assertCanCreate, assertCanStart, type BetaConfig, betaStatus } from './beta';
@@ -56,6 +57,8 @@ export interface ServiceDeps {
   fleet: FleetClient;
   worker: Pick<Worker, 'kick'>;
   beta: BetaConfig;
+  /** Null while billing is off: every team is on the free cohort. */
+  billing: Billing | null;
 }
 
 const hashToken = (token: string) => createHash('sha256').update(token).digest();
@@ -75,7 +78,7 @@ const notOnTeam = () => new CloudApiError('not_team_member', 'This account is no
 const CALLER_SQL = `SELECT a.id, a.github_id, a.github_login, a.name, a.email, a.tailscale_login, s.team_id, s.role
   FROM accounts a LEFT JOIN seats s ON s.account_id = a.id`;
 
-export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps): BoundRoute[] {
+export function serviceHandlers({ db, github, fleet, worker, beta, billing }: ServiceDeps): BoundRoute[] {
   const view = async (row: MachineRow, usage: Machine['usage']) => machineView(row, usage, await pushWindowEndsAt(db, row, beta));
   const caller = async (token: string | null): Promise<CallerRow> => {
     const { rows } = await db.query<CallerRow>(
@@ -211,6 +214,18 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
     return { machine, entry };
   };
 
+  /** Refuses to create or start a machine while the team's bill is unpaid or its subscription has ended. */
+  const requirePaid = async (who: CallerRow) => {
+    if (!billing || !who.team_id || (await billing.machinesAllowed(who.team_id))) return;
+    throw new CloudApiError(
+      'invalid_state',
+      "Your team's Pane Cloud bill is unpaid or the subscription has ended, so machines can't start. Disks are kept.",
+      'The team owner can pay or subscribe again from Pane Cloud billing in Settings.',
+    );
+  };
+  /** Updates the team's seat count on its bill; a failure is caught up by billing's next enforce run. */
+  const syncSeats = async (teamId: string) => billing?.syncSeats(teamId).catch((error: unknown) => console.error('billing seat sync failed:', error));
+
   const userActor = (who: CallerRow) => ({ kind: 'user' as const, accountId: who.id, githubLogin: who.github_login });
   const requireState = (machine: MachineRow, state: Machine['state'], action: string) => {
     if (machine.state !== state) {
@@ -314,6 +329,7 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
         throw new CloudApiError('not_invited', "You're on the list. Pane Cloud is invite-only for now.", 'Wait for your invite, or ask a team owner to invite your GitHub login.');
       }
       assertCanCreate(beta);
+      await requirePaid(who);
       const release = await releaseFor();
       const seatTaken = () => new CloudApiError('seat_has_machine', 'Your seat already has a machine.', 'Open your existing machine, or delete it before creating another.');
       let created;
@@ -356,6 +372,7 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
       const who = await caller(token);
       assertCanStart(beta);
       const pushWindow = betaStatus(beta).phase === 'push_windows';
+      await requirePaid(who);
       const { machine, entry } = await queue(who, params.machineId ?? '', (m) => {
         requireState(m, 'stopped', 'Start');
         const reason = pushWindow ? 'You started this machine for a 60-minute push window before the beta ends.' : 'You started this machine.';
@@ -473,6 +490,7 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
     bind(r.getBilling, async ({ token }): Promise<BillingStatus> => {
       const who = await caller(token);
       const teamId = requireTeam(who);
+      if (billing) return billing.getBillingStatus(teamId, who.id);
       const { rows } = await db.query<{ founding: boolean; seats: string }>(
         'SELECT t.founding, (SELECT count(*) FROM seats s WHERE s.team_id = t.id) AS seats FROM teams t WHERE t.id = $1',
         [teamId],
@@ -530,7 +548,7 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
     bind(r.acceptInvite, async ({ token, params }) => {
       const who = await caller(token);
       if (who.team_id) throw new CloudApiError('already_member', 'You are already on a team.', 'Leave your current team first.');
-      await transaction(db, async (client) => {
+      const teamId = await transaction(db, async (client) => {
         const { rows } = await client.query<InviteRow & { founding: boolean }>(
           `SELECT i.*, t.founding FROM invites i JOIN teams t ON t.id = i.team_id
            WHERE i.id = $1 AND i.status = 'pending' AND i.expires_at > now() AND lower(i.github_login) = lower($2) FOR UPDATE OF i`,
@@ -544,7 +562,9 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
           [who.id, invite.team_id, invite.founding],
         );
         if (seat.rowCount === 0) throw new CloudApiError('already_member', 'You are already on a team.', 'Leave your current team first.');
+        return invite.team_id;
       });
+      await syncSeats(teamId);
       return accountView(await reloadCaller(who.id));
     }),
 
@@ -562,6 +582,7 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
           [accountId],
         );
       });
+      await syncSeats(teamId);
       return teamView(teamId);
     }),
 

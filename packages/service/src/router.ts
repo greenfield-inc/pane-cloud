@@ -51,7 +51,7 @@ function matchPath(pattern: string, path: string): Record<string, string> | null
   return params;
 }
 
-async function readJson(request: IncomingMessage): Promise<unknown> {
+async function readBody(request: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
@@ -61,7 +61,11 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
     if (size > MAX_BODY_BYTES) throw new BodyTooLarge();
     chunks.push(buffer);
   }
-  const text = Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
+}
+
+async function readJson(request: IncomingMessage): Promise<unknown> {
+  const text = (await readBody(request)).toString('utf8');
   if (text === '') return undefined;
   try {
     return JSON.parse(text);
@@ -88,7 +92,12 @@ function send(response: ServerResponse, status: number, body: unknown): void {
  * each answer against the route's response schema, so the service cannot drift from the contract.
  * Logs carry the method, path, status and time, never a body or a header.
  */
-export function createRouteServer(routes: BoundRoute[], log: (line: string) => void = console.log): Server {
+export interface RawRoutes {
+  /** POST /v1/billing/webhook: Stripe's raw body and Stripe-Signature header. Null while billing is off. */
+  stripeWebhook: ((body: Buffer, signature: string) => Promise<void>) | null;
+}
+
+export function createRouteServer(routes: BoundRoute[], log: (line: string) => void = console.log, raw: RawRoutes = { stripeWebhook: null }): Server {
   return createServer((request, response) => {
     const started = Date.now();
     const url = new URL(request.url ?? '/', 'http://service');
@@ -98,6 +107,20 @@ export function createRouteServer(routes: BoundRoute[], log: (line: string) => v
         if (request.method === 'GET' && url.pathname === '/healthz') {
           status = 200;
           send(response, status, { ok: true });
+          return;
+        }
+        if (request.method === 'POST' && url.pathname === '/v1/billing/webhook' && raw.stripeWebhook) {
+          const body = await readBody(request);
+          try {
+            await raw.stripeWebhook(body, String(request.headers['stripe-signature'] ?? ''));
+          } catch (error) {
+            if ((error as { type?: string }).type === 'StripeSignatureVerificationError') {
+              throw new CloudApiError('invalid_request', 'The Stripe signature does not match.', 'Send webhooks only from Stripe, signed with this endpoint secret.');
+            }
+            throw error;
+          }
+          status = 200;
+          send(response, status, { received: true });
           return;
         }
         let matched: { bound: BoundRoute; params: Record<string, string> } | null = null;

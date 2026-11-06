@@ -1,4 +1,5 @@
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
+import type { StripeGateway } from '@pane-cloud/billing';
 import { createServiceClient, type ServiceClient } from 'pane-cloud-contract';
 import { type FleetStub, startFleetStub } from 'pane-cloud-contract/stubs';
 import { Client } from 'pg';
@@ -30,7 +31,14 @@ export interface Harness {
 }
 
 /** A running service on its own fresh database, with P0's fleet stub and a fake GitHub behind it. */
-export async function startHarness(options: { fleetUrl?: string; betaEndsAt?: string } = {}): Promise<Harness> {
+export interface HarnessBilling {
+  stripe: StripeGateway;
+  webhookSecret: string;
+  outboxDir: string;
+  now: () => Date;
+}
+
+export async function startHarness(options: { fleetUrl?: string; betaEndsAt?: string; billing?: HarnessBilling } = {}): Promise<Harness> {
   const admin = new Client({ connectionString: inject('adminDatabaseUrl') });
   await admin.connect();
   const name = `pane_cloud_test_${randomBytes(6).toString('hex')}`;
@@ -55,8 +63,11 @@ export async function startHarness(options: { fleetUrl?: string; betaEndsAt?: st
         signing: { keyId: 'service-test-key', privateKeyPem: signingKeyPem },
         workerIntervalMs: 50,
         beta: { endsAt: betaEndsAt, announcementUrl: null, ownAwsTemplateUrl: null },
+        billing: options.billing
+          ? { stripeSecretKey: 'sk_test_unused', webhookSecret: options.billing.webhookSecret, returnUrl: 'https://runpane.com/cloud', outboxDir: options.billing.outboxDir, enforceIntervalMs: 3_600_000 }
+          : null,
       },
-      { log: () => undefined },
+      { log: () => undefined, billing: options.billing && { stripe: options.billing.stripe, now: options.billing.now } },
     );
   let app = await start(options.betaEndsAt ?? null, 0);
   const db = createDb(databaseUrl);
