@@ -20,13 +20,19 @@ function setup(options: { founding?: boolean; seats?: number } = {}) {
   };
   const stopped: { teamId: string; reason: string }[] = [];
   const outbox: { to: string; subject: string; text: string }[] = [];
+  let mailDown = false;
   const billing = createBilling({
     stripe: stripe.gateway,
     webhookSecret: stripe.webhookSecret,
     store: createMemoryStore(),
     teams: { getTeam: async (id) => (id === team.id ? team : null), listTeamIds: async () => [team.id] },
     machines: { stopTeamMachines: async (teamId, reason) => void stopped.push({ teamId, reason }) },
-    mailer: { send: async (mail) => void outbox.push(mail) },
+    mailer: {
+      send: async (mail) => {
+        if (mailDown) throw new Error('mailer down');
+        outbox.push(mail);
+      },
+    },
     returnUrl: 'https://runpane.com/cloud',
     now: () => now,
   });
@@ -37,6 +43,7 @@ function setup(options: { founding?: boolean; seats?: number } = {}) {
     stopped,
     outbox,
     advance: (ms: number) => (now = new Date(now.getTime() + ms)),
+    setMailDown: (down: boolean) => void (mailDown = down),
     /** The owner opens their manage link and pays in Checkout; Stripe then sends its webhooks. */
     addCard: async () => {
       const status = await billing.getBillingStatus(team.id, team.ownerAccountId);
@@ -108,6 +115,30 @@ describe('the billing notice', () => {
     t.team.ownerEmail = 'owner@example.com';
     expect(await t.billing.announceCharges(startAt)).toEqual({ emailed: 1, noEmail: [] });
     expect(t.outbox.map((m) => m.to)).toEqual(['owner@example.com']);
+  });
+
+  test('saves no start date when no email could be sent', async () => {
+    const t = setup();
+    t.setMailDown(true);
+    await expect(t.billing.announceCharges(new Date(NOV_5.getTime() + 14 * DAY))).rejects.toThrow(/mailer down/);
+    expect(await t.status()).toMatchObject({ chargesStartAt: null, manageUrl: null });
+  });
+
+  test('refuses to move the start date once the notice is out', async () => {
+    const t = setup();
+    await t.billing.announceCharges(new Date(NOV_5.getTime() + 14 * DAY));
+    await expect(t.billing.announceCharges(new Date(NOV_5.getTime() + 30 * DAY))).rejects.toThrow(/already/);
+    expect((await t.status()).chargesStartAt).toBe('2026-11-19T12:00:00.000Z');
+  });
+
+  test('a rerun after the start date emails owners who had no notice yet', async () => {
+    const t = setup();
+    t.team.ownerEmail = null;
+    const startAt = new Date(NOV_5.getTime() + 14 * DAY);
+    await t.billing.announceCharges(startAt);
+    t.advance(20 * DAY);
+    t.team.ownerEmail = 'owner@example.com';
+    expect(await t.billing.announceCharges(startAt)).toEqual({ emailed: 1, noEmail: [] });
   });
 
   test('refuses a start date that is not in the future', async () => {
@@ -184,6 +215,17 @@ describe('charges', () => {
     await t.deliver(t.stripe.advanceTo(new Date(NOV_5.getTime() + 14 * DAY)));
     expect(t.stripe.invoices()).toEqual([{ amountCents: 9800, paid: true }]);
     expect((await t.status()).seats).toBe(2);
+  });
+});
+
+describe('a team created after the notice', () => {
+  test('pays the standard price, and gets 7 days of grace from its own creation', async () => {
+    const t = setup();
+    await t.billing.announceCharges(new Date(NOV_5.getTime() + 14 * DAY));
+    t.advance(30 * DAY);
+    t.team.createdAt = new Date(NOV_5.getTime() + 30 * DAY);
+    t.stripe.setStandardSeatCents(5900);
+    expect(await t.status()).toMatchObject({ foundingPriceLocked: false, seatPriceCents: 5900, status: 'grace', graceEndsAt: '2026-12-12T12:00:00.000Z' });
   });
 });
 

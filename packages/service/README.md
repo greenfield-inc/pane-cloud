@@ -77,7 +77,7 @@ with the signing key's public half in its `trustedKeys`. The tests do exactly th
 | `cohort add <github-login> [note]` | Lets a GitHub login into the cohort |
 | `cohort remove <github-login>` | Takes a login out of the cohort; teams and machines it already has stay |
 | `cohort list` | Lists the cohort |
-| `billing announce <start-date-iso>` | Sets the date charges start and emails every team owner who hasn't had the notice. Needs the billing variables |
+| `billing announce <start-date-iso>` | Sets the date charges start and emails every team owner who hasn't had the notice, listing teams whose owner has no email. Rerun with the same date to reach later teams; the date can't change once sent. Needs the billing variables |
 
 ## Tests
 

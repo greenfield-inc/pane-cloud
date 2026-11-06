@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { assertTestModeKey } from '@pane-cloud/billing';
 import type { BetaConfig } from './beta';
 
 /** B1 billing, on when STRIPE_SECRET_KEY is set. Test mode only: live keys are refused. */
@@ -33,15 +34,22 @@ export interface ServiceConfig {
   billing: BillingConfig | null;
 }
 
+function positiveMs(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const value = Number(env[name] ?? fallback);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`Set ${name} to a positive number of milliseconds, or leave it unset.`);
+  return value;
+}
+
 export function billingFromEnv(env: NodeJS.ProcessEnv): BillingConfig | null {
   const stripeSecretKey = env.STRIPE_SECRET_KEY;
   if (!stripeSecretKey) return null;
+  assertTestModeKey(stripeSecretKey);
   return {
     stripeSecretKey,
     webhookSecret: required(env, 'STRIPE_WEBHOOK_SECRET'),
     returnUrl: env.BILLING_RETURN_URL ?? 'https://runpane.com/cloud',
     outboxDir: env.BILLING_OUTBOX_DIR ?? null,
-    enforceIntervalMs: Number(env.BILLING_ENFORCE_INTERVAL_MS ?? 300_000),
+    enforceIntervalMs: positiveMs(env, 'BILLING_ENFORCE_INTERVAL_MS', 300_000),
   };
 }
 

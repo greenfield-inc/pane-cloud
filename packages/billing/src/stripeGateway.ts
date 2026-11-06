@@ -39,7 +39,7 @@ export interface StripeGateway {
 
 export function assertTestModeKey(secretKey: string): void {
   if (/^(sk|rk)_live_/.test(secretKey)) {
-    throw new Error('Pane Cloud billing runs in Stripe test mode only. Live charges wait for Parsa to approve live mode.');
+    throw new Error('Pane Cloud billing runs in Stripe test mode only. Live charges stay off until live mode is approved.');
   }
 }
 

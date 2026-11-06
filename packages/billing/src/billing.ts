@@ -5,6 +5,8 @@ import { PRICE_LOOKUP_KEYS, type SeatPrice, type StripeGateway } from './stripeG
 
 const DAY_MS = 86_400_000;
 export const GRACE_DAYS = 7;
+/** Seat prices change only when an operator moves a lookup key, so a few minutes of caching is safe. */
+const PRICE_CACHE_MS = 10 * 60_000;
 
 /** What billing reads from the service's team tables. */
 export interface BillingTeam {
@@ -45,21 +47,34 @@ export function createBilling(deps: BillingDeps) {
     return team;
   }
 
-  async function seatPrice(team: BillingTeam): Promise<SeatPrice> {
-    return stripe.findPrice(team.founding ? PRICE_LOOKUP_KEYS.founding : PRICE_LOOKUP_KEYS.standard);
+  /** Founding means the team joined during the free cohort, before the notice went out. */
+  const isFounding = (team: BillingTeam, notice: BillingNotice | null) => team.founding && (!notice || team.createdAt < notice.issuedAt);
+
+  /** When charges start for this team: the notice's date, or the team's creation if it came later. */
+  const teamStart = (team: BillingTeam, notice: BillingNotice) => (team.createdAt > notice.chargesStartAt ? team.createdAt : notice.chargesStartAt);
+
+  const prices = new Map<string, { price: SeatPrice; fetchedAt: number }>();
+  async function seatPrice(team: BillingTeam, notice: BillingNotice | null): Promise<SeatPrice> {
+    const key = isFounding(team, notice) ? PRICE_LOOKUP_KEYS.founding : PRICE_LOOKUP_KEYS.standard;
+    const cached = prices.get(key);
+    if (cached && now().getTime() - cached.fetchedAt < PRICE_CACHE_MS) return cached.price;
+    const price = await stripe.findPrice(key);
+    prices.set(key, { price, fetchedAt: now().getTime() });
+    return price;
   }
 
   /** The team's billing state, derived from Stripe's last word, the notice and the clock. */
-  function derive(record: BillingRecord, notice: BillingNotice | null): Pick<BillingStatus, 'plan' | 'status' | 'graceEndsAt'> {
+  function derive(record: BillingRecord, notice: BillingNotice | null, team: BillingTeam): Pick<BillingStatus, 'plan' | 'status' | 'graceEndsAt'> {
     const t = now();
     const sub = record.subscription;
-    const started = notice !== null && t >= notice.chargesStartAt;
+    const startAt = notice && teamStart(team, notice);
+    const started = startAt !== null && t >= startAt;
     const grace = (endsAt: Date) => ({ status: t < endsAt ? ('grace' as const) : ('past_due' as const), graceEndsAt: endsAt.toISOString() });
 
     if (!sub || sub.status === 'canceled' || sub.status === 'incomplete_expired') {
       if (sub) return { plan: 'paid', status: 'canceled', graceEndsAt: null };
-      if (!notice || !started) return { plan: 'cohort', status: 'free', graceEndsAt: null };
-      return { plan: 'paid', ...grace(new Date(notice.chargesStartAt.getTime() + GRACE_DAYS * DAY_MS)) };
+      if (!startAt || !started) return { plan: 'cohort', status: 'free', graceEndsAt: null };
+      return { plan: 'paid', ...grace(new Date(startAt.getTime() + GRACE_DAYS * DAY_MS)) };
     }
     if (sub.status === 'active' || sub.status === 'trialing') return started ? { plan: 'paid', status: 'active', graceEndsAt: null } : { plan: 'cohort', status: 'free', graceEndsAt: null };
     // past_due, unpaid, incomplete, paused: the card failed or was never confirmed.
@@ -85,8 +100,8 @@ export function createBilling(deps: BillingDeps) {
   }
 
   async function status(teamId: string): Promise<BillingStatus['status']> {
-    const [record, notice] = await Promise.all([store.getRecord(teamId), store.getNotice()]);
-    return derive(record ?? emptyRecord(teamId), notice).status;
+    const [record, notice, team] = await Promise.all([store.getRecord(teamId), store.getNotice(), requireTeam(teamId)]);
+    return derive(record ?? emptyRecord(teamId), notice, team).status;
   }
 
   /** Matches the subscription's seat count to the team's; a no-op without a live subscription or when they agree. */
@@ -103,15 +118,16 @@ export function createBilling(deps: BillingDeps) {
     /** GET /v1/billing. Only the owner gets a manage link; creating it may call Stripe. */
     async getBillingStatus(teamId: string, viewerAccountId: string): Promise<BillingStatus> {
       const team = await requireTeam(teamId);
-      const [stored, notice, price] = await Promise.all([store.getRecord(teamId), store.getNotice(), seatPrice(team)]);
+      const [stored, notice] = await Promise.all([store.getRecord(teamId), store.getNotice()]);
+      const price = await seatPrice(team, notice);
       const record = stored ?? emptyRecord(teamId);
       const isOwner = viewerAccountId === team.ownerAccountId;
       return {
         teamId,
-        ...derive(record, notice),
+        ...derive(record, notice, team),
         seatPriceCents: price.unitAmountCents,
         currency: 'usd',
-        foundingPriceLocked: team.founding,
+        foundingPriceLocked: isFounding(team, notice),
         seats: team.seats,
         chargesStartAt: notice?.chargesStartAt.toISOString() ?? null,
         currentPeriodEnd: record.subscription?.currentPeriodEnd?.toISOString() ?? null,
@@ -132,9 +148,14 @@ export function createBilling(deps: BillingDeps) {
      * only owners who haven't had it. Returns how many were emailed, and the teams whose owner has no email.
      */
     async announceCharges(chargesStartAt: Date): Promise<{ emailed: number; noEmail: string[] }> {
-      if (chargesStartAt <= now()) throw new Error('The charge start date must be in the future.');
       const existing = await store.getNotice();
-      await store.saveNotice({ issuedAt: existing?.issuedAt ?? now(), chargesStartAt });
+      if (existing && existing.chargesStartAt.getTime() !== chargesStartAt.getTime()) {
+        throw new Error(`Charges already start ${existing.chargesStartAt.toISOString()}, and owners were told that date. Run this again with that date to email owners who haven't had the notice.`);
+      }
+      if (!existing && chargesStartAt <= now()) throw new Error('The charge start date must be in the future.');
+      const notice = existing ?? { issuedAt: now(), chargesStartAt };
+      // The date is saved with the first email that goes out, so a mailer failure leaves no unannounced date behind.
+      let saved = existing !== null;
       const result = { emailed: 0, noEmail: [] as string[] };
       for (const teamId of await teams.listTeamIds()) {
         const record = (await store.getRecord(teamId)) ?? emptyRecord(teamId);
@@ -144,11 +165,16 @@ export function createBilling(deps: BillingDeps) {
           result.noEmail.push(teamId);
           continue;
         }
-        await deps.mailer.send(noticeEmail({ ...team, ownerEmail: team.ownerEmail }, (await seatPrice(team)).unitAmountCents, chargesStartAt));
+        await deps.mailer.send(noticeEmail({ ...team, founding: isFounding(team, notice), ownerEmail: team.ownerEmail }, (await seatPrice(team, notice)).unitAmountCents, chargesStartAt));
+        if (!saved) {
+          await store.saveNotice(notice);
+          saved = true;
+        }
         record.noticeSentAt = now();
         await store.saveRecord(record);
         result.emailed += 1;
       }
+      if (!saved) await store.saveNotice(notice);
       return result;
     },
 

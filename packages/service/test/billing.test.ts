@@ -7,6 +7,7 @@ import type { Machine, ServiceClient } from 'pane-cloud-contract';
 import { expectError, waitFor } from 'pane-cloud-contract/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runCommand } from '../src/cli';
+import { billingFromEnv } from '../src/config';
 import { type Harness, startHarness } from './support/harness';
 
 const DAY = 86_400_000;
@@ -41,6 +42,7 @@ describe('billing in the service', () => {
     expect(await owner.getBilling()).toMatchObject({ plan: 'cohort', status: 'free', seatPriceCents: 4900, foundingPriceLocked: true, seats: 1, manageUrl: null });
 
     // The operator sends the notice: charges start in 14 days.
+    now = new Date();
     const startAt = new Date(now.getTime() + 14 * DAY);
     expect(await runCommand(harness.db, ['billing', 'announce', startAt.toISOString()], billingEnv, { stripe: stripe.gateway, now: () => now })).toMatch(/Charges start .*Emailed 1 team owner/);
     const [mail] = readdirSync(outboxDir).map((f) => readFileSync(path.join(outboxDir, f), 'utf8'));
@@ -101,5 +103,14 @@ describe('billing in the service', () => {
     const response = await fetch(`${harness.url}/v1/billing/webhook`, { method: 'POST', headers: { 'stripe-signature': 't=1,v1=bad' }, body: '{}' });
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: { code: 'invalid_request' } });
+  });
+});
+
+describe('billing configuration', () => {
+  it('is off without a Stripe key, refuses a live key, and refuses a bad enforce interval', () => {
+    expect(billingFromEnv({})).toBeNull();
+    expect(() => billingFromEnv({ STRIPE_SECRET_KEY: 'sk_live_x', STRIPE_WEBHOOK_SECRET: 'whsec_x' })).toThrow(/test mode only/);
+    expect(() => billingFromEnv({ STRIPE_SECRET_KEY: 'sk_test_x', STRIPE_WEBHOOK_SECRET: 'whsec_x', BILLING_ENFORCE_INTERVAL_MS: 'soon' })).toThrow(/positive number/);
+    expect(billingFromEnv({ STRIPE_SECRET_KEY: 'sk_test_x', STRIPE_WEBHOOK_SECRET: 'whsec_x' })).toMatchObject({ enforceIntervalMs: 300_000, outboxDir: null });
   });
 });

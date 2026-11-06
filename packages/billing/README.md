@@ -11,11 +11,11 @@ founding and the owner from the service's team tables.
 
 | When | What happens |
 | --- | --- |
-| Free cohort | Every team is `cohort`, `free`. A founding team (one that joined during the cohort) shows `foundingPriceLocked: true` and keeps $49 a seat if the standard price rises. |
-| Notice | `announceCharges(startAt)` sets the start date for every team and emails each owner once. Running it again emails only owners who haven't had it, such as teams created since. The owner's `manageUrl` becomes a Stripe Checkout link. |
+| Free cohort | Every team is `cohort`, `free`. A founding team (one created before the notice went out) shows `foundingPriceLocked: true` and keeps $49 a seat if the standard price rises. Teams created later pay the standard price. |
+| Notice | `announceCharges(startAt)` sets the start date for every team and emails each owner once. The date is saved with the first email that goes out, and can't be changed after that. Running it again with the same date, even after it has passed, emails only owners who haven't had it: teams created since, and owners whose email was private. The owner's `manageUrl` becomes a Stripe Checkout link. |
 | Card added | Checkout saves the card and creates a subscription with one seat per team member, anchored to the start date (`billing_cycle_anchor`), so Stripe charges nothing until then and $49 a seat on that date. A card added after the start date is charged at once. |
 | Teammate joins or leaves | `syncSeats(teamId)` changes the subscription's seat count; Stripe prorates it onto the next invoice. |
-| Card fails, or no card by the start date | Status `grace` for 7 days (the app shows a banner from `status` and `graceEndsAt`), then `past_due`: `enforce()` stops the team's machines with their disks kept, and `machinesAllowed` refuses create and start. Paying the open invoice in the portal, or adding a card through Checkout when there was none, makes the team `active` again. |
+| Card fails, or no card by the start date (or by a later team's creation) | Status `grace` for 7 days (the app shows a banner from `status` and `graceEndsAt`), then `past_due`: `enforce()` stops the team's machines with their disks kept, and `machinesAllowed` refuses create and start. Paying the open invoice in the portal, or adding a card through Checkout when there was none, makes the team `active` again. |
 | Owner cancels | In the customer portal (`manageUrl`), at the end of the period. The team stays `active` until then, then `canceled`: `enforce()` stops its machines and `machinesAllowed` refuses create and start. `manageUrl` becomes a Checkout link to subscribe again. |
 | Refund | An operator refunds the charge in the Stripe dashboard (Payments → the charge → Refund). Billing state needs no change. |
 
