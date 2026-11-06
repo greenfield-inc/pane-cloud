@@ -1,0 +1,68 @@
+name: fleet
+
+on:
+  pull_request:
+    paths: ['fleet/**', '.github/workflows/fleet.yml']
+  push:
+    branches: [main]
+    paths: ['fleet/**', '.github/workflows/fleet.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fleet
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fleet/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: fleet/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - name: shellcheck
+        run: find . -name node_modules -prune -o -name '*.sh' -print0 | xargs -0 -r shellcheck -x
+
+  # Boots real Firecracker microVMs. GitHub's Ubuntu x86_64 runners expose /dev/kvm; the runtime code
+  # is the same on the fleet's arm64 hosts.
+  kvm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fleet/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: fleet/pnpm-lock.yaml
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools
+      - run: pnpm install --frozen-lockfile
+      - name: Fetch Firecracker and test images
+        run: sudo bash host/fetch-test-artifacts.sh /srv/fleet-artifacts
+      - name: cgroup v2 subtree for test machines
+        run: |
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p /sys/fs/cgroup/fleet-test
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/fleet-test/cgroup.subtree_control
+      - name: Runtime tests on KVM
+        env:
+          FLEET_TEST_ARTIFACTS: /srv/fleet-artifacts
+        run: sudo --preserve-env=FLEET_TEST_ARTIFACTS,FLEET_BOOT_BUDGET_MS env "PATH=$PATH" pnpm --filter @pane-cloud/fleet-runtime exec vitest run --reporter=verbose

@@ -1,0 +1,11 @@
+[Unit]
+Description=Prepare this host for Pane Cloud machines
+DefaultDependencies=no
+After=local-fs.target systemd-udev-settle.service
+Before=fleet-agent.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/fleet-host-boot
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+{
+  "name": "pane-cloud-fleet",
+  "private": true,
+  "license": "AGPL-3.0",
+  "packageManager": "pnpm@10.18.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "typecheck": "pnpm -r --if-present typecheck",
+    "lint": "pnpm -r --if-present lint",
+    "test": "pnpm -r --if-present test"
+  }
+}
