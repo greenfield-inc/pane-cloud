@@ -1,7 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { CloudApiError, type PaneRelease, signOperation } from 'pane-cloud-contract';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { CloudApiError, MACHINE_LIMITS, type PaneRelease, signOperation } from 'pane-cloud-contract';
 import { createLocalSigner } from 'pane-cloud-contract/testing';
 import { afterEach, describe, expect, test } from 'vitest';
+import { CAPPED_TX, DEFAULT_EGRESS_POLICY } from './host.js';
 import { eventually, type Harness, startHarness, type TestHost } from './testing/harness.js';
 
 let h: Harness;
@@ -118,5 +121,119 @@ describe('stop with a broken guest agent', () => {
     expect(guest.received).toContain('prepare_to_stop');
     expect((await h.client.getMachine('m-silent')).state).toBe('stopped');
     expect((await run('m-silent', 'resume')).status).toBe('succeeded');
+  });
+});
+
+/** Waits until the host agent has polled the machine's guest `n` more times. */
+async function polls(host: TestHost, machineId: string, n = 2) {
+  const count = () => host.fake.guests.get(machineId)?.received.filter((op) => op === 'status').length ?? 0;
+  const target = count() + n;
+  await eventually(async () => count(), (c) => c >= target);
+}
+
+/** Fills a host to its memory target, so the fleet places nothing more on it. */
+async function fill(host: TestHost, full: boolean) {
+  host.memory.usedMiB = full ? host.memory.totalMiB * 0.75 : 0;
+  // Hosts sync every 10 ms; let the fleet see the new report.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+
+describe('network', () => {
+  test('a machine keeps its address and its month of egress when it resumes on another host', async () => {
+    const noAbuse = { ...DEFAULT_EGRESS_POLICY, abuseBytes: Number.POSITIVE_INFINITY };
+    h = await startHarness({ hosts: [{ id: 'host-a', egressPolicy: noAbuse }, { id: 'host-b', egressPolicy: noAbuse }] });
+    const [a, b] = [hostOf('host-a'), hostOf('host-b')];
+    await fill(b, true);
+    await run('m-moves', 'create');
+    await fill(a, true);
+    await fill(b, false);
+    await run('m-other', 'create');
+    expect((await h.client.getMachine('m-other')).hostId).toBe('host-b');
+
+    // Past 100 GiB this month: capped to about 1 MiB/s.
+    a.net.counters.set('m-moves', MACHINE_LIMITS.monthlyEgressBytes + 1);
+    await eventually(() => h.client.getMetrics('m-moves'), (m) => m.egressBytesThisMonth > MACHINE_LIMITS.monthlyEgressBytes);
+    expect(a.fake.txLimits.get('m-moves')).toEqual([CAPPED_TX]);
+
+    await run('m-moves', 'stop');
+    expect((await run('m-moves', 'resume')).status).toBe('succeeded');
+    expect((await h.client.getMachine('m-moves')).hostId).toBe('host-b');
+
+    const addressOn = (host: TestHost, machineId: string) => host.net.attached.filter((x) => x.machineId === machineId).map((x) => x.address);
+    const [before] = addressOn(a, 'm-moves');
+    const [after] = addressOn(b, 'm-moves');
+    expect(after).toEqual(before);
+    expect(addressOn(b, 'm-other')[0]?.guestIp).not.toBe(before?.guestIp);
+    // The restored machine is capped again on its new host.
+    expect(b.fake.txLimits.get('m-moves')).toEqual([CAPPED_TX]);
+  });
+
+  test('stops a machine that sends 10 GB within an hour, with reason abuse', async () => {
+    h = await startHarness({ hosts: [{ id: 'host-a' }] });
+    const host = hostOf('host-a');
+    await run('m-flood', 'create');
+    await polls(host, 'm-flood');
+    host.net.counters.set('m-flood', 11e9);
+    const stopped = await eventually(() => h.client.getMachine('m-flood'), (m) => m.state === 'stopped');
+    expect(stopped.stateReason).toBe('abuse');
+    const { events } = await h.client.listEvents(undefined, 500);
+    expect(events).toContainEqual(expect.objectContaining({ machineId: 'm-flood', kind: 'state_changed', state: 'stopped', reason: 'abuse' }));
+  });
+});
+
+describe('fair use', () => {
+  test('throttles a machine that used its daily CPU budget, and it resumes throttled', async () => {
+    h = await startHarness({ hosts: [{ id: 'host-a' }] });
+    const host = hostOf('host-a');
+    await run('m-burner', 'create');
+    const vm = host.fake.vms.get('m-burner');
+    if (!vm) throw new Error('no vm');
+    await writeFile(join(vm.cgroupPath, 'cpu.stat'), `usage_usec ${(MACHINE_LIMITS.dailyCpuSeconds + 60) * 1e6}\n`);
+
+    const metrics = await eventually(() => h.client.getMetrics('m-burner'), (m) => m.throttled);
+    expect(metrics.cpuSecondsUsed).toBeGreaterThanOrEqual(MACHINE_LIMITS.dailyCpuSeconds);
+    expect((await readFile(join(vm.cgroupPath, 'cpu.max'), 'utf8')).trim()).toBe('50000 100000');
+    const { events } = await h.client.listEvents(undefined, 500);
+    expect(events).toContainEqual(expect.objectContaining({ machineId: 'm-burner', kind: 'budget_exhausted' }));
+
+    await run('m-burner', 'stop');
+    await run('m-burner', 'resume');
+    expect(host.fake.specs.at(-1)?.cgroup?.['cpu.max']).toBe('50000 100000');
+  });
+
+  test('stops idle machines with reason memory_pressure when host memory reaches 85%, and leaves busy ones', async () => {
+    h = await startHarness({ hosts: [{ id: 'host-a' }] });
+    const host = hostOf('host-a');
+    await run('m-idle', 'create');
+    await run('m-busy', 'create');
+    const busy = host.fake.guests.get('m-busy');
+    if (!busy) throw new Error('no guest');
+    busy.activity.agentsRunning = 1;
+    await polls(host, 'm-busy');
+
+    host.memory.usedMiB = host.memory.totalMiB * 0.9;
+    const stopped = await eventually(() => h.client.getMachine('m-idle'), (m) => m.state === 'stopped');
+    expect(stopped.stateReason).toBe('memory_pressure');
+    expect((await h.client.getMachine('m-busy')).state).toBe('running');
+    const { events } = await h.client.listEvents(undefined, 500);
+    expect(events).toContainEqual(expect.objectContaining({ machineId: 'm-idle', kind: 'state_changed', state: 'stopped', reason: 'memory_pressure' }));
+  });
+});
+
+describe('collect_diagnostics', () => {
+  test('stores the guest archive, and refuses one that does not match its SHA-256', async () => {
+    h = await startHarness({ hosts: [{ id: 'host-a' }] });
+    await run('m-diag', 'create');
+    const good = await run('m-diag', 'collect_diagnostics');
+    expect(good.status).toBe('succeeded');
+    const archiveKey = good.result?.archiveKey ?? '';
+    expect(await readFile(join(h.tmp, 'diagnostics', archiveKey), 'utf8')).toBe('fake archive');
+
+    const guest = hostOf('host-a').fake.guests.get('m-diag');
+    if (!guest) throw new Error('no guest');
+    guest.corruptDiagnostics = true;
+    const bad = await run('m-diag', 'collect_diagnostics');
+    expect(bad.status).toBe('failed');
+    expect(bad.error?.message).toMatch(/SHA-256/);
   });
 });

@@ -127,6 +127,8 @@ describe('scheduler', () => {
   let h: Harness;
   beforeAll(async () => {
     h = await startHarness({ hosts: [{ id: 'busy', usedMiB: 300 * 1024, maxMachines: 2 }, { id: 'quiet', usedMiB: 100 * 1024, maxMachines: 1 }] });
+    // Hosts sync every 10 ms; let both report before the first placement.
+    await new Promise((resolve) => setTimeout(resolve, 200));
     await eventually(async () => h.client.submitOperation(await h.sign('warmup', 'create')).catch((e: unknown) => e), (r) => !(r instanceof CloudApiError));
   });
   afterAll(() => h.close());

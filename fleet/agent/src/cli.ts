@@ -9,12 +9,14 @@
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { createHostNetwork } from '@pane-cloud/fleet-network';
 import { createRuntime } from '@pane-cloud/fleet-runtime';
 import { PaneRelease } from 'pane-cloud-contract';
 import { z } from 'zod';
 import { startFleet } from './fleet.js';
-import { createHostAgent } from './host.js';
-import { basicFairUse, fileMaintenanceSignal, localDiagnosticsStore, localSnapshotStore, localVolumeRecovery, releasesFrom } from './local.js';
+import { cloudWatchHostMetrics } from './aws.js';
+import { createHostAgent, DEFAULT_EGRESS_POLICY } from './host.js';
+import { adoptedVolumeRecovery, fileMaintenanceSignal, fleetFairUse, localDiagnosticsStore, localSnapshotStore, noHostMetrics, releasesFrom } from './local.js';
 import { fileStore } from './store.js';
 
 const TrustedKeys = z.record(z.string().min(1), z.string().startsWith('-----BEGIN PUBLIC KEY-----'));
@@ -49,7 +51,11 @@ const HostConfig = z
     snapshotDir: z.string().default('/srv/fleet-snapshots'),
     diagnosticsDir: z.string().default('/srv/fleet-diagnostics'),
     /** Where a lost host's data volume is mounted, as `<dir>/<hostId>`. */
-    recoveryDir: z.string().default('/srv/fleet/recovered'),
+    adoptedDir: z.string().default('/srv/adopted'),
+    /** Region for CloudWatch host metrics; defaults to AWS_REGION. With neither, metrics are off. */
+    awsRegion: z.string().optional(),
+    /** Overrides of the plan's egress thresholds (D-23 keeps the real ones in private config). */
+    egress: z.object({ monthlyAlertBytes: z.number().positive(), abuseBytes: z.number().positive(), abuseWindowSeconds: z.number().positive() }).partial().default({}),
     /** The host drains while this file exists. */
     maintenanceFile: z.string().default('/run/pane-fleet/maintenance'),
   })
@@ -102,6 +108,8 @@ async function main(argv: string[]): Promise<void> {
 
   if (mode === 'serve-host') {
     const config = await readConfig(HostConfig, configPath ?? '/etc/pane-fleet/host.json');
+    const region = config.awsRegion ?? process.env.AWS_REGION;
+    if (!region) console.log(JSON.stringify({ msg: 'no AWS region; host metrics are off' }));
     const agent = await createHostAgent({
       hostId: config.hostId,
       fleetUrl: config.fleetUrl,
@@ -111,9 +119,17 @@ async function main(argv: string[]): Promise<void> {
       releases: releasesFrom(config.releases),
       snapshots: localSnapshotStore(config.snapshotDir),
       diagnostics: localDiagnosticsStore(config.diagnosticsDir),
-      volumes: localVolumeRecovery(config.recoveryDir),
+      volumes: adoptedVolumeRecovery({ mountRoot: config.adoptedDir }),
       maintenance: fileMaintenanceSignal(config.maintenanceFile),
-      fairUse: basicFairUse(),
+      fairUse: fleetFairUse(join(config.dataDir, 'state', 'cpu-budget')),
+      network: createHostNetwork(),
+      hostMetrics: region ? cloudWatchHostMetrics(region) : noHostMetrics,
+      egressPolicy: {
+        ...DEFAULT_EGRESS_POLICY,
+        ...(config.egress.monthlyAlertBytes ? { monthlyAlertBytes: config.egress.monthlyAlertBytes } : {}),
+        ...(config.egress.abuseBytes ? { abuseBytes: config.egress.abuseBytes } : {}),
+        ...(config.egress.abuseWindowSeconds ? { abuseWindowMs: config.egress.abuseWindowSeconds * 1000 } : {}),
+      },
       store: fileStore(join(config.dataDir, 'agent-state.json')),
       dataDir: config.dataDir,
       kernelPath: join(config.dataDir, 'templates', 'vmlinux'),

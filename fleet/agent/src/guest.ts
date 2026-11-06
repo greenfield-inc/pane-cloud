@@ -21,11 +21,22 @@ export const GuestStatus = z.object({
 });
 export type GuestStatus = z.infer<typeof GuestStatus>;
 
+/** F5's `collect_diagnostics` answer. The host checks the archive against `bytes` and `sha256`. */
 export const GuestDiagnostics = z.object({
   files: z.array(z.object({ path: z.string().max(4096), bytes: z.number().int().nonnegative() }).strict()).max(1000),
-  /** The collected files as a .tar.gz, base64. */
-  archiveBase64: z.base64(),
+  skipped: z.array(z.object({ path: z.string().max(4096), reason: z.string().max(200) }).strict()).max(1000),
+  archive: z
+    .object({
+      format: z.literal('tar+gzip'),
+      bytes: z.number().int().nonnegative(),
+      sha256: z.string().regex(/^[0-9a-f]{64}$/),
+      base64: z.base64(),
+    })
+    .strict(),
 });
+
+/** F5's `bootstrap` answer: whether the guest's first-boot setup is still running, done or failed. */
+export const GuestBootstrap = z.object({ firstBoot: z.enum(['running', 'done', 'failed']) });
 
 export type GuestRequest =
   | { operation: 'status' | 'prepare_to_stop' | 'collect_diagnostics'; parameters: Record<string, never> }

@@ -9,9 +9,10 @@ import { createLocalSigner } from 'pane-cloud-contract/testing';
 type LocalSigner = ReturnType<typeof createLocalSigner>;
 import { type Fleet, type FleetState, startFleet } from '../fleet.js';
 import { createHostAgent, type HostAgent, type HostAgentOptions, type HostState } from '../host.js';
-import { basicFairUse, localDiagnosticsStore, localSnapshotStore, localVolumeRecovery, releasesFrom } from '../local.js';
+import type { EgressPolicy } from '@pane-cloud/fleet-network';
+import { fleetFairUse, localDiagnosticsStore, localSnapshotStore, localVolumeRecovery, noHostMetrics, releasesFrom } from '../local.js';
 import { memoryStore, type StateStore } from '../store.js';
-import { createFakeRuntime, type FakeRuntime } from './fakes.js';
+import { createFakeNetwork, createFakeRuntime, type FakeNetwork, type FakeRuntime } from './fakes.js';
 
 export const SERVICE_TOKEN = 'test-service-token';
 export const HOST_TOKEN = 'test-host-token';
@@ -26,6 +27,7 @@ export interface TestHost {
   id: string;
   agent: HostAgent;
   fake: FakeRuntime;
+  net: FakeNetwork;
   clock: ReturnType<typeof testClock>;
   dataDir: string;
   store: StateStore<HostState>;
@@ -37,7 +39,7 @@ export interface TestHost {
 }
 
 export interface HarnessOptions {
-  hosts: { id: string; usedMiB?: number; maxMachines?: number; releases?: PaneRelease[]; trustedKeys?: Record<string, string> }[];
+  hosts: { id: string; usedMiB?: number; maxMachines?: number; releases?: PaneRelease[]; trustedKeys?: Record<string, string>; egressPolicy?: EgressPolicy }[];
   hostLostAfterMs?: number;
 }
 
@@ -80,6 +82,7 @@ export async function startHarness(options: HarnessOptions): Promise<Harness> {
   for (const spec of options.hosts) {
     const dataDir = join(tmp, spec.id);
     const fake = createFakeRuntime(join(tmp, `${spec.id}-vm`));
+    const net = createFakeNetwork();
     const memory = { totalMiB: 512 * 1024, usedMiB: spec.usedMiB ?? 0 };
     const maintenance = { requested: false };
     const store = memoryStore<HostState>();
@@ -95,7 +98,10 @@ export async function startHarness(options: HarnessOptions): Promise<Harness> {
       diagnostics: localDiagnosticsStore(join(tmp, 'diagnostics')),
       volumes: localVolumeRecovery(tmp),
       maintenance: { requested: async () => maintenance.requested },
-      fairUse: basicFairUse(),
+      fairUse: fleetFairUse(join(dataDir, 'cpu-budget'), clock.now),
+      network: net.network,
+      hostMetrics: noHostMetrics,
+      ...(spec.egressPolicy ? { egressPolicy: spec.egressPolicy } : {}),
       store,
       dataDir,
       kernelPath: join(tmp, 'vmlinux'),
@@ -105,7 +111,7 @@ export async function startHarness(options: HarnessOptions): Promise<Harness> {
         await writeFile(diskPath, 'template\n');
       },
       maxMachines: spec.maxMachines ?? 109,
-      hostMemory: () => memory,
+      hostMemory: async () => memory,
       now: clock.now,
       syncIntervalMs: 10,
       pollIntervalMs: 20,
@@ -116,6 +122,7 @@ export async function startHarness(options: HarnessOptions): Promise<Harness> {
       id: spec.id,
       agent: await createHostAgent(agentOptions),
       fake,
+      net,
       clock,
       dataDir,
       store,

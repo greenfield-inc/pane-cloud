@@ -19,14 +19,18 @@ import {
 import { bind, createApiServer } from './http.js';
 import type { ReleaseList } from './ports.js';
 import { createSaver, type StateStore } from './store.js';
-import { type HostReport, syncRoute, type Work } from './sync.js';
+import { type HostReport, type Placement, syncRoute, type Work } from './sync.js';
 
 const FINAL: readonly FleetMachine['state'][] = ['stopped', 'deleted'];
 const MAX_EVENTS = 100_000;
 const OPERATION_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** F3's guest subnet, 10.200.0.0/16, holds 16,384 /30 slots: the most machines the fleet can keep. */
+const NETWORK_SLOTS = 16_384;
 
 interface MachineRecord {
   machine: FleetMachine;
+  /** The machine's network slot, kept until it is deleted (`Placement.slot`). */
+  slot: number;
   /** The last metrics a host reported, kept while the machine is on no host. */
   metrics: MachineMetrics | null;
   /** Set while the machine waits to be rebuilt from the disk on this lost host. */
@@ -128,6 +132,18 @@ export async function startFleet(options: FleetOptions, listen: { host?: string;
     return best?.hostId ?? null;
   }
 
+  /** The lowest slot no machine holds. A stopped machine keeps its slot, so it resumes with the same address. */
+  function freeSlot(): number | null {
+    const used = new Set(Object.values(state.machines).filter((m) => m.machine.state !== 'deleted').map((m) => m.slot));
+    for (let slot = 0; slot < NETWORK_SLOTS; slot += 1) if (!used.has(slot)) return slot;
+    return null;
+  }
+
+  const placement = (m: MachineRecord): Placement => {
+    const month = iso().slice(0, 7);
+    return { slot: m.slot, egressBytesThisMonth: m.metrics?.day.slice(0, 7) === month ? m.metrics.egressBytesThisMonth : 0 };
+  };
+
   /** Any live host, for work that needs no room, such as deleting a stopped machine's snapshot. */
   const anyHost = () => [...hosts].find(([, view]) => live(view))?.[0] ?? null;
 
@@ -138,9 +154,11 @@ export async function startFleet(options: FleetOptions, listen: { host?: string;
     if (operation === 'create') {
       if (existing && existing.machine.state !== 'deleted') throw new CloudApiError('machine_exists', `Machine ${machineId} already exists.`, 'Use a new machine id, or resume the existing machine.');
       const hostId = place();
-      if (!hostId) throw noCapacity();
+      const slot = freeSlot();
+      if (!hostId || slot === null) throw noCapacity();
       state.machines[machineId] = {
         machine: { machineId, state: 'creating', stateReason: null, hostId, paneVersion: null, tailnet: { status: 'awaiting_login', loginUrl: null, hostname: null }, updatedAt: iso() },
+        slot,
         metrics: null,
         recoverFrom: null,
       };
@@ -242,10 +260,13 @@ export async function startFleet(options: FleetOptions, listen: { host?: string;
     const work: Work[] = [
       ...Object.values(state.operations)
         .filter((op) => op.hostId === hostId && !op.delivered)
-        .map((op): Work => ({ kind: 'operation', envelope: op.envelope })),
+        .flatMap((op): Work[] => {
+          const m = state.machines[op.status.machineId];
+          return m ? [{ kind: 'operation', envelope: op.envelope, placement: placement(m) }] : [];
+        }),
       ...Object.values(state.machines)
         .filter((m) => m.recoverFrom && m.machine.hostId === hostId)
-        .map((m): Work => ({ kind: 'recover', machineId: m.machine.machineId, fromHostId: m.recoverFrom ?? '' })),
+        .map((m): Work => ({ kind: 'recover', machineId: m.machine.machineId, fromHostId: m.recoverFrom ?? '', placement: placement(m) })),
     ];
     await save();
     return { work, eventsAck: state.hostCursors[hostId] ?? null };

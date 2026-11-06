@@ -2,7 +2,7 @@
 
 `@pane-cloud/fleet-network` gives each machine its own network on the host: a tap device, NAT to the
 internet, a firewall that keeps it away from everything else, a filtering DNS resolver, an egress
-counter and a flow log. The host agent (F2) calls it and assigns each machine a slot number that is free on the host. It
+counter and a flow log. The host agent (F2) calls it with the machine's slot, which the fleet assigns once per machine, unique across the fleet. It
 runs `ip` and `nft` as root, and needs `net.ipv4.ip_forward=1` (set by
 [`host/files/sysctl/90-fleet.conf`](../host/files/sysctl/90-fleet.conf)).
 

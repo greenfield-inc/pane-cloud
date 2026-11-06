@@ -1,12 +1,16 @@
 /**
- * Test doubles at the package's outer boundaries: F1's `Runtime` (no Firecracker, no KVM) and F5's
- * guest agent, which speaks the real vsock line protocol on a Unix socket.
+ * Test doubles at the package's outer boundaries: F1's `Runtime` (no Firecracker, no KVM), F5's
+ * guest agent, which speaks the real vsock line protocol on a Unix socket, and F3's network, whose
+ * real implementation drives `ip` and `nft` as root.
  */
+import { createHash } from 'node:crypto';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
-import type { MachineSpec, Runtime, SnapshotFiles, Vm } from '@pane-cloud/fleet-runtime';
+import { addressForSlot, type MachineAddress } from '@pane-cloud/fleet-network';
+import type { MachineSpec, RateLimit, Runtime, SnapshotFiles, Vm } from '@pane-cloud/fleet-runtime';
 import type { FleetMachine } from 'pane-cloud-contract';
+import type { NetworkPort } from '../ports.js';
 
 export interface FakeGuest {
   paneVersion: string | null;
@@ -16,6 +20,8 @@ export interface FakeGuest {
   received: string[];
   /** A broken guest agent: it takes the connection and never answers. */
   silent?: boolean;
+  /** A diagnostics archive that does not match the SHA-256 the guest sends with it. */
+  corruptDiagnostics?: boolean;
 }
 
 /** Serves the guest agent protocol; the returned function ends it as a VM's process ending would. */
@@ -45,8 +51,15 @@ function serveGuest(socketPath: string, guest: FakeGuest): Promise<() => Promise
           guest.paneVersion = request.parameters.release?.version ?? null;
           guest.tailnet = { status: 'awaiting_login', loginUrl: 'https://login.tailscale.com/a/fake', hostname: null };
         }
+        if (request.operation === 'bootstrap') result = { paneVersion: guest.paneVersion, firstBoot: 'done' };
         if (request.operation === 'collect_diagnostics') {
-          result = { files: [{ path: '/var/log/pane-cloud/guest-agent.log', bytes: 12 }], archiveBase64: Buffer.from('fake archive').toString('base64') };
+          const archive = Buffer.from('fake archive');
+          const sent = guest.corruptDiagnostics ? Buffer.from('other archive') : archive;
+          result = {
+            files: [{ path: '/var/log/pane-cloud/guest-agent.log', bytes: 12 }],
+            skipped: [],
+            archive: { format: 'tar+gzip', bytes: sent.length, sha256: createHash('sha256').update(archive).digest('hex'), base64: sent.toString('base64') },
+          };
         }
         socket.write(`${JSON.stringify({ id: request.id, ok: true, result })}\n`);
       }
@@ -64,8 +77,14 @@ export interface FakeRuntime {
   runtime: Runtime;
   /** The guest of each machine with a running VM. */
   guests: Map<string, FakeGuest>;
+  /** Each machine's running VM. */
+  vms: Map<string, Vm>;
   /** VMs started or restored, by machine id. */
   started: string[];
+  /** The spec of every start and restore, in order. */
+  specs: MachineSpec[];
+  /** Every rate limit set on a running VM, by machine id. */
+  txLimits: Map<string, (RateLimit | undefined)[]>;
   /** Ends every VM, as a host losing power would. */
   crash(): Promise<void>;
 }
@@ -75,6 +94,8 @@ export function createFakeRuntime(dir: string): FakeRuntime {
   const guests = new Map<string, FakeGuest>();
   const vms = new Map<string, Vm>();
   const started: string[] = [];
+  const specs: MachineSpec[] = [];
+  const txLimits = new Map<string, (RateLimit | undefined)[]>();
   let count = 0;
 
   async function launch(spec: MachineSpec, guest: FakeGuest): Promise<Vm> {
@@ -82,7 +103,10 @@ export function createFakeRuntime(dir: string): FakeRuntime {
     const n = ++count;
     const cgroupPath = join(dir, 'cgroup', `${spec.machineId}-${n}`);
     await mkdir(cgroupPath, { recursive: true });
+    // What the jailer writes, then what the kernel reports.
+    for (const [file, value] of Object.entries(spec.cgroup ?? {})) await writeFile(join(cgroupPath, file), value);
     await writeFile(join(cgroupPath, 'memory.current'), String(3 * 2 ** 30));
+    await writeFile(join(cgroupPath, 'memory.stat'), 'anon 3221225472\nfile 0\n');
     await writeFile(join(cgroupPath, 'cpu.stat'), 'usage_usec 1500000\n');
     const vsockPath = join(dir, `v${n}.sock`);
     const closeGuest = await serveGuest(vsockPath, guest);
@@ -108,13 +132,16 @@ export function createFakeRuntime(dir: string): FakeRuntime {
       },
       setBalloon: async () => undefined,
       balloonStats: async () => ({ targetMiB: 0, actualMiB: 0 }),
-      updateNetworkRateLimit: async () => undefined,
+      updateNetworkRateLimit: async ({ tx }) => {
+        txLimits.set(spec.machineId, [...(txLimits.get(spec.machineId) ?? []), tx]);
+      },
       stop,
       isRunning: async () => vms.has(spec.machineId),
     };
     vms.set(spec.machineId, vm);
     guests.set(spec.machineId, guest);
     started.push(spec.machineId);
+    specs.push(spec);
     return vm;
   }
 
@@ -127,7 +154,10 @@ export function createFakeRuntime(dir: string): FakeRuntime {
 
   return {
     guests,
+    vms,
     started,
+    specs,
+    txLimits,
     runtime: {
       start: (spec) => launch(spec, freshGuest()),
       async restore(spec, snapshot) {
@@ -138,6 +168,41 @@ export function createFakeRuntime(dir: string): FakeRuntime {
     },
     async crash() {
       for (const vm of [...vms.values()]) await vm.stop();
+    },
+  };
+}
+
+export interface FakeNetwork {
+  network: NetworkPort;
+  /** Each attached machine's egress counter, in bytes; a test sets it to make traffic. */
+  counters: Map<string, number>;
+  /** Every attach, in order. */
+  attached: { machineId: string; slot: number; uid: number; address: MachineAddress }[];
+}
+
+/** F3 without `ip` and `nft`: F3's own address plan, and counters a test sets. */
+export function createFakeNetwork(): FakeNetwork {
+  const counters = new Map<string, number>();
+  const attached: FakeNetwork['attached'] = [];
+  return {
+    counters,
+    attached,
+    network: {
+      installHostRules: async () => undefined,
+      async attach(machineId, slot, { uid }) {
+        const address = addressForSlot(machineId, slot);
+        attached.push({ machineId, slot, uid, address });
+        counters.set(machineId, 0);
+        return address;
+      },
+      async egressBytes(machineId) {
+        const bytes = counters.get(machineId);
+        if (bytes === undefined) throw new Error(`No egress counter for machine ${machineId}; it is not attached.`);
+        return bytes;
+      },
+      async detach(machineId) {
+        counters.delete(machineId);
+      },
     },
   };
 }

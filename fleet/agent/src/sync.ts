@@ -26,11 +26,25 @@ export const HostReport = z
   .strict();
 export type HostReport = z.infer<typeof HostReport>;
 
+/** What the fleet keeps for a machine across hosts. */
+export const Placement = z
+  .object({
+    /**
+     * Unique across the fleet, and the same on every host the machine runs on: its uid there and its
+     * F3 address. A restored guest keeps its IP and MAC in memory, so they must never change.
+     */
+    slot: z.number().int().nonnegative(),
+    /** Bytes the machine sent this month on earlier hosts, so the monthly cap follows it. */
+    egressBytesThisMonth: z.number().nonnegative(),
+  })
+  .strict();
+export type Placement = z.infer<typeof Placement>;
+
 export const Work = z.discriminatedUnion('kind', [
   /** A signed operation, exactly as the service sent it. The host verifies it again. */
-  z.object({ kind: z.literal('operation'), envelope: OperationEnvelope }).strict(),
+  z.object({ kind: z.literal('operation'), envelope: OperationEnvelope, placement: Placement }).strict(),
   /** Boot a machine from its disk on a lost host's data volume. */
-  z.object({ kind: z.literal('recover'), machineId: MachineId, fromHostId: HostId }).strict(),
+  z.object({ kind: z.literal('recover'), machineId: MachineId, fromHostId: HostId, placement: Placement }).strict(),
 ]);
 export type Work = z.infer<typeof Work>;
 

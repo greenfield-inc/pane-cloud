@@ -15,6 +15,9 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1163.0",
+    "@pane-cloud/fleet-fair-use": "workspace:*",
+    "@pane-cloud/fleet-network": "workspace:*",
     "@pane-cloud/fleet-runtime": "workspace:*",
     "pane-cloud-contract": "github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract",
     "zod": "^4.6.7"

@@ -1,7 +1,8 @@
 name: fleet-agent
 
 # fleet.yml already runs typecheck, lint and the unit tests for every fleet package. This job adds
-# the host agent's KVM test: create, stop and resume a real microVM through the fleet API.
+# the host agent's root tests: create, stop and resume a real microVM through the fleet API on F3's
+# network and F4's ceilings, and adopting a lost host's data volume.
 on:
   pull_request:
     paths: ['fleet/**', '.github/workflows/fleet-agent.yml']
@@ -31,7 +32,11 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
-      - run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools
+      - run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools nftables xfsprogs
+      - name: Let forwarded packets through Docker's iptables policy
+        run: |
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo iptables -P FORWARD ACCEPT
       - run: pnpm install --frozen-lockfile
       - name: Fetch Firecracker and test images
         run: sudo bash host/fetch-test-artifacts.sh /srv/fleet-artifacts
@@ -44,3 +49,7 @@ jobs:
         env:
           FLEET_TEST_ARTIFACTS: /srv/fleet-artifacts
         run: sudo --preserve-env=FLEET_TEST_ARTIFACTS env "PATH=$PATH" pnpm --filter @pane-cloud/fleet-agent exec vitest run src/host.kvm.test.ts --reporter=verbose
+      - name: Lost host volume adoption
+        env:
+          FLEET_VOLUME_TEST: '1'
+        run: sudo --preserve-env=FLEET_VOLUME_TEST env "PATH=$PATH" pnpm --filter @pane-cloud/fleet-agent exec vitest run src/volumes.linux.test.ts --reporter=verbose

@@ -3,10 +3,12 @@
  * runtime, F3's network, F4's fair use and the guest agent. It has no inbound port; it calls the
  * fleet API to report and to receive work (`sync.ts`).
  */
-import { lchown, lstat, readFile, rename, rm, stat } from 'node:fs/promises';
-import { freemem, totalmem } from 'node:os';
+import { createHash } from 'node:crypto';
+import { lchown, lstat, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createDiskFromTemplate, type MachineSpec, type Runtime, type Vm } from '@pane-cloud/fleet-runtime';
+import { type HostSample, type MachineSample, RECLAIM_RULES, readHostMemory } from '@pane-cloud/fleet-fair-use';
+import { checkEgressAbuse, checkMonthlyEgress, type CounterSample, type EgressPolicy, type MachineAddress } from '@pane-cloud/fleet-network';
+import { createDiskFromTemplate, type MachineSpec, type RateLimit, type Runtime, type Vm } from '@pane-cloud/fleet-runtime';
 import {
   callRoute,
   CloudApiError,
@@ -20,16 +22,33 @@ import {
   type OperationStatus,
   verifyOperation,
 } from 'pane-cloud-contract';
-import { callGuest, GuestDiagnostics, GuestStatus, operationError } from './guest.js';
+import { callGuest, GuestBootstrap, GuestDiagnostics, GuestStatus, operationError } from './guest.js';
 import { copySparse } from './local.js';
-import type { DiagnosticsStore, FairUsePort, HostMemorySample, MaintenanceSignal, MachineAttachment, NetworkPort, ReleaseList, SnapshotStore, VolumeRecovery } from './ports.js';
+import type { DiagnosticsStore, FairUsePort, HostMetrics, MaintenanceSignal, NetworkPort, ReleaseList, SnapshotStore, VolumeRecovery } from './ports.js';
 import { createSaver, type StateStore } from './store.js';
-import { type HostReport, syncRoute, type Work } from './sync.js';
+import { type HostReport, type Placement, syncRoute, type Work } from './sync.js';
 
 /** No agent running and no client connected for this long stops a machine (journey 9). */
 export const IDLE_STOP_MS = 30 * 60 * 1000;
 /** How long a stop waits for the guest agent's prepare_to_stop before snapshotting anyway. */
 const PREPARE_TO_STOP_TIMEOUT_MS = 10_000;
+/**
+ * The plan's egress limits (F3's README): stop at 10 GB out in an hour, alert at 30 GB a month, cap
+ * at the contract's 100 GiB a month. D-23 keeps the real abuse thresholds in private config.
+ */
+export const DEFAULT_EGRESS_POLICY: EgressPolicy = {
+  monthlyCapBytes: MACHINE_LIMITS.monthlyEgressBytes,
+  monthlyAlertBytes: 30e9,
+  abuseBytes: 10e9,
+  abuseWindowMs: 60 * 60 * 1000,
+};
+/**
+ * A machine past the monthly cap sends at about 1 MiB/s until the month ends. An assumption: the
+ * plan says only "capped"; Parsa may choose another rate, or a stop.
+ */
+export const CAPPED_TX: RateLimit = { size: 1024 * 1024, refillTimeMs: 1000 };
+/** A token bucket of size 0 turns Firecracker's limiter off. */
+const UNLIMITED_TX: RateLimit = { size: 0, refillTimeMs: 0 };
 
 type State = FleetMachine['state'];
 type Reason = NonNullable<FleetMachine['stateReason']>;
@@ -42,8 +61,11 @@ const MAX_EVENTS = 10_000;
 
 interface HostMachine {
   machine: FleetMachine;
+  /** The fleet's slot for the machine: uid `uidBase + slot` and F3's address for the slot. */
   slot: number;
   metrics: MachineMetrics | null;
+  /** This month's egress, and the F3 counter's reading it was last updated from. */
+  egress: { month: string; bytes: number; counter: number };
 }
 
 export interface HostState {
@@ -68,8 +90,9 @@ export interface HostAgentOptions {
   volumes: VolumeRecovery;
   maintenance: MaintenanceSignal;
   fairUse: FairUsePort;
-  /** F3. Without it machines boot with no network interface. */
-  network?: NetworkPort;
+  network: NetworkPort;
+  hostMetrics: HostMetrics;
+  egressPolicy?: EgressPolicy;
   store: StateStore<HostState>;
   /** Machine disks go in `<dataDir>/disks`, snapshots being written in `<dataDir>/snapshots`. */
   dataDir: string;
@@ -83,10 +106,11 @@ export interface HostAgentOptions {
   maxMachines?: number;
   /** Share of host memory the scheduler may fill (F4's overcommit target). */
   memoryTargetFraction?: number;
-  hostMemory?: () => HostMemorySample;
+  /** Host memory now; defaults to /proc/meminfo. */
+  hostMemory?: () => Promise<HostSample>;
   now?: () => Date;
   syncIntervalMs?: number;
-  /** How often to read guest status, metrics, maintenance and F4's reclaim decisions. */
+  /** How often to read guest status, metrics, egress, maintenance and F4's budget and reclaim decisions. */
   pollIntervalMs?: number;
   guestTimeoutMs?: number;
   /** For bootstrap and update_pane, which download and install a release. */
@@ -113,7 +137,8 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
   const log = o.log ?? ((entry) => console.log(JSON.stringify({ at: iso(), host: o.hostId, ...entry })));
   const size = o.machineSize ?? { vcpu: MACHINE_LIMITS.vcpu, memoryMiB: MACHINE_LIMITS.memoryMiB };
   const uidBase = o.uidBase ?? 200_000;
-  const hostMemory = o.hostMemory ?? (() => ({ totalMiB: totalmem() / 2 ** 20, usedMiB: (totalmem() - freemem()) / 2 ** 20 }));
+  const hostMemory = o.hostMemory ?? (() => readHostMemory());
+  const egressPolicy = o.egressPolicy ?? DEFAULT_EGRESS_POLICY;
   const guestTimeoutMs = o.guestTimeoutMs ?? 30_000;
   const createDisk = o.createDisk ?? createDiskFromTemplate;
 
@@ -121,13 +146,19 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
   const save = createSaver(o.store, () => state);
   const vms = new Map<string, Vm>();
   const idleSince = new Map<string, number>();
+  /** F3 counter readings from the last abuse window, for `checkEgressAbuse`. */
+  const egressSamples = new Map<string, CounterSample[]>();
+  /** Host-side resident memory samples from the last 15 minutes, by machine id, kept across a stop and resume. */
+  const residentSamples = new Map<string, { at: number; mib: number }[]>();
   const queues = new Map<string, Promise<void>>();
   const changedOperations = new Set<string>();
   let draining = false;
 
   const diskPath = (id: string) => join(o.dataDir, 'disks', `${id}.ext4`);
   const snapshotDir = (id: string) => join(o.dataDir, 'snapshots', id);
-  const spec = (record: HostMachine, net?: MachineAttachment): MachineSpec => ({
+  const month = () => iso().slice(0, 7);
+  const capped = (m: HostMachine) => m.egress.month === month() && checkMonthlyEgress(m.egress.bytes, egressPolicy).capped;
+  const spec = (record: HostMachine, extra: Partial<MachineSpec> = {}): MachineSpec => ({
     machineId: record.machine.machineId,
     uid: uidBase + record.slot,
     gid: uidBase + record.slot,
@@ -136,8 +167,8 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     kernelPath: o.kernelPath,
     diskPath: diskPath(record.machine.machineId),
     consoleLogPath: join(o.dataDir, 'console', `${record.machine.machineId}.log`),
-    ...(net ? { network: { tapName: net.tapName, guestMac: net.guestMac, kernelIpArg: net.kernelIpArg } } : {}),
     balloon: { deflateOnOom: true, statsPollingIntervalS: 5 },
+    ...extra,
   });
 
   const record = (event: Omit<FleetEvent, 'id' | 'at'>) => {
@@ -150,13 +181,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     record({ machineId: m.machine.machineId, kind: 'state_changed', state: next, reason, requestId });
     void save();
   };
-  const freeSlot = () => {
-    const used = new Set(Object.values(state.machines).filter((m) => ACTIVE.includes(m.machine.state)).map((m) => m.slot));
-    let slot = 0;
-    while (used.has(slot)) slot += 1;
-    return slot;
-  };
-  const newRecord = (machineId: string, from?: HostMachine): HostMachine => {
+  const newRecord = (machineId: string, placement: Placement, from?: HostMachine): HostMachine => {
     const m: HostMachine = {
       machine: {
         machineId,
@@ -167,8 +192,9 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
         tailnet: from?.machine.tailnet ?? { status: 'awaiting_login', loginUrl: null, hostname: null },
         updatedAt: iso(),
       },
-      slot: freeSlot(),
-      metrics: null,
+      slot: placement.slot,
+      metrics: from?.metrics ?? null,
+      egress: { month: month(), bytes: placement.egressBytesThisMonth, counter: 0 },
     };
     state.machines[machineId] = m;
     return m;
@@ -182,19 +208,27 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────────────────────────
 
+  /** Starts the machine, or restores it from a snapshot, on its F3 network and F4 ceilings. */
   async function boot(m: HostMachine, snapshot?: { statePath: string; memPath: string }) {
     const id = m.machine.machineId;
-    const net = o.network ? await o.network.attach(id, m.slot) : undefined;
-    const vm = snapshot ? await o.runtime.restore(spec(m, net), snapshot) : await o.runtime.start(spec(m, net));
+    const net: MachineAddress = await o.network.attach(id, m.slot, { uid: uidBase + m.slot });
+    // A new tap's counter starts at 0.
+    m.egress.counter = 0;
+    const machineSpec = spec(m, {
+      network: { tapName: net.tapName, guestMac: net.guestMac, kernelIpArg: net.kernelIpArg, ...(capped(m) ? { txRateLimit: CAPPED_TX } : {}) },
+      cgroup: await o.fairUse.cgroupFor(id),
+    });
+    const vm = snapshot ? await o.runtime.restore(machineSpec, snapshot) : await o.runtime.start(machineSpec);
     vms.set(id, vm);
-    await o.fairUse.applyCeilings(vm.cgroupPath);
+    // A snapshot keeps the rate limiter it was taken with; the month may have changed since.
+    if (snapshot) await vm.updateNetworkRateLimit({ tx: capped(m) ? CAPPED_TX : UNLIMITED_TX });
   }
 
   async function release(id: string) {
     const vm = vms.get(id);
     vms.delete(id);
     if (vm) await vm.stop();
-    await o.network?.detach(id);
+    await o.network.detach(id);
   }
 
   async function guestCall(id: string, request: Parameters<typeof callGuest>[1], requestId?: string, timeoutMs = guestTimeoutMs) {
@@ -212,6 +246,8 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     await guestCall(id, { operation: 'prepare_to_stop', parameters: {} }, undefined, Math.min(guestTimeoutMs, PREPARE_TO_STOP_TIMEOUT_MS)).catch((error: unknown) =>
       log({ msg: 'prepare_to_stop failed; stopping anyway', machineId: id, error: String(error) }),
     );
+    // Charge the CPU and egress used since the last poll, so a stop loses none.
+    await measure(m, vm).catch((error: unknown) => log({ msg: 'last measurement before stop failed', machineId: id, error: String(error) }));
     let files;
     try {
       files = await vm.snapshot(snapshotDir(id));
@@ -228,6 +264,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     await rm(diskPath(id), { force: true });
     await rm(snapshotDir(id), { recursive: true, force: true });
     m.metrics = m.metrics && { ...m.metrics, memoryResidentMiB: 0 };
+    egressSamples.delete(id);
     setState(m, 'stopped', reason, requestId);
   }
 
@@ -280,18 +317,25 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     const id = m.machine.machineId;
     switch (payload.operation) {
       case 'bootstrap':
-      case 'update_pane':
-        await guestCall(id, { operation: payload.operation, parameters: { release: payload.parameters.release } }, payload.requestId, o.guestInstallTimeoutMs ?? 15 * 60_000);
+      case 'update_pane': {
+        const installed = await guestCall(id, { operation: payload.operation, parameters: { release: payload.parameters.release } }, payload.requestId, o.guestInstallTimeoutMs ?? 15 * 60_000);
+        if (payload.operation === 'bootstrap') log({ msg: 'bootstrap answered', machineId: id, firstBoot: GuestBootstrap.safeParse(installed).data?.firstBoot ?? 'unreported' });
         m.machine = { ...m.machine, paneVersion: payload.parameters.release.version, updatedAt: iso() };
         await refreshStatus(m).catch(() => undefined);
         return null;
+      }
       case 'prepare_to_stop':
         await guestCall(id, { operation: 'prepare_to_stop', parameters: {} }, payload.requestId);
         return null;
       case 'collect_diagnostics': {
         const found = GuestDiagnostics.parse(await guestCall(id, { operation: 'collect_diagnostics', parameters: {} }, payload.requestId));
+        const archive = Buffer.from(found.archive.base64, 'base64');
+        if (archive.length !== found.archive.bytes || createHash('sha256').update(archive).digest('hex') !== found.archive.sha256) {
+          throw new Error('The diagnostics archive the guest agent sent does not match its own size and SHA-256.');
+        }
         const archiveKey = `diagnostics/${id}/${payload.requestId}.tar.gz`;
-        await o.diagnostics.put(archiveKey, Buffer.from(found.archiveBase64, 'base64'));
+        await o.diagnostics.put(archiveKey, archive);
+        if (found.skipped.length > 0) log({ msg: 'diagnostics skipped files', machineId: id, requestId: payload.requestId, skipped: found.skipped });
         return { files: found.files, archiveKey };
       }
       default:
@@ -310,7 +354,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
   };
 
   /** Checks a signed operation against this host's own keys, releases and machine states, then runs it. */
-  async function receive(envelope: OperationEnvelope) {
+  async function receive(envelope: OperationEnvelope, placement: Placement) {
     const { requestId, machineId, operation, reason } = envelope.payload;
     if (state.operations[requestId]) return;
     const status: OperationStatus = { requestId, machineId, operation, status: 'accepted', error: null, result: null, acceptedAt: iso(), finishedAt: null };
@@ -324,7 +368,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
       if ((payload.operation === 'bootstrap' || payload.operation === 'update_pane') && !(await o.releases.isPublished(payload.parameters.release))) {
         throw new CloudApiError('release_not_published', `Pane ${payload.parameters.release.version} with that checksum is not a published release.`, 'Name a published release and its exact .deb checksum.');
       }
-      m = admit(payload);
+      m = admit(payload, placement);
     } catch (error) {
       return finish(status, { error: operationError(error) });
     }
@@ -342,27 +386,27 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
   }
 
   /** Checks the machine's state allows the operation and takes its first step, before any await. */
-  function admit(payload: OperationPayload): HostMachine {
+  function admit(payload: OperationPayload, placement: Placement): HostMachine {
     const { machineId: id, operation } = payload;
     const m = state.machines[id];
     const current = m?.machine.state;
     if (operation === 'create') {
       if (m && current !== 'deleted') throw new CloudApiError('machine_exists', `Machine ${id} already exists.`, 'Use a new machine id, or resume the existing machine.');
       if (draining) throw drainingError();
-      const created = newRecord(id);
+      const created = newRecord(id, placement);
       setState(created, 'creating', null, payload.requestId);
       return created;
     }
     if (operation === 'resume') {
       if (m && current !== 'stopped') throw invalidState(id, operation, current);
       if (draining) throw drainingError();
-      const resumed = newRecord(id, m);
+      const resumed = newRecord(id, placement, m);
       setState(resumed, 'resuming', null, payload.requestId);
       return resumed;
     }
     if (operation === 'delete') {
       if (current === 'deleting' || current === 'deleted') throw invalidState(id, operation, current);
-      const target = m ?? newRecord(id);
+      const target = m ?? newRecord(id, placement);
       setState(target, 'deleting', 'user', payload.requestId);
       return target;
     }
@@ -371,10 +415,10 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     return m;
   }
 
-  function recover(machineId: string, fromHostId: string) {
+  function recover(machineId: string, fromHostId: string, placement: Placement) {
     const existing = state.machines[machineId];
     if (existing && ACTIVE.includes(existing.machine.state)) return;
-    const m = newRecord(machineId, existing);
+    const m = newRecord(machineId, placement, existing);
     setState(m, 'resuming', 'host_lost');
     log({ msg: 'recovering machine from a lost host', machineId, fromHostId });
     void enqueue(machineId, async () => {
@@ -389,7 +433,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     });
   }
 
-  // ── Polling: guest status, idle stop, metrics, budget, maintenance, reclaim ─────────────────────
+  // ── Polling: guest status, idle stop, metrics, budget, egress, maintenance, reclaim ─────────────
 
   async function refreshStatus(m: HostMachine): Promise<GuestStatus> {
     const status = GuestStatus.parse(await guestCall(m.machine.machineId, { operation: 'status', parameters: {} }));
@@ -398,42 +442,95 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     return status;
   }
 
-  async function sample(m: HostMachine): Promise<{ residentMiB: number; idle: boolean }> {
+  /** Adds egress since the last reading to the month, and caps or uncaps the machine as the month's total says. */
+  async function meterEgress(m: HostMachine, vm: Vm, at: Date): Promise<void> {
     const id = m.machine.machineId;
-    const vm = vms.get(id);
-    if (!vm) return { residentMiB: 0, idle: false };
-    const at = now();
-    const status = await refreshStatus(m).catch(() => null);
-    const idle = status !== null && status.activity.agentsRunning === 0 && status.activity.clientsConnected === 0;
-    if (!idle) idleSince.delete(id);
-    else if (!idleSince.has(id)) idleSince.set(id, at.getTime());
+    const counter = await o.network.egressBytes(id);
+    const thisMonth = at.toISOString().slice(0, 7);
+    const before = m.egress.month === thisMonth ? m.egress.bytes : 0;
+    const wasCapped = checkMonthlyEgress(m.egress.bytes, egressPolicy).capped;
+    // A counter that went down was recreated, and counts from zero.
+    const sent = counter >= m.egress.counter ? counter - m.egress.counter : counter;
+    m.egress = { month: thisMonth, bytes: before + sent, counter };
+    const after = checkMonthlyEgress(m.egress.bytes, egressPolicy);
+    if (after.alert && !checkMonthlyEgress(before, egressPolicy).alert) log({ msg: 'egress alert: the machine passed the monthly alert threshold', machineId: id, bytesThisMonth: m.egress.bytes });
+    if (after.capped !== wasCapped) {
+      await vm.updateNetworkRateLimit({ tx: after.capped ? CAPPED_TX : UNLIMITED_TX });
+      log({ msg: after.capped ? 'egress capped for the rest of the month' : 'egress cap lifted for the new month', machineId: id, bytesThisMonth: m.egress.bytes });
+    }
+    const samples = (egressSamples.get(id) ?? []).filter((sample) => sample.at >= at.getTime() - 2 * egressPolicy.abuseWindowMs);
+    samples.push({ at: at.getTime(), bytes: counter });
+    egressSamples.set(id, samples);
+  }
 
-    const resident = Number((await readFile(join(vm.cgroupPath, 'memory.current'), 'utf8').catch(() => '0')).trim()) / 2 ** 20;
-    const cpu = await o.fairUse.chargeCpu(id, vm.cgroupPath, at);
-    const disk = await stat(diskPath(id)).then((s) => s.blocks * 512, () => 0);
-    const egress = o.network ? await o.network.egressBytes(id) : 0;
-    const before = m.metrics;
+  /** Charges CPU to F4's daily budget and egress to the month, and reads memory and disk: the machine's metrics. */
+  async function measure(m: HostMachine, vm: Vm, at = now()): Promise<MachineMetrics> {
+    const id = m.machine.machineId;
+    await o.fairUse.applyCeilings(vm.cgroupPath);
+    const cpu = await o.fairUse.check(id, vm.cgroupPath);
+    if (cpu.event) {
+      record({ machineId: id, kind: cpu.event, state: null, reason: null, requestId: null });
+      log({ msg: cpu.event, machineId: id, cpuSecondsUsed: cpu.cpuSecondsUsed });
+    }
+    await meterEgress(m, vm, at);
     m.metrics = {
       machineId: id,
       day: cpu.day,
       cpuSecondsUsed: cpu.cpuSecondsUsed,
       cpuBudgetSeconds: MACHINE_LIMITS.dailyCpuSeconds,
       throttled: cpu.throttled,
-      memoryResidentMiB: resident,
-      diskUsedBytes: disk,
-      egressBytesThisMonth: egress,
+      memoryResidentMiB: await o.fairUse.readResidentMiB(vm.cgroupPath),
+      diskUsedBytes: await stat(diskPath(id)).then((s) => s.blocks * 512, () => 0),
+      egressBytesThisMonth: m.egress.bytes,
       sampledAt: at.toISOString(),
     };
-    if (cpu.throttled && !before?.throttled) record({ machineId: id, kind: 'budget_exhausted', state: null, reason: null, requestId: null });
-    if (!cpu.throttled && before?.throttled) record({ machineId: id, kind: 'budget_reset', state: null, reason: null, requestId: null });
-    return { residentMiB: resident, idle };
+    return m.metrics;
+  }
+
+  /** How long, within the last 15 minutes, the machine's resident memory was above F4's 12 GiB line. */
+  function residentAboveLimitMs(id: string, at: number, mib: number): number {
+    const start = at - RECLAIM_RULES.residentWindowMs;
+    const samples = [...(residentSamples.get(id) ?? []), { at, mib }];
+    // Keep one sample from before the window: the first one inside counts from it.
+    while (samples.length > 1 && (samples[1]?.at ?? at) < start) samples.shift();
+    residentSamples.set(id, samples);
+    let total = 0;
+    for (let i = 1; i < samples.length; i += 1) {
+      const [prev, next] = [samples[i - 1], samples[i]];
+      if (prev && next && next.mib > RECLAIM_RULES.residentLimitMiB) total += next.at - Math.max(prev.at, start);
+    }
+    return total;
+  }
+
+  async function sample(m: HostMachine, at: Date): Promise<MachineSample | null> {
+    const id = m.machine.machineId;
+    const vm = vms.get(id);
+    if (!vm) return null;
+    const status = await refreshStatus(m).catch(() => null);
+    // clientsConnected is 0 until Pane serves it to the guest agent (fleet/guest/README.md).
+    const idle = status !== null && status.activity.agentsRunning === 0 && status.activity.clientsConnected === 0;
+    if (!idle) idleSince.delete(id);
+    else if (!idleSince.has(id)) idleSince.set(id, at.getTime());
+    const metrics = await measure(m, vm, at);
+    return {
+      machineId: id,
+      residentMiB: metrics.memoryResidentMiB,
+      idle,
+      balloon: await vm.balloonStats().catch(() => null),
+      residentAboveLimitMsInWindow: residentAboveLimitMs(id, at.getTime(), metrics.memoryResidentMiB),
+    };
   }
 
   async function poll() {
+    const at = now();
+    const memory = await hostMemory();
+    await o.hostMetrics.publish({ memoryUsedPercent: (100 * memory.usedMiB) / memory.totalMiB }).catch((error: unknown) => log({ msg: 'host metrics failed', error: String(error) }));
     const running = Object.values(state.machines).filter((m) => m.machine.state === 'running' && vms.has(m.machine.machineId));
-    const samples = [];
-    for (const m of running) samples.push({ machineId: m.machine.machineId, ...(await sample(m)) });
-    const at = now().getTime();
+    const samples: MachineSample[] = [];
+    for (const m of running) {
+      const found = await sample(m, at).catch((error: unknown) => log({ msg: 'sampling failed', machineId: m.machine.machineId, error: String(error) }));
+      if (found) samples.push(found);
+    }
     const stop = (m: HostMachine, reason: Reason) => {
       // An operation may have changed the machine while this poll sampled it.
       if (m.machine.state !== 'running') return;
@@ -450,23 +547,28 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
       log({ msg: 'maintenance requested; stopping every machine' });
     }
     for (const m of running) {
+      const id = m.machine.machineId;
+      const abuse = checkEgressAbuse(egressSamples.get(id) ?? [], egressPolicy);
       if (draining) stop(m, 'host_maintenance');
-      else if (at - (idleSince.get(m.machine.machineId) ?? at) >= IDLE_STOP_MS) stop(m, 'idle');
+      else if (abuse.stop) {
+        log({ msg: 'egress abuse; stopping the machine', machineId: id, bytesInWindow: abuse.bytesInWindow, windowMs: egressPolicy.abuseWindowMs });
+        stop(m, 'abuse');
+      } else if (at.getTime() - (idleSince.get(id) ?? at.getTime()) >= IDLE_STOP_MS) stop(m, 'idle');
     }
     if (draining) return;
-    for (const decision of o.fairUse.decideReclaim(hostMemory(), samples)) {
-      const m = state.machines[decision.machineId];
+    for (const action of o.fairUse.decideReclaim(memory, samples)) {
+      const m = state.machines[action.machineId];
       if (!m || m.machine.state !== 'running') continue;
-      log({ msg: 'reclaim', ...decision });
-      if (decision.kind === 'snapshot_stop') stop(m, 'memory_pressure');
-      else await vms.get(decision.machineId)?.setBalloon(decision.balloonMiB);
+      log({ msg: 'reclaim', ...action });
+      if (action.kind === 'snapshot_stop') stop(m, 'memory_pressure');
+      else await vms.get(action.machineId)?.setBalloon(action.targetMiB ?? 0).catch((error: unknown) => log({ msg: 'balloon failed', machineId: action.machineId, error: String(error) }));
     }
     void save();
   }
 
   // ── Sync with the fleet ────────────────────────────────────────────────────────────────────────
 
-  function report(): HostReport {
+  async function report(): Promise<HostReport> {
     const at = now().getTime();
     for (const [id, m] of Object.entries(state.machines)) {
       if (!ACTIVE.includes(m.machine.state) && m.machine.state !== 'error' && at - Date.parse(m.machine.updatedAt) > FINISHED_RECORD_MS) delete state.machines[id];
@@ -474,7 +576,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     for (const [id, op] of Object.entries(state.operations)) {
       if (op.finishedAt && at - Date.parse(op.finishedAt) > 24 * FINISHED_RECORD_MS) delete state.operations[id];
     }
-    const memory = hostMemory();
+    const memory = await hostMemory();
     const machines = Object.values(state.machines);
     return {
       hostId: o.hostId,
@@ -483,7 +585,8 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
       activeMachines: machines.filter((m) => ACTIVE.includes(m.machine.state)).length,
       memoryTargetMiB: memory.totalMiB * (o.memoryTargetFraction ?? 0.75),
       memoryUsedMiB: memory.usedMiB,
-      machines: machines.map((m) => ({ machine: m.machine, metrics: m.machine.state === 'running' ? m.metrics : null })),
+      // A stopped machine's last metrics carry its month's egress to the host it resumes on.
+      machines: machines.map((m) => ({ machine: m.machine, metrics: m.machine.state === 'deleted' ? null : m.metrics })),
       // Copies: an operation can finish while the report is in flight.
       operations: [...changedOperations].flatMap((id) => (state.operations[id] ? [{ ...state.operations[id] }] : [])),
       events: state.events.slice(0, 500),
@@ -492,7 +595,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
 
   async function sync() {
     await save();
-    const body = report();
+    const body = await report();
     const sent = new Set(changedOperations);
     const answer = await callRoute({ baseUrl: o.fleetUrl, token: o.token }, syncRoute, { params: { hostId: o.hostId }, body });
     for (const id of sent) {
@@ -506,11 +609,15 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
   }
 
   async function handle(work: Work) {
-    if (work.kind === 'operation') await receive(work.envelope);
-    else recover(work.machineId, work.fromHostId);
+    if (work.kind === 'operation') await receive(work.envelope, work.placement);
+    else recover(work.machineId, work.fromHostId, work.placement);
   }
 
   // ── Startup: reattach to machines that kept running while the agent was down ────────────────────
+
+  // Names this host on its data volume, so a host that adopts the volume after a loss can check it.
+  await mkdir(o.dataDir, { recursive: true });
+  await writeFile(join(o.dataDir, 'host-id'), `${o.hostId}\n`);
 
   for (const op of Object.values(state.operations)) {
     if (!op.finishedAt) finish(op, { error: { code: 'internal', message: 'The host agent restarted while the operation ran.', next: 'Read the machine state, then send the operation again if it is still needed.' } });
@@ -525,6 +632,8 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
       setState(m, 'error', 'failed');
     }
   }
+  // The firewall lasts until the host reboots. Replacing it would cut off machines still running.
+  if (vms.size === 0) await o.network.installHostRules();
   log({ msg: 'host agent ready', machines: vms.size });
   await save();
 

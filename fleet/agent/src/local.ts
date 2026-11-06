@@ -7,9 +7,10 @@ import { constants as fsConstants } from 'node:fs';
 import { access, copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import { canonicalJson, MACHINE_LIMITS, PaneRelease } from 'pane-cloud-contract';
+import { canonicalJson, PaneRelease } from 'pane-cloud-contract';
 import { z } from 'zod';
-import type { CpuUse, DiagnosticsStore, FairUsePort, MachineFiles, MaintenanceSignal, ReleaseList, SnapshotStore, VolumeRecovery } from './ports.js';
+import { applyCeilings, createCpuBudget, createFileBudgetStore, decideReclaim, readResidentMiB } from '@pane-cloud/fleet-fair-use';
+import type { DiagnosticsStore, FairUsePort, HostMetrics, MachineFiles, MaintenanceSignal, ReleaseList, SnapshotStore, VolumeRecovery } from './ports.js';
 
 const run = promisify(execFile);
 const exists = (path: string) => access(path, fsConstants.F_OK).then(() => true, () => false);
@@ -101,29 +102,71 @@ export function fileMaintenanceSignal(path: string): MaintenanceSignal {
   return { requested: () => exists(path) };
 }
 
+/** F4's package as the host agent's fair-use port, keeping each machine's CPU budget in `budgetDir`. */
+export function fleetFairUse(budgetDir: string, now?: () => Date): FairUsePort {
+  return { ...createCpuBudget(createFileBudgetStore(budgetDir), now ? { now } : {}), applyCeilings, readResidentMiB, decideReclaim };
+}
+
+/** Host metrics off: for development and tests, and a host with no AWS region. */
+export const noHostMetrics: HostMetrics = { publish: async () => undefined };
+
+/** The label `host-boot.sh` mounts at /srv. Only this host's own data volume may carry it. */
+export const DATA_LABEL = 'fleet-data';
+/** An adopted volume's label: an XFS label holds at most 12 characters. */
+export const ADOPTED_LABEL = 'fleet-adopt';
+
 /**
- * Fair use until F4 lands: no ceilings written and no reclaim, but CPU is charged from the cgroup's
- * `cpu.stat` against the daily budget, so metrics and budget events are real.
+ * A lost host's data volume, attached to this host (F6 attaches it), mounted at
+ * `<mountRoot>/<lostHostId>`. The volume is found by its `fleet-data` label among unmounted block
+ * devices and must hold `<dataSubdir>/host-id` naming the lost host. It is relabelled
+ * `fleet-adopt` once mounted, so `host-boot.sh` never sees two `fleet-data` volumes.
  */
-export function basicFairUse(): FairUsePort {
-  const days = new Map<string, { day: string; seconds: number; lastUsageUsec: number | null }>();
-  return {
-    applyCeilings: async () => undefined,
-    async chargeCpu(machineId, cgroupPath, now): Promise<CpuUse> {
-      const day = now.toISOString().slice(0, 10);
-      const stat = await readFile(join(cgroupPath, 'cpu.stat'), 'utf8').catch(() => '');
-      const usage = Number(/^usage_usec (\d+)$/m.exec(stat)?.[1] ?? 0);
-      let entry = days.get(machineId);
-      if (!entry || entry.day !== day) {
-        entry = { day, seconds: 0, lastUsageUsec: entry?.lastUsageUsec ?? null };
-        days.set(machineId, entry);
+export function adoptedVolumeRecovery(options: { mountRoot?: string; dataSubdir?: string } = {}): VolumeRecovery {
+  const mountRoot = options.mountRoot ?? '/srv/adopted';
+  const dataSubdir = options.dataSubdir ?? 'fleet';
+  const mounting = new Map<string, Promise<string>>();
+
+  async function adopt(lostHostId: string): Promise<string> {
+    const target = join(mountRoot, lostHostId);
+    if (await isMountpoint(target)) return target;
+    await mkdir(target, { recursive: true });
+    // -c /dev/null: probe every device now instead of trusting blkid's cache.
+    const labelled = async (label: string) => (await run('blkid', ['-c', '/dev/null', '-o', 'device', '-t', `LABEL=${label}`]).catch(() => ({ stdout: '' }))).stdout.split('\n').filter(Boolean);
+    const devices = [...(await labelled(DATA_LABEL)), ...(await labelled(ADOPTED_LABEL))];
+    for (const device of devices) {
+      if ((await run('findmnt', ['-rn', '-S', device]).catch(() => ({ stdout: '' }))).stdout.trim()) continue;
+      // Mounting replays the log of a volume whose host died, which a relabel needs.
+      await run('mount', ['-o', 'noatime,nodev,nosuid', device, target]);
+      const owner = (await readFile(join(target, dataSubdir, 'host-id'), 'utf8').catch(() => '')).trim();
+      if (owner !== lostHostId) {
+        await run('umount', [target]);
+        continue;
       }
-      // A restored machine has a new cgroup whose counter starts again from zero.
-      const delta = entry.lastUsageUsec === null || usage < entry.lastUsageUsec ? usage : usage - entry.lastUsageUsec;
-      entry.lastUsageUsec = usage;
-      entry.seconds += delta / 1e6;
-      return { day, cpuSecondsUsed: entry.seconds, throttled: entry.seconds >= MACHINE_LIMITS.dailyCpuSeconds };
+      await run('xfs_io', ['-c', `label -s ${ADOPTED_LABEL}`, target]);
+      return target;
+    }
+    throw new Error(`No unmounted ${DATA_LABEL} volume from ${lostHostId} is attached to this host.`);
+  }
+
+  return {
+    async diskOf(lostHostId, machineId) {
+      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(lostHostId) || lostHostId.startsWith('.')) throw new Error(`"${lostHostId}" is not a host id.`);
+      let mounted = mounting.get(lostHostId);
+      if (!mounted) {
+        mounted = adopt(lostHostId);
+        mounting.set(lostHostId, mounted);
+        mounted.catch(() => mounting.delete(lostHostId));
+      }
+      const path = join(await mounted, dataSubdir, 'disks', `${machineId}.ext4`);
+      if (!(await exists(path))) throw new Error(`No disk for ${machineId} on ${lostHostId}'s data volume.`);
+      return path;
     },
-    decideReclaim: () => [],
   };
+}
+
+async function isMountpoint(path: string): Promise<boolean> {
+  return run('mountpoint', ['-q', path]).then(
+    () => true,
+    () => false,
+  );
 }

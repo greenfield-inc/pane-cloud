@@ -29,6 +29,9 @@ echo "+cpu +cpuset +memory +io +pids" > "/sys/fs/cgroup/$FLEET_CGROUP/cgroup.sub
 
 # The data volume holds machine disks and jails. It is a separate EBS volume that outlives the host,
 # so a replacement host can mount it after a host loss. XFS gives reflink copies of the template.
+# A lost host's volume adopted by the host agent is relabelled fleet-adopt; two fleet-data volumes
+# would leave the choice of /srv to chance.
+[ "$(blkid -c /dev/null -o device -t "LABEL=$FLEET_DATA_LABEL" | wc -l)" -le 1 ] || fail "more than one volume is labelled $FLEET_DATA_LABEL."
 dev="$(blkid -L "$FLEET_DATA_LABEL" || true)"
 if [ -z "$dev" ]; then
   # A new, blank volume: the only unpartitioned NVMe disk with no filesystem signature.
