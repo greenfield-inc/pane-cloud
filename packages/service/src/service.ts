@@ -105,10 +105,14 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
     const inCohort = await db.query('SELECT 1 FROM cohort WHERE github_login_lower = lower($1)', [who.github_login]);
     if (inCohort.rowCount === 0) return who;
     await transaction(db, async (client) => {
+      // Lock the account so concurrent first requests create one team, not one each.
+      await client.query('SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE', [who.id]);
+      const seated = await client.query('SELECT 1 FROM seats WHERE account_id = $1', [who.id]);
+      if (seated.rowCount !== 0) return;
       const teamId = newId('team');
       await client.query('INSERT INTO teams (id, name, owner_account_id) VALUES ($1, $2, $3)', [teamId, `${who.github_login}'s team`, who.id]);
       await client.query(
-        "INSERT INTO seats (account_id, team_id, role, founding_price) VALUES ($1, $2, 'owner', true) ON CONFLICT (account_id) DO NOTHING",
+        "INSERT INTO seats (account_id, team_id, role, founding_price) VALUES ($1, $2, 'owner', true)",
         [who.id, teamId],
       );
     });
@@ -292,38 +296,52 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
 
     bind(r.createMachine, async ({ token, body }) => {
       const who = await caller(token);
-      const repeat = await db.query<MachineRow>('SELECT * FROM machines WHERE owner_account_id = $1 AND idempotency_key = $2', [who.id, body.idempotencyKey]);
-      const existing = repeat.rows[0];
-      if (existing) {
+      /** The machine a create with this idempotency key already made, as that create answered. */
+      const repeated = async () => {
+        const repeat = await db.query<MachineRow>('SELECT * FROM machines WHERE owner_account_id = $1 AND idempotency_key = $2', [who.id, body.idempotencyKey]);
+        const existing = repeat.rows[0];
+        if (!existing) return null;
         const entry = await db.query<ActionRow>("SELECT * FROM action_log WHERE machine_id = $1 AND operation = 'create' ORDER BY id LIMIT 1", [existing.id]);
         const first = entry.rows[0];
-        if (first) return { machine: machineView(existing, await usageFor(existing)), operation: actionView(first) };
-      }
+        return first ? { machine: machineView(existing, await usageFor(existing)), operation: actionView(first) } : null;
+      };
+      const earlier = await repeated();
+      if (earlier) return earlier;
       if (!who.team_id) {
         throw new CloudApiError('not_invited', "You're on the list. Pane Cloud is invite-only for now.", 'Wait for your invite, or ask a team owner to invite your GitHub login.');
       }
       const release = await releaseFor();
       const seatTaken = () => new CloudApiError('seat_has_machine', 'Your seat already has a machine.', 'Open your existing machine, or delete it before creating another.');
-      const created = await transaction(db, async (client) => {
-        const machineId = newId('m');
-        try {
-          await client.query(
-            `INSERT INTO machines (id, owner_account_id, name, idempotency_key, state) VALUES ($1, $2, $3, $4, 'creating')`,
-            [machineId, who.id, body.name, body.idempotencyKey],
-          );
-        } catch (error) {
-          if ((error as { code?: string }).code === '23505') throw seatTaken();
-          throw error;
+      let created;
+      try {
+        created = await transaction(db, async (client) => {
+          const machineId = newId('m');
+          try {
+            await client.query(
+              `INSERT INTO machines (id, owner_account_id, name, idempotency_key, state) VALUES ($1, $2, $3, $4, 'creating')`,
+              [machineId, who.id, body.name, body.idempotencyKey],
+            );
+          } catch (error) {
+            if ((error as { code?: string }).code === '23505') throw seatTaken();
+            throw error;
+          }
+          const rows = await logSteps(client, machineId, [
+            { operation: 'create', fleetOperation: 'create', parameters: {}, actor: userActor(who), reason: 'You created this machine.' },
+            { operation: 'bootstrap', fleetOperation: 'bootstrap', parameters: { release }, actor: { kind: 'service' }, reason: `First boot: install Pane ${release.version} and wait for your tailnet login.` },
+          ]);
+          const machine = (await client.query<MachineRow>('SELECT * FROM machines WHERE id = $1', [machineId])).rows[0];
+          const entry = rows[0];
+          if (!machine || !entry) throw new Error('create wrote nothing');
+          return { machine, entry };
+        });
+      } catch (error) {
+        // A concurrent create with the same key won the race: answer as it did.
+        if (error instanceof CloudApiError && error.code === 'seat_has_machine') {
+          const raced = await repeated();
+          if (raced) return raced;
         }
-        const rows = await logSteps(client, machineId, [
-          { operation: 'create', fleetOperation: 'create', parameters: {}, actor: userActor(who), reason: 'You created this machine.' },
-          { operation: 'bootstrap', fleetOperation: 'bootstrap', parameters: { release }, actor: { kind: 'service' }, reason: `First boot: install Pane ${release.version} and wait for your tailnet login.` },
-        ]);
-        const machine = (await client.query<MachineRow>('SELECT * FROM machines WHERE id = $1', [machineId])).rows[0];
-        const entry = rows[0];
-        if (!machine || !entry) throw new Error('create wrote nothing');
-        return { machine, entry };
-      });
+        throw error;
+      }
       void worker.kick();
       return { machine: machineView(created.machine, null), operation: actionView(created.entry) };
     }),
@@ -384,7 +402,7 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
 
     bind(r.listActionLog, async ({ token, params, query }) => {
       const machine = await machineRow(db, await caller(token), params.machineId ?? '');
-      const before = query.before === undefined ? null : /^act_\d+$/.test(query.before) ? query.before.slice(4) : undefined;
+      const before = query.before === undefined ? null : /^act_\d{1,18}$/.test(query.before) ? query.before.slice(4) : undefined;
       if (before === undefined) throw new CloudApiError('invalid_request', 'The before cursor is not one this service gave out.', 'Pass the nextCursor from the previous page.');
       const limit = query.limit ?? 50;
       const { rows } = await db.query<ActionRow>(

@@ -87,6 +87,14 @@ describe('Pane Cloud service', () => {
     expect(operations).toEqual(['start:user', 'stop:host', 'bootstrap:service', 'create:user']);
   });
 
+  it('answers retries of one create sent at the same time with the same machine', async () => {
+    const owner = await invitedOwner('racing-retries');
+    const key = randomUUID();
+    const answers = await Promise.all(Array.from({ length: 6 }, () => owner.createMachine('m', key)));
+    expect(new Set(answers.map((a) => a.machine.id)).size).toBe(1);
+    expect(new Set(answers.map((a) => a.operation.id)).size).toBe(1);
+  });
+
   it('pages the action log newest first', async () => {
     const owner = await invitedOwner('pager');
     const { machine } = await owner.createMachine('m', randomUUID());

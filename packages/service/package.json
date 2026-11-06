@@ -4,8 +4,6 @@
   "private": true,
   "description": "The Pane Cloud service: sign-in, teams and seats, the machine lifecycle and the per-machine action log",
   "license": "AGPL-3.0",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "engines": {
     "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
   },

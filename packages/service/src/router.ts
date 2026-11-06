@@ -24,6 +24,13 @@ export function bind<T extends Route>(target: T, handle: Handler<T>): BoundRoute
 
 const MAX_BODY_BYTES = 64 * 1024;
 
+/** The body was not read to its end, so the connection cannot carry another request. */
+class BodyTooLarge extends CloudApiError {
+  constructor() {
+    super('invalid_request', 'The request body is too large.', 'Send a body under 64 KB.');
+  }
+}
+
 function matchPath(pattern: string, path: string): Record<string, string> | null {
   const want = pattern.split('/');
   const got = path.split('/');
@@ -32,7 +39,13 @@ function matchPath(pattern: string, path: string): Record<string, string> | null
   for (let i = 0; i < want.length; i += 1) {
     const segment = want[i] ?? '';
     const actual = got[i] ?? '';
-    if (segment.startsWith(':')) params[segment.slice(1)] = decodeURIComponent(actual);
+    if (segment.startsWith(':')) {
+      try {
+        params[segment.slice(1)] = decodeURIComponent(actual);
+      } catch {
+        throw new CloudApiError('invalid_request', 'The path has invalid percent-encoding.', 'Encode path segments with encodeURIComponent.');
+      }
+    }
     else if (segment !== actual) return null;
   }
   return params;
@@ -45,7 +58,7 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
     // SAFETY: an IncomingMessage with no encoding set yields Buffer chunks.
     const buffer = chunk as Buffer;
     size += buffer.length;
-    if (size > MAX_BODY_BYTES) throw new CloudApiError('invalid_request', 'The request body is too large.', 'Send a smaller body.');
+    if (size > MAX_BODY_BYTES) throw new BodyTooLarge();
     chunks.push(buffer);
   }
   const text = Buffer.concat(chunks).toString('utf8');
@@ -111,6 +124,7 @@ export function createRouteServer(routes: BoundRoute[], log: (line: string) => v
         send(response, status, answer.data);
       } catch (error) {
         if (error instanceof CloudApiError) {
+          if (error instanceof BodyTooLarge) response.setHeader('connection', 'close');
           status = error.status;
           send(response, status, error.toBody());
         } else {
