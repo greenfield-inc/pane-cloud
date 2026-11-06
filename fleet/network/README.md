@@ -101,8 +101,7 @@ The thresholds come from the host agent's config (D-23).
 Each machine may open 100 new outbound connections a second, with bursts of 500. The kernel logs
 the first packet of every one. A connection over that budget is dropped, so nothing leaves the host
 without a log line; the guest's TCP retries it a moment later. Packets that belong to no tracked
-connection are dropped too.
-
+connection are dropped too. A line looks like this:
 
 ```
 fleet-flow <machineId> IN=fctap1 OUT=ens5 SRC=10.200.0.6 DST=203.0.113.2 ... PROTO=TCP SPT=58994 DPT=443 ...
