@@ -105,3 +105,18 @@ describe('host maintenance', () => {
     await eventually(async () => h.client.submitOperation(await h.sign('m-new', 'create')).catch((e: unknown) => e), (r) => r instanceof CloudApiError && r.code === 'no_capacity');
   });
 });
+
+describe('stop with a broken guest agent', () => {
+  test('snapshots and stops a machine whose guest agent never answers', async () => {
+    h = await startHarness({ hosts: [{ id: 'host-a' }] });
+    await run('m-silent', 'create');
+    const guest = hostOf('host-a').fake.guests.get('m-silent');
+    if (!guest) throw new Error('no guest');
+    guest.silent = true;
+    const finished = await run('m-silent', 'stop');
+    expect(finished.status).toBe('succeeded');
+    expect(guest.received).toContain('prepare_to_stop');
+    expect((await h.client.getMachine('m-silent')).state).toBe('stopped');
+    expect((await run('m-silent', 'resume')).status).toBe('succeeded');
+  });
+});

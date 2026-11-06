@@ -14,6 +14,8 @@ export interface FakeGuest {
   activity: { agentsRunning: number; clientsConnected: number; lastActivityAt: string | null };
   /** Every operation the guest agent received, in order. */
   received: string[];
+  /** A broken guest agent: it takes the connection and never answers. */
+  silent?: boolean;
 }
 
 /** Serves the guest agent protocol; the returned function ends it as a VM's process ending would. */
@@ -36,6 +38,7 @@ function serveGuest(socketPath: string, guest: FakeGuest): Promise<() => Promise
         }
         const request = JSON.parse(line) as { id: string; operation: string; parameters: { release?: { version: string } } };
         guest.received.push(request.operation);
+        if (guest.silent) continue;
         let result: unknown = {};
         if (request.operation === 'status') result = { paneVersion: guest.paneVersion, tailnet: guest.tailnet, activity: guest.activity };
         if (request.operation === 'bootstrap' || request.operation === 'update_pane') {

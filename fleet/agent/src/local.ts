@@ -2,19 +2,27 @@
  * Local implementations of the host agent's ports, for development, tests and a single host before
  * the AWS account exists. The README says what each becomes in production.
  */
+import { execFile } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import { access, copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { promisify } from 'node:util';
 import { canonicalJson, MACHINE_LIMITS, PaneRelease } from 'pane-cloud-contract';
 import { z } from 'zod';
 import type { CpuUse, DiagnosticsStore, FairUsePort, MachineFiles, MaintenanceSignal, ReleaseList, SnapshotStore, VolumeRecovery } from './ports.js';
 
+const run = promisify(execFile);
 const exists = (path: string) => access(path, fsConstants.F_OK).then(() => true, () => false);
 
-/** Copies a file, as a reflink where the filesystem supports it. */
+/**
+ * Copies a file, keeping its holes: a 50 GiB machine disk holds a few GiB of data. On Linux this is
+ * `cp --sparse=always`, as a reflink where the filesystem supports it; Node's copyFile would write
+ * every hole out as zeros.
+ */
 export async function copySparse(from: string, to: string): Promise<void> {
   await mkdir(dirname(to), { recursive: true });
-  await copyFile(from, to, fsConstants.COPYFILE_FICLONE);
+  if (process.platform === 'linux') await run('cp', ['--reflink=auto', '--sparse=always', from, to]);
+  else await copyFile(from, to, fsConstants.COPYFILE_FICLONE);
 }
 
 const FILE_NAMES = { diskPath: 'disk.ext4', statePath: 'vmstate', memPath: 'mem' } as const;

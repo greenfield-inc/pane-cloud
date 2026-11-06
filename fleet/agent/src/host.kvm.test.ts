@@ -67,7 +67,7 @@ describe.skipIf(!canRun)('host agent on KVM', () => {
     await agent?.close();
     await fleet?.close();
     if (work) await rm(work, { recursive: true, force: true });
-  });
+  }, 60_000);
 
   test('creates a machine, stops it to a snapshot and resumes it without a reboot', async () => {
     const client = createFleetClient({ baseUrl: fleet.url, token: 'kvm-service' });

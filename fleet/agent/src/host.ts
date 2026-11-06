@@ -28,6 +28,8 @@ import { type HostReport, syncRoute, type Work } from './sync.js';
 
 /** No agent running and no client connected for this long stops a machine (journey 9). */
 export const IDLE_STOP_MS = 30 * 60 * 1000;
+/** How long a stop waits for the guest agent's prepare_to_stop before snapshotting anyway. */
+const PREPARE_TO_STOP_TIMEOUT_MS = 10_000;
 
 type State = FleetMachine['state'];
 type Reason = NonNullable<FleetMachine['stateReason']>;
@@ -206,8 +208,10 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     if (m.machine.state !== 'stopping') setState(m, 'stopping', reason, requestId);
     const vm = vms.get(id);
     if (!vm) throw new Error(`Machine ${id} has no VM on this host.`);
-    // The guest's chance to flush; a guest that does not answer is stopped anyway.
-    await guestCall(id, { operation: 'prepare_to_stop', parameters: {} }).catch((error: unknown) => log({ msg: 'prepare_to_stop failed', machineId: id, error: String(error) }));
+    // The guest's chance to flush. Its user can break the guest agent, so this is best effort and short.
+    await guestCall(id, { operation: 'prepare_to_stop', parameters: {} }, undefined, Math.min(guestTimeoutMs, PREPARE_TO_STOP_TIMEOUT_MS)).catch((error: unknown) =>
+      log({ msg: 'prepare_to_stop failed; stopping anyway', machineId: id, error: String(error) }),
+    );
     let files;
     try {
       files = await vm.snapshot(snapshotDir(id));
@@ -217,8 +221,10 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
       setState(m, 'running', null, requestId);
       throw error;
     }
+    log({ msg: 'snapshot written', machineId: id });
     await release(id);
     await o.snapshots.put(id, { diskPath: diskPath(id), ...files });
+    log({ msg: 'snapshot uploaded', machineId: id });
     await rm(diskPath(id), { force: true });
     await rm(snapshotDir(id), { recursive: true, force: true });
     m.metrics = m.metrics && { ...m.metrics, memoryResidentMiB: 0 };
@@ -536,7 +542,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
       closed = true;
       for (const timer of timers) clearTimeout(timer);
       await Promise.all(running.map((current) => current()));
-      await Promise.all(queues.values());
+      // Machine work still running is not awaited: a new agent fails it and reattaches to the machine.
       await save();
     },
   };
