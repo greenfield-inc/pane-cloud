@@ -4,11 +4,36 @@
  *   pane-cloud-service cohort add <github-login> [note]
  *   pane-cloud-service cohort remove <github-login>
  *   pane-cloud-service cohort list
+ *   pane-cloud-service beta announce
+ *   pane-cloud-service beta delete-machines [--approved-by <name>]
+ * The beta commands read BETA_ENDS_AT, BETA_ANNOUNCEMENT_URL and OWN_AWS_TEMPLATE_URL, as the service does.
  */
+import { type BetaConfig, betaConfigFromEnv } from './beta';
+import { announceEnd, deleteEndedMachines, type Mailer } from './endOfBeta';
 import { createDb, type Db, migrate } from './db';
 
-export async function runCommand(db: Db, args: string[]): Promise<string> {
+export interface CommandDeps {
+  beta?: BetaConfig;
+  /** Sends the end-of-beta notice. None exists until SES production access does (aws-setup.md step 6). */
+  mailer?: Mailer;
+}
+
+async function betaCommand(db: Db, [action, ...args]: string[], deps: CommandDeps): Promise<string> {
+  const beta = deps.beta ?? betaConfigFromEnv();
+  if (action === 'announce') {
+    if (!deps.mailer) throw new Error('No email transport is set up yet: the notice email waits on SES production access (aws-setup.md step 6).');
+    return `Emailed the end date to ${await announceEnd(db, beta, deps.mailer)} people who hadn't had it.`;
+  }
+  if (action === 'delete-machines') {
+    const at = args.indexOf('--approved-by');
+    return deleteEndedMachines(db, beta, at === -1 ? null : (args[at + 1] ?? null));
+  }
+  throw new Error('Usage: beta announce | beta delete-machines [--approved-by <name>]');
+}
+
+export async function runCommand(db: Db, args: string[], deps: CommandDeps = {}): Promise<string> {
   const [command, action, login, ...rest] = args;
+  if (command === 'beta') return betaCommand(db, args.slice(1), deps);
   if (command === 'migrate') {
     const ran = await migrate(db);
     return ran.length ? `Applied ${ran.join(', ')}` : 'Already up to date';
@@ -28,7 +53,7 @@ export async function runCommand(db: Db, args: string[]): Promise<string> {
     const { rows } = await db.query<{ github_login_lower: string; added_at: Date; note: string | null }>('SELECT * FROM cohort ORDER BY added_at');
     return rows.map((r) => `${r.github_login_lower}\t${r.added_at.toISOString()}\t${r.note ?? ''}`).join('\n') || 'The cohort is empty.';
   }
-  throw new Error('Usage: migrate | cohort add <github-login> [note] | cohort remove <github-login> | cohort list');
+  throw new Error('Usage: migrate | cohort add <github-login> [note] | cohort remove <github-login> | cohort list | beta announce | beta delete-machines [--approved-by <name>]');
 }
 
 if (require.main === module) {

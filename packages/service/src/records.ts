@@ -118,15 +118,16 @@ export async function logSteps(client: Queryable, machineId: string, steps: Step
 
 /**
  * When the machine's push window ends: in the beta's push-window phase, an hour after the latest
- * start inside that phase, while the machine is running or resuming. Null otherwise.
+ * start inside that phase (or after the phase began, for a machine already on), and never later than
+ * the end date, while the machine is running or resuming. Null otherwise.
  */
 export async function pushWindowEndsAt(client: Queryable, row: MachineRow, beta: BetaConfig): Promise<string | null> {
   const status = betaStatus(beta);
-  if (status.phase !== 'push_windows' || !status.pushWindowsFrom || (row.state !== 'running' && row.state !== 'resuming')) return null;
+  if (status.phase !== 'push_windows' || !status.pushWindowsFrom || !status.endsAt || (row.state !== 'running' && row.state !== 'resuming')) return null;
   const { rows } = await client.query<{ at: Date | null }>(
     "SELECT max(requested_at) AS at FROM action_log WHERE machine_id = $1 AND operation = 'start' AND requested_at >= $2",
     [row.id, status.pushWindowsFrom],
   );
-  const started = rows[0]?.at;
-  return started ? new Date(started.getTime() + PUSH_WINDOW_MS).toISOString() : null;
+  const started = rows[0]?.at?.getTime() ?? Date.parse(status.pushWindowsFrom);
+  return new Date(Math.min(started + PUSH_WINDOW_MS, Date.parse(status.endsAt))).toISOString();
 }
