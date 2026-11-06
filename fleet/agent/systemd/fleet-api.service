@@ -1,0 +1,29 @@
+# The fleet API and scheduler. It needs no privileges: it keeps its state file and answers HTTP.
+[Unit]
+Description=Pane Cloud fleet API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node /opt/pane-fleet/agent/dist/cli.js serve-fleet --config /etc/pane-fleet/fleet.json
+LoadCredential=fleet-service-token:/etc/pane-fleet/credentials/fleet-service-token
+LoadCredential=fleet-host-token:/etc/pane-fleet/credentials/fleet-host-token
+DynamicUser=yes
+StateDirectory=pane-fleet
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

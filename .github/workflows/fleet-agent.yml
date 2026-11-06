@@ -1,0 +1,46 @@
+name: fleet-agent
+
+# fleet.yml already runs typecheck, lint and the unit tests for every fleet package. This job adds
+# the host agent's KVM test: create, stop and resume a real microVM through the fleet API.
+on:
+  pull_request:
+    paths: ['fleet/**', '.github/workflows/fleet-agent.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fleet
+
+jobs:
+  kvm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fleet/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: fleet/pnpm-lock.yaml
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools
+      - run: pnpm install --frozen-lockfile
+      - name: Fetch Firecracker and test images
+        run: sudo bash host/fetch-test-artifacts.sh /srv/fleet-artifacts
+      - name: cgroup v2 subtree for test machines
+        run: |
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p /sys/fs/cgroup/fleet-test
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/fleet-test/cgroup.subtree_control
+      - name: Host agent on KVM
+        env:
+          FLEET_TEST_ARTIFACTS: /srv/fleet-artifacts
+        run: sudo --preserve-env=FLEET_TEST_ARTIFACTS env "PATH=$PATH" pnpm --filter @pane-cloud/fleet-agent exec vitest run src/host.kvm.test.ts --reporter=verbose

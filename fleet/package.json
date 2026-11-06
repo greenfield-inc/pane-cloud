@@ -8,5 +8,6 @@
     "typecheck": "pnpm -r --if-present typecheck",
     "lint": "pnpm -r --if-present lint",
     "test": "pnpm -r --if-present test"
-  }
+  },
+  "pnpm": { "onlyBuiltDependencies": ["pane-cloud-contract"] }
 }

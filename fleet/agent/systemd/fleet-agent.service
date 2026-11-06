@@ -1,0 +1,23 @@
+# The host agent on a fleet host. It runs as root because the jailer needs root to give each machine
+# its own uid, chroot and cgroup. Machines live in their own cgroups under /sys/fs/cgroup/fleet, so
+# restarting the agent leaves them running and the new agent reattaches to them.
+[Unit]
+Description=Pane Cloud host agent
+After=network-online.target fleet-host-boot.service
+Wants=network-online.target
+Requires=fleet-host-boot.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node /opt/pane-fleet/agent/dist/cli.js serve-host --config /etc/pane-fleet/host.json
+LoadCredential=fleet-host-token:/etc/pane-fleet/credentials/fleet-host-token
+RuntimeDirectory=pane-fleet
+RuntimeDirectoryPreserve=yes
+KillMode=process
+Restart=always
+RestartSec=2
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
