@@ -1,5 +1,5 @@
 import type { BalloonStats } from '@pane-cloud/fleet-runtime';
-import { MACHINE_LIMITS } from 'pane-cloud-contract';
+import { MACHINE_LIMITS } from './limits.js';
 
 const MiB = 1024 ** 2;
 

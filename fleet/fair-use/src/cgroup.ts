@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { MACHINE_LIMITS } from 'pane-cloud-contract';
+import { MACHINE_LIMITS } from './limits.js';
 
 const MiB = 1024 ** 2;
 const CPU_PERIOD_US = 100_000;

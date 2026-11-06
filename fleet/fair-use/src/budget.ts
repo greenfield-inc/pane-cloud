@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { MACHINE_LIMITS, MachineId } from 'pane-cloud-contract';
+import { MACHINE_LIMITS, checkMachineId } from './limits.js';
 import { cpuMax, statField } from './cgroup.js';
 
 /** One machine's CPU use for one UTC day, kept so a host agent restart doesn't reset the budget. */
@@ -76,7 +76,7 @@ export function createCpuBudget(store: BudgetStore, options: { now?: () => Date 
 
 /** Keeps each machine's record in `<dir>/<machineId>.json`, replaced atomically. */
 export function createFileBudgetStore(dir: string): BudgetStore {
-  const pathOf = (machineId: string) => join(dir, `${MachineId.parse(machineId)}.json`);
+  const pathOf = (machineId: string) => join(dir, `${checkMachineId(machineId)}.json`);
   return {
     async get(machineId) {
       let text: string;

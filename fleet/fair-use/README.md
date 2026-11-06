@@ -41,7 +41,7 @@ beyond guest RAM, and checks that this plus 64 MiB of page tables fits in 256 Mi
 
 `createCpuBudget(store).check(machineId, cgroupPath)` reads `usage_usec` from the cgroup's
 `cpu.stat` and adds what the machine used since the last check to the UTC day's total. At 43,200
-vCPU-seconds (`MACHINE_LIMITS.dailyCpuSeconds`) it writes `cpu.max 50000 100000` (0.5 vCPU) and
+vCPU-seconds (the contract's `MACHINE_LIMITS.dailyCpuSeconds`) it writes `cpu.max 50000 100000` (0.5 vCPU) and
 returns `event: 'budget_exhausted'`. The first check after the next UTC midnight writes 8 vCPU back
 and returns `event: 'budget_reset'`. The result's `cpuSecondsUsed` and `throttled` are the fleet
 API's metric fields.
@@ -84,6 +84,13 @@ Firecracker v1.17 has both (added in v1.14, `free_page_reporting` and `free_page
 
 Reporting would also return memory from busy guests between builds. Turning it on means adding
 `free_page_reporting: true` to F1's `PUT /balloon`.
+
+## Contract values
+
+[`src/limits.ts`](src/limits.ts) copies the contract's `MACHINE_LIMITS` and machine id rule from
+pane-cloud-contract at greenfield-inc/Pane 5c3d3c6. Installing the contract from git runs a full Pane
+monorepo install, which fails on Linux (it rebuilds better-sqlite3 for Electron), so it is not a
+dependency yet. Replace the copy with an import once the contract installs on its own.
 
 ## Checks
 
