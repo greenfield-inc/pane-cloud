@@ -214,7 +214,11 @@ export function serviceHandlers({ db, github, fleet, worker, beta, billing }: Se
     return { machine, entry };
   };
 
-  /** Refuses to create or start a machine while the team's bill is unpaid or its subscription has ended. */
+  /**
+   * Refuses to create or start a machine while the caller's team's bill is unpaid or its subscription
+   * has ended. A caller with no seat, such as a removed teammate on their push window (D-27), has no
+   * team bill to check.
+   */
   const requirePaid = async (who: CallerRow) => {
     if (!billing || !who.team_id || (await billing.machinesAllowed(who.team_id))) return;
     throw new CloudApiError(

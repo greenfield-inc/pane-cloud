@@ -35,14 +35,14 @@ describe('billing in the service', () => {
     }
   };
 
-  it('bills a founding team $49 a seat from the start date, stops machines after 7 days unpaid, and lets them start once paid', async () => {
+  it('bills a founding team $49 a seat from the start date, stops its machines after 7 days unpaid, and lets them start once paid', async () => {
     await harness.cohort('bill-owner');
     const owner = harness.client(await harness.signIn({ id: 7001, login: 'bill-owner', name: 'Owner', email: 'owner@example.com' }));
     expect(await owner.getBilling()).toMatchObject({ plan: 'cohort', status: 'free', seatPriceCents: 4900, foundingPriceLocked: true, seats: 1, manageUrl: null });
 
     // The operator sends the notice: charges start in 14 days.
     const startAt = new Date(now.getTime() + 14 * DAY);
-    expect(await runCommand(harness.db, ['billing', 'announce', startAt.toISOString()], billingEnv, { stripe: stripe.gateway, now: () => now })).toMatch(/Charges start/);
+    expect(await runCommand(harness.db, ['billing', 'announce', startAt.toISOString()], billingEnv, { stripe: stripe.gateway, now: () => now })).toMatch(/Charges start .*Emailed 1 team owner/);
     const [mail] = readdirSync(outboxDir).map((f) => readFileSync(path.join(outboxDir, f), 'utf8'));
     expect(mail).toMatch(/^To: owner@example.com\nSubject: Pane Cloud billing starts /);
     expect(mail).toContain('founding team');
@@ -70,6 +70,14 @@ describe('billing in the service', () => {
     await harness.app.enforceBilling();
     expect((await owner.getMachine(machine.id)).state).toBe('running');
 
+    // During grace the teammate makes a machine and stops it; then the owner removes them, so they have no seat.
+    const { machine: mateMachine } = await mate.createMachine('mate', randomUUID());
+    await machineIn(mate, mateMachine.id, (m) => m.state === 'running', 'mate running');
+    await mate.stopMachine(mateMachine.id);
+    await machineIn(mate, mateMachine.id, (m) => m.state === 'stopped', 'mate stopped');
+    const account = await mate.getAccount();
+    await owner.removeMember(account.id);
+
     // Grace ends: the service stops the machine, logged as its own, and refuses to start it.
     now = new Date(now.getTime() + 7 * DAY + 1000);
     await harness.app.enforceBilling();
@@ -77,6 +85,9 @@ describe('billing in the service', () => {
     const { entries } = await owner.listActionLog(machine.id);
     expect(entries.find((e) => e.operation === 'stop')).toMatchObject({ actor: { kind: 'service', accountId: null }, reason: expect.stringMatching(/Payment failed/) });
     await expectError('invalid_state', () => owner.startMachine(machine.id));
+    // The removed teammate's start (their D-27 push window) isn't held to their old team's bill.
+    await mate.startMachine(mateMachine.id);
+    await machineIn(mate, mateMachine.id, (m) => m.state === 'running', 'mate push window');
 
     // Paid: the team is active and the machine starts again with its disk.
     stripe.acceptCards();
