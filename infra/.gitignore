@@ -1,0 +1,7 @@
+.terraform/
+test/.out/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!test/offline.tfvars
+__pycache__/

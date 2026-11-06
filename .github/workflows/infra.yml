@@ -1,0 +1,35 @@
+name: infra
+
+on:
+  pull_request:
+    paths: ['infra/**', '.github/workflows/infra.yml']
+  push:
+    branches: [main]
+    paths: ['infra/**', '.github/workflows/infra.yml']
+
+permissions:
+  contents: read
+
+# No AWS credentials exist in this workflow. The plan runs with fake keys and every AWS endpoint
+# blocked (infra/test/plan.sh), so a step that tried to reach AWS would fail.
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: fmt, validate, offline plan, containment tests
+        run: infra/test/check.sh
+      - name: Keep the rendered policies
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-policies
+          path: infra/test/.out/policies
+          if-no-files-found: ignore
