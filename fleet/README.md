@@ -119,6 +119,16 @@ and `status`, each with exactly the parameters the contract allows. `status` ret
 
 Idle stop (F2) reads `activity`: no agent running and no client connected for 30 minutes.
 
+`collect_diagnostics` returns `{ "files": [{ "path", "bytes" }], "archiveBase64": "<.tar.gz>" }`; the
+host agent stores the archive in the diagnostics bucket and returns its key.
+
+### F2 fleet API and host agents
+
+Hosts have no inbound ports, so each host agent calls the fleet API once a second:
+`POST /v1/hosts/<hostId>/sync` with its machines, metrics, changed operations and new events, and
+receives its work: signed envelopes exactly as the service sent them, and machines to rebuild from a
+lost host's disk. See [`agent/src/sync.ts`](agent/src/sync.ts).
+
 ## Where checks run
 
 Firecracker needs `/dev/kvm`. The KVM checks run in CI on GitHub's Ubuntu x86_64 runners, which

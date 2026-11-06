@@ -1,0 +1,35 @@
+{
+  "name": "@pane-cloud/fleet-agent",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": { "fleet-agent": "dist/cli.js" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1163.0",
+    "@aws-sdk/credential-provider-node": "^3.972.93",
+    "@pane-cloud/fleet-fair-use": "workspace:*",
+    "@pane-cloud/fleet-network": "workspace:*",
+    "@pane-cloud/fleet-runtime": "workspace:*",
+    "@smithy/signature-v4": "^5.7.5",
+    "pane-cloud-contract": "github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.2",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.0",
+    "vitest": "^3.2.4"
+  }
+}
