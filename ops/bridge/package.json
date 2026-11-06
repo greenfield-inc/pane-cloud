@@ -1,0 +1,16 @@
+{
+  "name": "pane-cloud-bridge",
+  "private": true,
+  "type": "module",
+  "description": "Operator tooling for the Pane Cloud bridge: hand-launched EC2 machines before the fleet is live.",
+  "license": "AGPL-3.0-only",
+  "bin": {
+    "bridge": "./bridge.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
