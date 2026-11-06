@@ -1,0 +1,9 @@
+[Unit]
+Description=Filtering DNS resolver for Pane Cloud machines
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/fleet/dns.conf --user=dnsmasq --pid-file=
+Restart=always
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,9 @@ and Node for the host agent. Every download is checked against its pinned SHA-25
 | [`install-firecracker.sh`](install-firecracker.sh) | `setup-host.sh`, CI | Downloads and checks the pinned Firecracker release |
 | [`fetch-test-artifacts.sh`](fetch-test-artifacts.sh) | CI | Firecracker, a test kernel and a test rootfs for the runtime's KVM tests |
 
+`setup-host.sh` also installs F3's filtering DNS resolver (`files/dns`, `fleet-dns.service`) and the
+flow log files (`files/rsyslog`, `files/logrotate`). See [`../network`](../network).
+
 The host follows Firecracker's [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md):
 
 - Every machine runs under the jailer: its own uid and gid, a chroot, a new PID namespace and its own

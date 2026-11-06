@@ -1,0 +1,11 @@
+# Local copies only; CloudWatch (F6) keeps the 90 days used for abuse reports.
+/var/log/fleet/flows.log {
+  daily
+  rotate 3
+  compress
+  missingok
+  notifempty
+  postrotate
+    /usr/lib/rsyslog/rsyslog-rotate
+  endscript
+}
