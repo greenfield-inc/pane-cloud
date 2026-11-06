@@ -1,0 +1,5 @@
+#!/bin/sh
+# Fake curl: saves the body sent with --data-binary and the target URL.
+while [ $# -gt 0 ]; do
+  case "$1" in --data-binary) printf '%s' "$2" > /out/signal.json; shift 2 ;; http*) echo "$1" > /out/signal.url; shift ;; *) shift ;; esac
+done

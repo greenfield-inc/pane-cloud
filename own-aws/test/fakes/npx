@@ -1,0 +1,9 @@
+#!/bin/sh
+# Fake npx: logs the user and arguments; prints a pairing code like runpane does.
+echo "npx[$(id -un)] $*" >> /out/calls.log
+case "$*" in
+  *"install daemon"*)
+    echo "Connection code: pane-remote://SECRET-PAIRING-CODE"
+    [ -n "$FAKE_INSTALL_FAILS" ] && { echo "install failed" >&2; exit 3; } ;;
+esac
+exit 0

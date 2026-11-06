@@ -1,0 +1,28 @@
+name: own-aws
+
+on:
+  pull_request:
+    paths: ["own-aws/**", ".github/workflows/own-aws.yml"]
+  push:
+    branches: [main]
+    paths: ["own-aws/**", ".github/workflows/own-aws.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  template:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cfn-lint==1.60.0
+      - name: cfn-lint
+        run: cfn-lint own-aws/pane-cloud.yaml
+      - name: shellcheck the first-boot script
+        working-directory: own-aws/test
+        run: python -c "import test_boot; print(test_boot.boot_script())" > "$RUNNER_TEMP/boot.sh" && shellcheck "$RUNNER_TEMP/boot.sh"
+      - name: first-boot tests
+        run: python -m unittest discover -v own-aws/test

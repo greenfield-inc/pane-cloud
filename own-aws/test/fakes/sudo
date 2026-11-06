@@ -1,0 +1,5 @@
+#!/bin/sh
+# Fake sudo: supports only `sudo -iu <user> <command...>`.
+[ "$1" = "-iu" ] || { echo "fake sudo: unsupported $*" >&2; exit 2; }
+user=$2; shift 2
+exec setpriv --reuid="$user" --regid="$user" --init-groups env HOME="/home/$user" PATH="$PATH" "$@"

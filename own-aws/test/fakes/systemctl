@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "systemctl $*" >> /out/calls.log
