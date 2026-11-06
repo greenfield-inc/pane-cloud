@@ -8,7 +8,8 @@ and calls the fleet API on the user's behalf.
   person's GitHub id, login, name and email, then drops the GitHub token. It stores only a hash of
   its own bearer token.
 - **Cohort, teams and seats**: Pane Cloud is invite-only. A GitHub login an operator adds to the
-  cohort gets a new team, as its owner, when it signs in. Owners invite teammates by GitHub login,
+  cohort gets a new team, as its owner, when it signs in, unless a team has invited it: then it
+  joins that team by accepting the invite. Owners invite teammates by GitHub login,
   and each member is one seat. Everyone else sees "You're on the list".
 - **Machines**: one per seat. Every create, start, stop, delete and operation is written to the
   machine's action log first. A worker then sends each step to the fleet, oldest first, as an

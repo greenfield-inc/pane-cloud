@@ -102,10 +102,14 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
     return teamId;
   };
 
-  /** A cohort login with no seat gets a new team, as its owner. */
+  /** A cohort login with no seat and no pending invite gets a new team, as its owner. */
   const ensureCohortTeam = async (who: CallerRow): Promise<CallerRow> => {
     if (who.team_id) return who;
-    const inCohort = await db.query('SELECT 1 FROM cohort WHERE github_login_lower = lower($1)', [who.github_login]);
+    const inCohort = await db.query(
+      `SELECT 1 FROM cohort WHERE github_login_lower = lower($1)
+       AND NOT EXISTS (SELECT 1 FROM invites WHERE lower(github_login) = lower($1) AND status = 'pending' AND expires_at > now())`,
+      [who.github_login],
+    );
     if (inCohort.rowCount === 0) return who;
     await transaction(db, async (client) => {
       // Lock the account so concurrent first requests create one team, not one each.

@@ -124,6 +124,23 @@ describe('Pane Cloud service', () => {
     expect((await owner.getBilling()).seats).toBe(2);
   });
 
+  it('lets a cohort login with a pending invite join the team that invited it, and gives it its own team once the invite is gone', async () => {
+    const owner = await invitedOwner('cohort-lead');
+    const invite = await owner.createInvite('cohort-mate');
+    await harness.cohort('cohort-mate');
+    const mate = harness.client(await harness.signIn(person('cohort-mate')));
+    expect(await mate.getAccount()).toMatchObject({ teamId: null, pendingInvites: [{ id: invite.id }] });
+    await mate.acceptInvite(invite.id);
+    expect(await mate.getAccount()).toMatchObject({ teamId: (await owner.getAccount()).teamId, role: 'member' });
+
+    const declined = await owner.createInvite('cohort-solo');
+    await harness.cohort('cohort-solo');
+    const solo = harness.client(await harness.signIn(person('cohort-solo')));
+    expect((await solo.getAccount()).teamId).toBeNull();
+    await owner.revokeInvite(declined.id);
+    expect(await solo.getAccount()).toMatchObject({ role: 'owner', pendingInvites: [] });
+  });
+
   it('keeps answering while the fleet is unreachable, and sends what was asked once it is back', async () => {
     const owner = await invitedOwner('durable');
     const { machine } = await owner.createMachine('m', randomUUID());
