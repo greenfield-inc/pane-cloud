@@ -101,6 +101,8 @@ export interface Runtime {
 
 // The serial console is emulated and slow, so the kernel and systemd print only errors to it.
 const DEFAULT_BOOT_ARGS = 'console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=3 systemd.show_status=false';
+// On x86 the kernel otherwise probes a PS/2 keyboard controller Firecracker doesn't have, which costs boot time.
+const ARCH_BOOT_ARGS = process.arch === 'x64' ? ' i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd' : '';
 const GUEST_CID = 3;
 const JAIL = { kernel: '/vmlinux', disk: '/disk.ext4', apiSock: '/api.sock', vsock: '/v.sock', snapshotDir: '/snapshot' } as const;
 
@@ -217,7 +219,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
         await api.call('PUT', '/machine-config', { vcpu_count: spec.vcpu, mem_size_mib: spec.memoryMiB, smt: false });
         await api.call('PUT', '/boot-source', {
           kernel_image_path: JAIL.kernel,
-          boot_args: [DEFAULT_BOOT_ARGS, spec.network?.kernelIpArg, spec.extraBootArgs].filter(Boolean).join(' '),
+          boot_args: [DEFAULT_BOOT_ARGS + ARCH_BOOT_ARGS, spec.network?.kernelIpArg, spec.extraBootArgs].filter(Boolean).join(' '),
         });
         // Writeback honours the guest's flushes, so a file the guest synced survives a host crash.
         await api.call('PUT', '/drives/rootfs', { drive_id: 'rootfs', path_on_host: JAIL.disk, is_root_device: true, is_read_only: false, cache_type: 'Writeback' });
