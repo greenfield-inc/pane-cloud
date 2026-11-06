@@ -2,6 +2,7 @@
 //   node probe.mjs serve <tcpPort,...> <udpPort,...>   TCP: replies "hello <peer>" and swallows input; UDP: echoes
 //   node probe.mjs tcp <host> <port> [sendBytes] [localAddress]   prints {"result":"open"|"refused"|"timeout"|<code>,"reply"}
 //   node probe.mjs udp <host> <port>                    prints {"result":"open"|"timeout","reply"}
+//   node probe.mjs flood <host> <firstPort> <count>     one UDP datagram to each of <count> ports: a new flow each
 import dgram from 'node:dgram';
 import net from 'node:net';
 
@@ -50,6 +51,12 @@ if (mode === 'serve') {
   sock.on('message', (msg) => done({ result: 'open', reply: String(msg) }));
   sock.on('error', (e) => done({ result: e.code }));
   sock.send('ping', Number(port), host);
+} else if (mode === 'flood') {
+  const [host, first, count] = args.map((a, i) => (i === 0 ? a : Number(a)));
+  const sock = dgram.createSocket('udp4');
+  sock.on('error', () => undefined);
+  for (let i = 0; i < count; i += 1) await new Promise((resolve) => sock.send('x', first + i, host, resolve));
+  done({ result: 'sent', count });
 } else {
   console.error('usage: probe.mjs serve|tcp|udp ...');
   process.exit(2);

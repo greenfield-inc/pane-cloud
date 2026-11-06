@@ -62,8 +62,22 @@ iptables `FORWARD` policy to drop, so fleet hosts do not run Docker.
 
 `dnsmasq` from the host image ([`host/files/dns/dns.conf`](../host/files/dns/dns.conf), unit
 `fleet-dns.service`), installed by `host/setup-host.sh` to `/etc/fleet/dns.conf`. It listens only on
-the taps' gateway addresses, picking up new taps as they appear, and runs as the `dnsmasq` user. It
-forwards to the VPC's Route 53 Resolver at `169.254.169.253`. The domains in
+the taps' gateway addresses, picking up new taps as they appear, and runs as the `dnsmasq` user.
+
+- **Upstream: Quad9** (`9.9.9.9`, `149.112.112.112`), a public resolver that also blocks known
+  malware domains. The VPC's Route 53 Resolver would answer `*.compute.internal`, `*.ec2.internal`
+  and the account's private zones with VPC addresses. A public resolver knows none of them, so no
+  list of private zones is needed. F6: hosts need outbound UDP and TCP 53 to those two addresses.
+- **`local=/internal/`**: AWS internal names answer NXDOMAIN without asking upstream.
+- **`stop-dns-rebind`** drops answers in private, loopback, link-local and test ranges, and
+  `bogus-nxdomain=100.64.0.0/10` turns answers in the shared range into NXDOMAIN. A public name
+  cannot point a guest's tools at the host's networks.
+- **No query log.** `log-queries` would record every name each user looks up, which is more than
+  abuse attribution needs; flow logs already show where a guest connected. DNS traffic goes to the
+  host, not out the uplink, so it is not in the egress counter. DNS tunnelling through the resolver
+  is an open point.
+
+The domains in
 [`dns-blocklist.conf`](../host/files/dns/dns-blocklist.conf) (`/etc/fleet/dns-blocklist.conf`) are
 public mining pools; they and their subdomains answer NXDOMAIN. The operators' fuller list is private
 config (D-23) installed over that file.
@@ -84,8 +98,11 @@ The thresholds come from the host agent's config (D-23).
 
 ## Flow logs
 
-The kernel logs the first packet of every new outbound connection, up to 100 a second per machine
-with bursts of 500. Connections past that limit still go through, unlogged but counted:
+Each machine may open 100 new outbound connections a second, with bursts of 500. The kernel logs
+the first packet of every one. A connection over that budget is dropped, so nothing leaves the host
+without a log line; the guest's TCP retries it a moment later. Packets that belong to no tracked
+connection are dropped too.
+
 
 ```
 fleet-flow <machineId> IN=fctap1 OUT=ens5 SRC=10.200.0.6 DST=203.0.113.2 ... PROTO=TCP SPT=58994 DPT=443 ...
@@ -110,7 +127,7 @@ and leaves it on.
 
 ## Not yet verified
 
-- The KVM test has not run yet: it needs a Linux host with `/dev/kvm`, and runs in CI on the PR.
-- On a real `r7g.metal`: the uplink name, the VPC resolver at `169.254.169.253`, AWS NAT of the
-  host's address, and the CloudWatch shipping of flow logs (F6), all wait for the AWS account (D-21).
-- Throughput and CPU cost of the ruleset with 109 machines sending at once.
+- On a real `r7g.metal`: the uplink name, Quad9 reachable from the hosts, AWS NAT of the host's
+  address, and the CloudWatch shipping of flow logs (F6), all wait for the AWS account (D-21).
+- Throughput and CPU cost of the ruleset with 109 machines sending at once, and whether the kernel
+  log keeps up when many machines open flows at their full budget together.

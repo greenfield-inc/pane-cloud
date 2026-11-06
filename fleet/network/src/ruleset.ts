@@ -11,8 +11,14 @@ export const TABLE = 'inet fleet';
  */
 const BLOCKED_V4 = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16', '224.0.0.0/4', '240.0.0.0/4'];
 
-/** New outbound flows logged per machine each second; past it the flows still pass and are counted. */
-const FLOW_LOG_RATE = 'limit rate 100/second burst 500 packets';
+/**
+ * New outbound flows a machine may open each second. Each one is logged; a flow over the budget is
+ * dropped, so no flow leaves the host without a log line.
+ */
+const FLOW_BUDGET = '100/second burst 500 packets';
+/** The first packet of a connection: its conntrack entry is not confirmed yet. Later packets of a flow
+ * that has seen no reply are still `ct state new`, so matching on state alone would log each one. */
+const FIRST_PACKET = 'ct status & confirmed == 0';
 /** Every flow log line starts with this, then the machine id. */
 const FLOW_LOG_PREFIX = 'fleet-flow';
 
@@ -26,7 +32,7 @@ export function renderHostRules({ uplink, subnet }: { uplink: string; subnet: st
   return `table ${TABLE} {}
 delete table ${TABLE}
 table ${TABLE} {
-  # tap name -> jump to that machine's chain (egress counter, flow log, accept).
+  # tap name -> jump to that machine's chain (flow budget, flow log, egress counter, accept).
   map machines {
     type ifname : verdict
   }
@@ -64,6 +70,8 @@ table ${TABLE} {
 
   chain guest_out {
     meta nfproto ipv6 drop
+    # Every packet that leaves belongs to a tracked connection, so it is logged when the flow starts.
+    ct state invalid drop
     # Out of the uplink only: no packet from one machine reaches another machine's tap.
     oifname != "${uplink}" goto refuse
     ip daddr @blocked_v4 goto refuse
@@ -87,7 +95,7 @@ table ${TABLE} {
 `;
 }
 
-/** Adds one machine: its egress counter and flow log, keyed by its tap. Safe to run twice. */
+/** Adds one machine: its flow budget, flow log and egress counter, keyed by its tap. Safe to run twice. */
 export function renderAttach(machineId: string, tapName: string): string {
   const chain = machineChain(machineId);
   const counter = egressCounter(machineId);
@@ -95,8 +103,9 @@ export function renderAttach(machineId: string, tapName: string): string {
 add counter ${TABLE} ${counter}
 add chain ${TABLE} ${chain}
 flush chain ${TABLE} ${chain}
+add rule ${TABLE} ${chain} ${FIRST_PACKET} limit rate over ${FLOW_BUDGET} drop
+add rule ${TABLE} ${chain} ${FIRST_PACKET} log prefix "${FLOW_LOG_PREFIX} ${machineId} " level info
 add rule ${TABLE} ${chain} counter name ${counter}
-add rule ${TABLE} ${chain} ct state new ${FLOW_LOG_RATE} log prefix "${FLOW_LOG_PREFIX} ${machineId} " level info
 add rule ${TABLE} ${chain} accept
 add element ${TABLE} machines { "${tapName}" : jump ${chain} }
 `;

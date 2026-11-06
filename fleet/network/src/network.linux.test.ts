@@ -62,7 +62,8 @@ describe.skipIf(!canRun)('host network on Linux', () => {
     await background(`ip netns exec net node ${probe} serve 22,25,80,443,853 3478,41641`);
     await background(
       `ip netns exec net dnsmasq --keep-in-foreground --no-resolv --no-hosts --listen-address=198.51.100.53 --bind-interfaces --user=root --pid-file= ` +
-        `--address=/example.test/203.0.113.80 --address=/supportxmr.com/203.0.113.81`,
+        `--address=/example.test/93.184.215.14 --address=/supportxmr.com/93.184.215.15 --address=/ip-10-0-0-5.ec2.internal/10.0.0.5 ` +
+        `--address=/private.test/10.1.2.3 --address=/linklocal.test/169.254.169.254 --address=/shared.test/100.64.1.1`,
     );
 
     net = createHostNetwork({ uplink: 'up0' });
@@ -74,7 +75,8 @@ describe.skipIf(!canRun)('host network on Linux', () => {
 
     // The host image's resolver config, pointed at the test's upstream instead of the VPC's.
     const conf = (await readFile(join(hostFiles, 'dns.conf'), 'utf8'))
-      .replace(/^server=.*$/m, 'server=198.51.100.53')
+      .replace(/^server=.*$/gm, '')
+      .concat('server=198.51.100.53\n')
       .replace(/^conf-file=.*$/m, `conf-file=${join(hostFiles, 'dns-blocklist.conf')}`);
     await writeFile(join(work, 'dns.conf'), conf);
     await background(`dnsmasq --keep-in-foreground --conf-file=${join(work, 'dns.conf')} --user=root --pid-file=`);
@@ -130,11 +132,19 @@ describe.skipIf(!canRun)('host network on Linux', () => {
 
   test('every DNS query goes to the filtering resolver, whichever server the guest asks', async () => {
     // 1.1.1.1 is not reachable in this test, so an answer proves the host's resolver gave it.
-    expect(await dig('ga', '1.1.1.1', 'example.test', '+short')).toBe('203.0.113.80\n');
-    expect(await dig('ga', '1.1.1.1', 'example.test', '+short +tcp')).toBe('203.0.113.80\n');
-    expect(await dig('ga', '10.200.0.5', 'example.test', '+short')).toBe('203.0.113.80\n');
+    expect(await dig('ga', '1.1.1.1', 'example.test', '+short')).toBe('93.184.215.14\n');
+    expect(await dig('ga', '1.1.1.1', 'example.test', '+short +tcp')).toBe('93.184.215.14\n');
+    expect(await dig('ga', '10.200.0.5', 'example.test', '+short')).toBe('93.184.215.14\n');
     expect(await dig('ga', '1.1.1.1', 'pool.supportxmr.com')).toContain('status: NXDOMAIN');
     expect((await tcp('ga', '203.0.113.2', 853)).result).toBe('refused');
+  });
+
+  test('the resolver hides internal names and private answers', async () => {
+    // The upstream knows all of these; the host's resolver must not pass them on.
+    expect(await dig('ga', '1.1.1.1', 'ip-10-0-0-5.ec2.internal')).toContain('status: NXDOMAIN');
+    for (const name of ['private.test', 'linklocal.test', 'shared.test']) {
+      expect(await dig('ga', '1.1.1.1', name, '+short')).toBe('');
+    }
   });
 
   test('each new outbound flow is logged with the machine id', async () => {
@@ -150,6 +160,20 @@ describe.skipIf(!canRun)('host network on Linux', () => {
     expect((await tcp('ga', '203.0.113.2', 443, String(5_000_000))).result).toBe('open');
     expect((await net.egressBytes(A)) - before).toBeGreaterThanOrEqual(5_000_000);
     expect((await net.egressBytes(B)) - otherBefore).toBeLessThan(10_000);
+  });
+
+  test('a flood of new flows cannot open one without a log line', async () => {
+    // Count what reaches the far side: one UDP packet per port, each a new flow.
+    await inNs('net', `sh -c "nft add table ip probe && nft add chain ip probe in '{ type filter hook input priority 0; }' && nft add rule ip probe in udp dport 20000-20999 counter"`);
+    await inNs('ga', `node ${probe} flood 203.0.113.2 20000 1000`);
+    await new Promise((r) => setTimeout(r, 500));
+    const received = Number(/packets (\d+)/.exec(await inNs('net', 'nft list chain ip probe in'))?.[1]);
+    const logged = [...(await sh('dmesg')).matchAll(new RegExp(`fleet-flow ${A} IN=fctap1 .*PROTO=UDP SPT=\\d+ DPT=2\\d{4} `, 'g'))].length;
+    // The budget is 100 new flows a second with a burst of 500: most of the flood is dropped, and
+    // every flow that got through has its log line.
+    expect(received).toBeGreaterThan(300);
+    expect(received).toBeLessThan(1000);
+    expect(logged).toBe(received);
   });
 
   test('detach removes the tap and the counter', async () => {

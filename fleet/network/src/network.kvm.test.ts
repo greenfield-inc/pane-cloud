@@ -80,10 +80,9 @@ describe.skipIf(!canRun)('journey 7: isolation from real guests', () => {
       await sh(`umount ${mnt}`);
     }
 
-    // The host image's resolver, with a public upstream and one test-only name that proves who answered.
+    // The host image's resolver, with one test-only name that proves who answered.
     const dns = join(here, '..', '..', 'host', 'files', 'dns');
     const conf = (await readFile(join(dns, 'dns.conf'), 'utf8'))
-      .replace(/^server=.*$/m, 'server=1.1.1.1')
       .replace(/^conf-file=.*$/m, `conf-file=${join(dns, 'dns-blocklist.conf')}\naddress=/pane-redirect.test/192.0.2.1`);
     await writeFile(join(work, 'dns.conf'), conf);
     resolver = spawn('dnsmasq', ['--keep-in-foreground', `--conf-file=${join(work, 'dns.conf')}`, '--user=root', '--pid-file='], { stdio: 'inherit' });
