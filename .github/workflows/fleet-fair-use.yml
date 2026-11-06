@@ -1,0 +1,100 @@
+name: fleet-fair-use
+
+# Typecheck, lint and the unit tests run in fleet.yml. These jobs need root (real cgroups) or KVM.
+on:
+  pull_request:
+    paths: ['fleet/fair-use/**', 'fleet/runtime/**', 'fleet/host/**', 'fleet/pnpm-lock.yaml', '.github/workflows/fleet-fair-use.yml']
+  push:
+    branches: [main]
+    paths: ['fleet/fair-use/**', 'fleet/runtime/**', 'fleet/host/**', 'fleet/pnpm-lock.yaml', '.github/workflows/fleet-fair-use.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fleet
+
+jobs:
+  # Ceilings and the CPU budget's throttle on the runner's own cgroup v2 hierarchy.
+  cgroup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fleet/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: fleet/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: cgroup v2 subtree for the tests
+        run: |
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p /sys/fs/cgroup/fair-use-test
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/fair-use-test/cgroup.subtree_control
+      - name: Real cgroup tests
+        env:
+          FLEET_CGROUP_TEST_PARENT: fair-use-test
+        run: sudo --preserve-env=FLEET_CGROUP_TEST_PARENT env "PATH=$PATH" pnpm --filter @pane-cloud/fleet-fair-use exec vitest run --reporter=verbose src/cgroup.privileged.test.ts
+
+  # Journey 5 on real microVMs, scaled to the runner: OOM inside the guest only, and balloon reclaim.
+  kvm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fleet/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: fleet/pnpm-lock.yaml
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools
+      - run: pnpm install --frozen-lockfile
+      - name: Fetch Firecracker and test images
+        run: sudo bash host/fetch-test-artifacts.sh /srv/fleet-artifacts
+      - name: Test rootfs with a memory hog
+        run: |
+          set -euo pipefail
+          sudo cp /srv/fleet-artifacts/rootfs.ext4 /srv/fleet-artifacts/rootfs-hog.ext4
+          mnt="$(mktemp -d)"
+          sudo mount -o loop /srv/fleet-artifacts/rootfs-hog.ext4 "$mnt"
+          sudo tee "$mnt/usr/local/bin/pane-hog" > /dev/null <<'SCRIPT'
+          #!/bin/sh
+          # Holds pane.hog_mib MiB in one process (tail buffers a line with no end), then lets it go.
+          mib="$(sed -n 's/.*pane\.hog_mib=\([0-9]*\).*/\1/p' /proc/cmdline)"
+          [ -n "$mib" ] || exit 0
+          head -c "${mib}M" /dev/zero | tail > /dev/null
+          echo "PANE_HOG_DONE $?" > /dev/ttyS0
+          SCRIPT
+          sudo chmod 755 "$mnt/usr/local/bin/pane-hog"
+          sudo tee "$mnt/etc/systemd/system/pane-hog.service" > /dev/null <<'UNIT'
+          [Unit]
+          Description=Hold memory for the fair-use tests
+          After=multi-user.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/pane-hog
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo ln -sf ../pane-hog.service "$mnt/etc/systemd/system/multi-user.target.wants/pane-hog.service"
+          sudo umount "$mnt"
+      - name: cgroup v2 subtree for test machines
+        run: |
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p /sys/fs/cgroup/fleet-test
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/fleet-test/cgroup.subtree_control
+      - name: Fair-use tests on KVM
+        env:
+          FLEET_TEST_ARTIFACTS: /srv/fleet-artifacts
+        run: sudo --preserve-env=FLEET_TEST_ARTIFACTS env "PATH=$PATH" pnpm --filter @pane-cloud/fleet-fair-use exec vitest run --reporter=verbose src/fair-use.kvm.test.ts
