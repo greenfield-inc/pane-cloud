@@ -14,7 +14,7 @@ Target: each person has a working machine on their own tailnet within 30 minutes
 
 ## Tools
 
-Run everything from a checkout of this repo, with Node 20 or later, AWS CLI v2, OpenSSH, and `gh` signed in to any GitHub account.
+Run everything from a checkout of this repo, with Node 22 or later, AWS CLI v2, OpenSSH, and `gh` signed in to any GitHub account.
 
 ```sh
 cd ops/bridge
