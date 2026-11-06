@@ -21,6 +21,8 @@ export interface MachineRow {
   tailnet_hostname: string | null;
   fleet_updated_at: Date | null;
   shared_at: Date | null;
+  /** Set while the owner has no seat after being removed from their team (D-27). */
+  seat_removed_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -117,15 +119,24 @@ export async function logSteps(client: Queryable, machineId: string, steps: Step
 }
 
 /**
- * When the machine's push window ends: in the beta's push-window phase, an hour after the latest
- * start inside that phase, while the machine is running or resuming. Null otherwise.
+ * Since when a start runs only for a push window, or null when starts are unlimited: from the beta's
+ * push-window phase, and while the owner has no seat after being removed from their team (D-27).
  */
-export async function pushWindowEndsAt(client: Queryable, row: MachineRow, beta: BetaConfig): Promise<string | null> {
+export function pushWindowsSince(row: Pick<MachineRow, 'seat_removed_at'>, beta: BetaConfig): Date | null {
   const status = betaStatus(beta);
-  if (status.phase !== 'push_windows' || !status.pushWindowsFrom || (row.state !== 'running' && row.state !== 'resuming')) return null;
+  const since = [status.phase === 'push_windows' && status.pushWindowsFrom ? new Date(status.pushWindowsFrom) : null, row.seat_removed_at]
+    .filter((at): at is Date => at !== null)
+    .sort((a, b) => a.getTime() - b.getTime());
+  return since[0] ?? null;
+}
+
+/** When the machine's push window ends: an hour after the latest push-window start, while it is running or resuming. */
+export async function pushWindowEndsAt(client: Queryable, row: MachineRow, beta: BetaConfig): Promise<string | null> {
+  const since = pushWindowsSince(row, beta);
+  if (!since || (row.state !== 'running' && row.state !== 'resuming')) return null;
   const { rows } = await client.query<{ at: Date | null }>(
     "SELECT max(requested_at) AS at FROM action_log WHERE machine_id = $1 AND operation = 'start' AND requested_at >= $2",
-    [row.id, status.pushWindowsFrom],
+    [row.id, since],
   );
   const started = rows[0]?.at;
   return started ? new Date(started.getTime() + PUSH_WINDOW_MS).toISOString() : null;

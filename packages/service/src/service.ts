@@ -122,6 +122,7 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
         "INSERT INTO seats (account_id, team_id, role, founding_price) VALUES ($1, $2, 'owner', true)",
         [who.id, teamId],
       );
+      await client.query('UPDATE machines SET seat_removed_at = NULL WHERE owner_account_id = $1 AND seat_removed_at IS NOT NULL', [who.id]);
     });
     return reloadCaller(who.id);
   };
@@ -360,9 +361,23 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
       const who = await caller(token);
       assertCanStart(beta);
       const pushWindow = betaStatus(beta).phase === 'push_windows';
+      const seatless = !who.team_id;
+      if (seatless) {
+        // Without a seat, a machine starts once after its owner was removed from their team (D-27).
+        const { rows } = await db.query<{ used: boolean }>(
+          `SELECT m.seat_removed_at IS NULL OR EXISTS (SELECT 1 FROM action_log s WHERE s.machine_id = m.id AND s.operation = 'start' AND s.requested_at >= m.seat_removed_at) AS used
+           FROM machines m WHERE m.id = $1 AND m.owner_account_id = $2`,
+          [params.machineId ?? '', who.id],
+        );
+        if (rows[0]?.used) {
+          throw new CloudApiError('invalid_state', 'You already used your one push window since leaving your team.', 'Ask a team owner to invite you again, or delete the machine.');
+        }
+      }
       const { machine, entry } = await queue(who, params.machineId ?? '', (m) => {
         requireState(m, 'stopped', 'Start');
-        const reason = pushWindow ? 'You started this machine for a 60-minute push window before the beta ends.' : 'You started this machine.';
+        let reason = 'You started this machine.';
+        if (seatless) reason = 'You started this machine for a 60-minute push window after leaving your team.';
+        else if (pushWindow) reason = 'You started this machine for a 60-minute push window before the beta ends.';
         return { steps: [{ operation: 'start', fleetOperation: 'resume', parameters: {}, actor: userActor(who), reason }], state: 'resuming', userStep: 0 };
       });
       return { machine: await view(machine, null), operation: actionView(entry) };
@@ -548,6 +563,7 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
           [who.id, invite.team_id, invite.founding],
         );
         if (seat.rowCount === 0) throw new CloudApiError('already_member', 'You are already on a team.', 'Leave your current team first.');
+        await client.query('UPDATE machines SET seat_removed_at = NULL WHERE owner_account_id = $1 AND seat_removed_at IS NOT NULL', [who.id]);
       });
       return accountView(await reloadCaller(who.id));
     }),
@@ -560,12 +576,17 @@ export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps
       await transaction(db, async (client) => {
         const removed = await client.query("DELETE FROM seats WHERE account_id = $1 AND team_id = $2 AND role = 'member'", [accountId, teamId]);
         if (removed.rowCount === 0) throw new CloudApiError('not_team_member', 'That account is not on your team.', 'List your team to see its members.');
-        await client.query('UPDATE machines SET shared_at = NULL, updated_at = now() WHERE owner_account_id = $1 AND shared_at IS NOT NULL', [accountId]);
+        // The worker stops their machine with its disk kept; it starts once more for a push window (D-27).
+        await client.query(
+          "UPDATE machines SET shared_at = NULL, seat_removed_at = now(), updated_at = now() WHERE owner_account_id = $1 AND state NOT IN ('deleted', 'deleting')",
+          [accountId],
+        );
         await client.query(
           'DELETE FROM connection_codes WHERE for_account_id = $1 OR machine_id IN (SELECT id FROM machines WHERE owner_account_id = $1)',
           [accountId],
         );
       });
+      void worker.kick();
       return teamView(teamId);
     }),
 

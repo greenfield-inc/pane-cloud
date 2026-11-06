@@ -20,6 +20,10 @@ and calls the fleet API on the user's behalf.
   its own, such as an idle stop), why, and the exact parameters sent. The machine page reads it.
 - **Team directory**: owners can list a machine for their team and leave a single-use connection
   code for one teammate. Neither admits anyone: the owner approves teammates on the host.
+- **Removing a teammate**: their seat goes, their machine leaves the team directory, and the service
+  stops the machine with its disk kept. Without a seat they can start it once, for a 60-minute push
+  window to push their work, after which the service stops it again. Joining a team again lifts the
+  limit.
 - **End of the beta**: `GET /v1/beta` publishes `BETA_ENDS_AT` and the phases that follow from it.
   Notice starts 30 days before the end. From 14 days before, no machine can be created, and a start
   runs for a 60-minute push window, after which the service stops the machine. Once the beta ends,
