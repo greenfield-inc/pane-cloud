@@ -61,6 +61,23 @@ describe('daily CPU budget', () => {
     expect(await b.check('m1', cgroup)).toMatchObject({ cpuSecondsUsed: 3_600, throttled: false, event: null });
   });
 
+  test('a throttled machine starts throttled until the next UTC midnight', async () => {
+    const b = budget();
+    clock = new Date('2026-11-05T08:00:00Z');
+    expect((await b.cgroupFor('m1'))['cpu.max']).toBe(FULL); // never seen
+    await b.check('m1', cgroup);
+    clock = new Date('2026-11-05T20:00:00Z');
+    await setUsage(43_200);
+    await b.check('m1', cgroup);
+
+    // What F2 hands the jailer when it starts, restores or recovers the machine.
+    const atStart = await b.cgroupFor('m1');
+    expect(atStart['cpu.max']).toBe(THROTTLED);
+    expect(atStart['memory.swap.max']).toBe('0');
+    expect((await b.cgroupFor('m1', new Date('2026-11-05T23:59:59Z')))['cpu.max']).toBe(THROTTLED);
+    expect((await b.cgroupFor('m1', new Date('2026-11-06T00:00:00Z')))['cpu.max']).toBe(FULL);
+  });
+
   test('a host agent restart keeps the day’s usage', async () => {
     clock = new Date('2026-11-05T08:00:00Z');
     await setUsage(1_000);

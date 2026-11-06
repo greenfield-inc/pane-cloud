@@ -5,11 +5,16 @@ const MiB = 1024 ** 2;
 
 /** The margin triggers from the plan's "Fair use and margin" section, and the balloon policy. */
 export const RECLAIM_RULES = {
-  /** Rule 2: a machine resident above this for `residentLimitForMs` while the host is above `stopAboveHostFraction` is stopped. */
+  /**
+   * Rule 2: while the host is above `stopAboveHostFraction`, a machine above this now, and above it
+   * for `residentLimitForMs` in total within the last `residentWindowMs`, is stopped. A total over a
+   * window, not an unbroken streak, so a guest can't reset the clock by dipping for one sample.
+   */
   residentLimitMiB: 12 * 1024,
   residentLimitForMs: 10 * 60_000,
+  residentWindowMs: 15 * 60_000,
   stopAboveHostFraction: 0.75,
-  /** Rule 3: at this host use, the largest idle machines are stopped until the host is under it. */
+  /** Rule 3: at this host use, machines above 12 GiB and then the largest idle machines are stopped until the host is under it. */
   stopIdleAtHostFraction: 0.85,
   /** Rule 1: an idle guest keeps this much memory free above what it uses. */
   keepAvailableMiB: 1024,
@@ -32,8 +37,11 @@ export interface MachineSample {
   idle: boolean;
   /** The Firecracker balloon's state and the guest's own counters; null when unreadable. */
   balloon: BalloonStats | null;
-  /** How long `residentMiB` has stayed above 12 GiB without a break; 0 when it is under. */
-  residentAboveLimitForMs: number;
+  /**
+   * How long, in total, `residentMiB` was above 12 GiB within the last 15 minutes. Each sample above
+   * 12 GiB counts for the time since the sample before it.
+   */
+  residentAboveLimitMsInWindow: number;
 }
 
 export interface ReclaimAction {
@@ -56,8 +64,8 @@ export function decideReclaim(host: HostSample, machines: readonly MachineSample
 
   if (host.usedMiB > host.totalMiB * r.stopAboveHostFraction) {
     for (const m of machines) {
-      if (m.residentMiB > r.residentLimitMiB && m.residentAboveLimitForMs >= r.residentLimitForMs) {
-        stops.push({ kind: 'snapshot_stop', machineId: m.machineId, reason: `Host memory is above 75% and this machine has held more than 12 GiB for ${Math.floor(m.residentAboveLimitForMs / 60_000)} minutes.` });
+      if (m.residentMiB > r.residentLimitMiB && m.residentAboveLimitMsInWindow >= r.residentLimitForMs) {
+        stops.push({ kind: 'snapshot_stop', machineId: m.machineId, reason: `Host memory is above 75% and this machine held more than 12 GiB for ${Math.floor(m.residentAboveLimitMsInWindow / 60_000)} of the last 15 minutes.` });
         usedMiB -= m.residentMiB;
       }
     }
@@ -66,10 +74,15 @@ export function decideReclaim(host: HostSample, machines: readonly MachineSample
   const line = host.totalMiB * r.stopIdleAtHostFraction;
   if (usedMiB >= line) {
     const stopping = new Set(stops.map((s) => s.machineId));
-    const idleLargestFirst = machines.filter((m) => m.idle && !stopping.has(m.machineId)).sort((a, b) => b.residentMiB - a.residentMiB);
-    for (const m of idleLargestFirst) {
+    const largestFirst = (list: MachineSample[]) => list.sort((a, b) => b.residentMiB - a.residentMiB);
+    const candidates = machines.filter((m) => !stopping.has(m.machineId));
+    // Machines over 12 GiB go first, busy or not, so one large guest can't push out other tenants' idle machines.
+    const overLimit = largestFirst(candidates.filter((m) => m.residentMiB > r.residentLimitMiB));
+    const idle = largestFirst(candidates.filter((m) => m.idle && m.residentMiB <= r.residentLimitMiB));
+    for (const m of [...overLimit, ...idle]) {
       if (usedMiB < line) break;
-      stops.push({ kind: 'snapshot_stop', machineId: m.machineId, reason: 'Host memory reached 85%; the largest idle machines are stopped first.' });
+      const why = m.residentMiB > r.residentLimitMiB ? 'machines above 12 GiB are stopped first' : 'the largest idle machines are stopped next';
+      stops.push({ kind: 'snapshot_stop', machineId: m.machineId, reason: `Host memory reached 85%; ${why}.` });
       usedMiB -= m.residentMiB;
     }
   }

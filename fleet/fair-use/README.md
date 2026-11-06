@@ -6,20 +6,25 @@ its decisions on a timer, stops machines with the contract's `memory_pressure` r
 user.
 
 ```ts
-import { MACHINE_CGROUP, applyCeilings, createCpuBudget, createFileBudgetStore, decideReclaim, readHostMemory, readResidentMiB } from '@pane-cloud/fleet-fair-use';
-
-await runtime.start({ ...spec, memoryMiB: 16_384, vcpu: 8, cgroup: MACHINE_CGROUP, balloon: { deflateOnOom: true, statsPollingIntervalS: 5 } });
+import { applyCeilings, createCpuBudget, createFileBudgetStore, decideReclaim, readHostMemory, readResidentMiB } from '@pane-cloud/fleet-fair-use';
 
 const budget = createCpuBudget(createFileBudgetStore('/srv/fleet/state/cpu-budget'));
+
+// Every start, restore and recovery: the ceilings, throttled already if today's budget is used.
+const cgroup = await budget.cgroupFor(machineId);
+await runtime.start({ ...spec, memoryMiB: 16_384, vcpu: 8, cgroup, balloon: { deflateOnOom: true, statsPollingIntervalS: 5 } });
+
 const { cpuSecondsUsed, throttled, event } = await budget.check(machineId, vm.cgroupPath); // every minute, and before a stop
 
-const actions = decideReclaim(await readHostMemory(), samples); // samples: residentMiB from readResidentMiB, idle, vm.balloonStats()
+const actions = decideReclaim(await readHostMemory(), samples); // see "What the host agent tracks"
 ```
 
 ## Ceilings
 
-`MACHINE_CGROUP` is what the jailer writes before Firecracker starts. `applyCeilings(cgroupPath)`
-writes the same files into a running machine's cgroup.
+`MACHINE_CGROUP` holds the ceilings. The jailer writes them before Firecracker starts, from
+`budget.cgroupFor(machineId)`, which is `MACHINE_CGROUP` with `cpu.max` at 0.5 vCPU when the machine
+has used today's budget. `applyCeilings(cgroupPath)` writes `MACHINE_CGROUP` into a running
+machine's cgroup.
 
 | File | Value | Why |
 | --- | --- | --- |
@@ -52,8 +57,9 @@ and returns `event: 'budget_reset'`. The result's `cpuSecondsUsed` and `throttle
 API's metric fields.
 
 The store keeps the running total, so a host agent restart doesn't reset the budget. A machine that
-stops and resumes on the same host the same day keeps its total and its throttle: the check notices
-the new cgroup and writes `cpu.max` again. `createFileBudgetStore(dir)` keeps one JSON file per
+stops and resumes on the same host the same day keeps its total and its throttle: it starts from
+`budget.cgroupFor(machineId)`, so it never runs at 8 vCPU between the start and the next check, and
+the check counts its new cgroup's counter from 0. `createFileBudgetStore(dir)` keeps one JSON file per
 machine.
 
 ## Memory reclaim
@@ -66,13 +72,27 @@ statistics is still caught.
    target becomes what the guest has available (free memory plus page cache) less 1 GiB, and never
    leaves the guest less than 2 GiB. It moves only in steps of 256 MiB or more, and only once the
    guest reached the last target. A machine in use again gets its balloon deflated to 0.
-2. **12 GiB for 10 minutes.** While the host is above 75% memory, any machine whose host-side
-   resident memory has stayed above 12 GiB for 10 minutes is snapshotted and stopped.
-3. **85% host memory.** The largest idle machines are snapshotted and stopped until the host is
-   under 85%.
+2. **12 GiB for 10 minutes.** While the host is above 75% memory, a machine whose host-side
+   resident memory is above 12 GiB now, and was above it for 10 minutes in total within the last 15,
+   is snapshotted and stopped. A total within a window, not an unbroken streak: a guest with root can
+   inflate its own balloon to dip under 12 GiB for one sample and then touch the memory again, and
+   that dip does not reset the count.
+3. **85% host memory.** Machines above 12 GiB, busy or idle, largest first, then the largest idle
+   machines, are snapshotted and stopped until the host is under 85%. One large guest goes before
+   other tenants' idle machines.
 
-`readResidentMiB(cgroupPath)` is `memory.current` less the disk's page cache (`memory.stat file`),
-which the kernel reclaims on its own. The caller tracks how long it has stayed above 12 GiB.
+### What the host agent tracks
+
+For each running machine, every tick, the host agent keeps a list of `(time, residentMiB)` samples
+from the last 15 minutes (`RECLAIM_RULES.residentWindowMs`) and passes:
+
+- `residentMiB`: `readResidentMiB(cgroupPath)`, which is `memory.current` less the disk's page cache
+  (`memory.stat file`) that the kernel reclaims on its own.
+- `residentAboveLimitMsInWindow`: the sum, over the samples in the window above 12 GiB, of the time
+  since the sample before each. Keep the list by machine id across a stop and resume on this host,
+  so a restart does not reset the count either.
+- `idle`: the idle stop's own test (no agent running, no client connected).
+- `balloon`: `vm.balloonStats()`, or null when it fails.
 
 ### Free page reporting and hinting
 

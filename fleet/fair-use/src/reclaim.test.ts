@@ -7,7 +7,7 @@ const MINUTE = 60_000;
 const hostAt = (fraction: number): HostSample => ({ totalMiB: 512 * GiB, usedMiB: 512 * GiB * fraction });
 
 function machine(overrides: Partial<MachineSample> & { machineId: string }): MachineSample {
-  return { residentMiB: 3 * GiB, idle: false, balloon: { targetMiB: 0, actualMiB: 0 }, residentAboveLimitForMs: 0, ...overrides };
+  return { residentMiB: 3 * GiB, idle: false, balloon: { targetMiB: 0, actualMiB: 0 }, residentAboveLimitMsInWindow: 0, ...overrides };
 }
 
 const stopped = (host: HostSample, machines: MachineSample[]) =>
@@ -15,28 +15,37 @@ const stopped = (host: HostSample, machines: MachineSample[]) =>
     .filter((a) => a.kind === 'snapshot_stop')
     .map((a) => a.machineId);
 
-describe('stop at 12 GiB for 10 minutes while the host is above 75%', () => {
+describe('stop at 12 GiB for 10 of the last 15 minutes while the host is above 75%', () => {
   // Journey 5: a guest with its balloon driver unloaded reports nothing and holds 14 GiB.
   const hostile = machine({ machineId: 'hostile', residentMiB: 14 * GiB, balloon: { targetMiB: 0, actualMiB: 0 } });
 
   test('stops a guest that ignores its balloon once it has held the memory for 10 minutes', () => {
-    expect(stopped(hostAt(0.76), [{ ...hostile, residentAboveLimitForMs: 10 * MINUTE }])).toEqual(['hostile']);
+    expect(stopped(hostAt(0.76), [{ ...hostile, residentAboveLimitMsInWindow: 10 * MINUTE }])).toEqual(['hostile']);
+  });
+
+  test('a guest that dips under 12 GiB for a minute and touches its memory again is still stopped', () => {
+    // Above for minutes 0 to 6 and 7 to 15, under for one minute: 14 minutes above within the window.
+    expect(stopped(hostAt(0.76), [{ ...hostile, residentAboveLimitMsInWindow: 14 * MINUTE }])).toEqual(['hostile']);
+  });
+
+  test('waits for the sample that finds it above 12 GiB again', () => {
+    expect(stopped(hostAt(0.76), [{ ...hostile, residentMiB: 11 * GiB, residentAboveLimitMsInWindow: 14 * MINUTE }])).toEqual([]);
   });
 
   test('waits until the 10 minutes are up', () => {
-    expect(stopped(hostAt(0.76), [{ ...hostile, residentAboveLimitForMs: 9 * MINUTE }])).toEqual([]);
+    expect(stopped(hostAt(0.76), [{ ...hostile, residentAboveLimitMsInWindow: 9 * MINUTE }])).toEqual([]);
   });
 
   test('leaves a large machine alone while the host is at 75% or below', () => {
-    expect(stopped(hostAt(0.75), [{ ...hostile, residentAboveLimitForMs: 60 * MINUTE }])).toEqual([]);
+    expect(stopped(hostAt(0.75), [{ ...hostile, residentAboveLimitMsInWindow: 60 * MINUTE }])).toEqual([]);
   });
 
   test('leaves a machine at 12 GiB or below alone', () => {
-    expect(stopped(hostAt(0.8), [machine({ machineId: 'm', residentMiB: 12 * GiB, residentAboveLimitForMs: 60 * MINUTE })])).toEqual([]);
+    expect(stopped(hostAt(0.8), [machine({ machineId: 'm', residentMiB: 12 * GiB, residentAboveLimitMsInWindow: 60 * MINUTE })])).toEqual([]);
   });
 
   test('stops a busy machine too: the rule does not depend on the guest being idle', () => {
-    expect(stopped(hostAt(0.8), [{ ...hostile, idle: false, residentAboveLimitForMs: 11 * MINUTE }])).toEqual(['hostile']);
+    expect(stopped(hostAt(0.8), [{ ...hostile, idle: false, residentAboveLimitMsInWindow: 11 * MINUTE }])).toEqual(['hostile']);
   });
 });
 
@@ -57,13 +66,22 @@ describe('at 85% host memory, stop the largest idle machines until under the lin
 
   test('counts memory freed by a 12 GiB stop first', () => {
     const machines = [
-      machine({ machineId: 'hog', residentMiB: 14 * GiB, residentAboveLimitForMs: 10 * MINUTE }),
+      machine({ machineId: 'hog', residentMiB: 14 * GiB, residentAboveLimitMsInWindow: 10 * MINUTE }),
       machine({ machineId: 'idle-4000', residentMiB: 4000, idle: true }),
     ];
     expect(stopped(host, machines)).toEqual(['hog']);
   });
 
-  test('never stops a busy machine for this rule', () => {
+  test("stops a machine above 12 GiB, busy or not, before other tenants' idle machines", () => {
+    const machines = [
+      machine({ machineId: 'idle-6000', residentMiB: 6000, idle: true }),
+      // Above 12 GiB for only 3 minutes, so rule 2 has not stopped it yet.
+      machine({ machineId: 'busy-13GiB', residentMiB: 13 * GiB, idle: false, residentAboveLimitMsInWindow: 3 * MINUTE }),
+    ];
+    expect(stopped(host, machines)).toEqual(['busy-13GiB']);
+  });
+
+  test('never stops a busy machine at 12 GiB or below for this rule', () => {
     expect(stopped(host, [machine({ machineId: 'busy', residentMiB: 10 * GiB, idle: false })])).toEqual([]);
   });
 
@@ -102,7 +120,7 @@ describe('balloon', () => {
   });
 
   test('does not inflate a machine it is stopping', () => {
-    const m = machine({ machineId: 'm', idle: true, residentMiB: 14 * GiB, residentAboveLimitForMs: 10 * MINUTE, balloon: { targetMiB: 0, actualMiB: 0, availableMemory: 2 * GiB * 1024 ** 2 } });
+    const m = machine({ machineId: 'm', idle: true, residentMiB: 14 * GiB, residentAboveLimitMsInWindow: 10 * MINUTE, balloon: { targetMiB: 0, actualMiB: 0, availableMemory: 2 * GiB * 1024 ** 2 } });
     expect(decideReclaim(hostAt(0.8), [m]).map((a) => a.kind)).toEqual(['snapshot_stop']);
   });
 });

@@ -123,7 +123,7 @@ describe.skipIf(!canRun)('fair use on KVM', () => {
     const before = await readResidentMiB(vm.cgroupPath);
     expect(before).toBeGreaterThan(3000);
 
-    const actions = decideReclaim({ totalMiB: 512 * 1024, usedMiB: 64 * 1024 }, [{ machineId: spec.machineId, residentMiB: before, idle: true, balloon: stats, residentAboveLimitForMs: 0 }]);
+    const actions = decideReclaim({ totalMiB: 512 * 1024, usedMiB: 64 * 1024 }, [{ machineId: spec.machineId, residentMiB: before, idle: true, balloon: stats, residentAboveLimitMsInWindow: 0 }]);
     const inflate = actions.find((a) => a.kind === 'inflate');
     console.log(`balloon stats after the hog: ${JSON.stringify(stats)}; resident ${before.toFixed(0)} MiB; actions ${JSON.stringify(actions)}`);
     expect(inflate?.targetMiB).toBeGreaterThan(0);

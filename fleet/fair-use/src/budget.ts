@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MACHINE_LIMITS, checkMachineId } from './limits.js';
-import { cpuMax, statField } from './cgroup.js';
+import { MACHINE_CGROUP, cpuMax, statField } from './cgroup.js';
 
 /** One machine's CPU use for one UTC day, kept so a host agent restart doesn't reset the budget. */
 export interface BudgetRecord {
@@ -38,6 +38,12 @@ export interface CpuBudget {
    * Run it on a timer for every running machine, and once right before a stop so no use is lost.
    */
   check(machineId: string, cgroupPath: string): Promise<BudgetState>;
+  /**
+   * The cgroup files a machine starts with: MACHINE_CGROUP, with `cpu.max` at 0.5 vCPU when the
+   * machine has used today's budget. Pass it as F1's `MachineSpec.cgroup` on every start, restore
+   * and recovery, so a throttled machine never runs a moment at 8 vCPU after a restart.
+   */
+  cgroupFor(machineId: string, now?: Date): Promise<Record<string, string>>;
 }
 
 const FULL_CPU_MAX = cpuMax(MACHINE_LIMITS.vcpu);
@@ -70,6 +76,12 @@ export function createCpuBudget(store: BudgetStore, options: { now?: () => Date 
       if ((await readFile(cpuMaxPath, 'utf8')).trim() !== wanted) await writeFile(cpuMaxPath, wanted);
       await store.set(machineId, { day, usedUsec, lastUsageUsec: usage, cgroupId, throttled });
       return { machineId, day, cpuSecondsUsed: usedUsec / 1_000_000, throttled, event };
+    },
+
+    async cgroupFor(machineId, at = now()) {
+      const record = await store.get(machineId);
+      const throttled = record?.day === at.toISOString().slice(0, 10) && record.throttled;
+      return { ...MACHINE_CGROUP, 'cpu.max': throttled ? THROTTLED_CPU_MAX : FULL_CPU_MAX };
     },
   };
 }
