@@ -32,7 +32,7 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - name: shellcheck
-        run: find . -name node_modules -prune -o -name '*.sh' -print0 | xargs -0 -r shellcheck -x
+        run: find . -name node_modules -prune -o -name '*.sh' -print0 | xargs -0 -r shellcheck -x -P SCRIPTDIR
 
   # Boots real Firecracker microVMs. GitHub's Ubuntu x86_64 runners expose /dev/kvm; the runtime code
   # is the same on the fleet's arm64 hosts.

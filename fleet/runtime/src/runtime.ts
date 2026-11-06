@@ -99,7 +99,8 @@ export interface Runtime {
   attach(spec: MachineSpec): Promise<Vm | null>;
 }
 
-const DEFAULT_BOOT_ARGS = 'console=ttyS0 reboot=k panic=1 pci=off';
+// The serial console is emulated and slow, so the kernel and systemd print only errors to it.
+const DEFAULT_BOOT_ARGS = 'console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=3 systemd.show_status=false';
 const GUEST_CID = 3;
 const JAIL = { kernel: '/vmlinux', disk: '/disk.ext4', apiSock: '/api.sock', vsock: '/v.sock', snapshotDir: '/snapshot' } as const;
 

@@ -4,7 +4,7 @@
  * PANE_BOOT_OK on its console once systemd reaches multi-user, then PANE_TICK <n> every 200 ms.
  */
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readFile, readlink, rm, stat } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { createRuntime, type MachineSpec, type Runtime, type Vm } from './index.js';
@@ -90,7 +90,9 @@ describe.skipIf(!canRun)('fleet runtime on KVM', () => {
     expect(status).toMatch(new RegExp(`^Uid:\\s+${s.uid}\\s`, 'm'));
     expect(await readFile(`/proc/${vm.pid}/cgroup`, 'utf8')).toContain(`/fleet-test/${s.machineId}`);
     expect(await readFile(join(vm.cgroupPath, 'cgroup.procs'), 'utf8')).toContain(String(vm.pid));
-    expect(await readlink(`/proc/${vm.pid}/root`)).toBe(vm.chrootPath);
+    // Inside its mount namespace the jail is "/": its root holds the machine's own disk and nothing of the host's.
+    expect((await stat(`/proc/${vm.pid}/root/disk.ext4`)).ino).toBe((await stat(s.diskPath)).ino);
+    expect(existsSync(`/proc/${vm.pid}/root/srv`)).toBe(false);
   }, 60_000);
 
   test('a snapshot resumes the same running guest, not a reboot', async () => {
