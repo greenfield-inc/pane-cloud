@@ -17,6 +17,12 @@ and calls the fleet API on the user's behalf.
   and the checksum of its arm64 `.deb`, read from the Pane repository's GitHub releases.
 - **Action log**: each entry says who acted (`user`, `service`, or `host` for stops the fleet made on
   its own, such as an idle stop), why, and the exact parameters sent. The machine page reads it.
+- **Billing**: $49 a seat a month after notice, through Stripe, in test mode only
+  (`packages/billing`; its README covers the states and the Stripe setup). It is on when
+  `STRIPE_SECRET_KEY` is set; without it every team stays on the free cohort. Stripe posts to
+  `POST /v1/billing/webhook`. Create and start are refused while a team's bill is unpaid past its
+  7 days of grace or its subscription has ended, and the service stops those teams' machines with a
+  signed stop logged as its own. Seats sync to the bill when an invite is accepted or a member removed.
 - **Team directory**: owners can list a machine for their team and leave a single-use connection
   code for one teammate. Neither admits anyone: the owner approves teammates on the host.
 - **End of the beta**: `GET /v1/beta` publishes `BETA_ENDS_AT` and the phases that follow from it.
@@ -41,6 +47,11 @@ and calls the fleet API on the user's behalf.
 | `WORKER_INTERVAL_MS` | no | How often the worker polls the fleet. Default `1000` |
 | `BETA_ENDS_AT` | no | The end of the beta, as an ISO date. Unset means no end date |
 | `BETA_ANNOUNCEMENT_URL`, `OWN_AWS_TEMPLATE_URL` | no | The links `GET /v1/beta` returns with the end date |
+| `STRIPE_SECRET_KEY` | no | A Stripe test-mode secret key; turns billing on. Live keys are refused |
+| `STRIPE_WEBHOOK_SECRET` | with billing | The signing secret of the `/v1/billing/webhook` endpoint |
+| `BILLING_OUTBOX_DIR` | no | Writes billing email here as files until SES is set up; without it the notice refuses to send |
+| `BILLING_RETURN_URL` | no | Where Stripe Checkout and the portal send the owner back. Default `https://runpane.com/cloud` |
+| `BILLING_ENFORCE_INTERVAL_MS` | no | How often unpaid and ended teams' machines are stopped. Default `300000` |
 
 The service migrates its database at startup. `GET /healthz` answers `{"ok":true}`.
 
@@ -66,6 +77,7 @@ with the signing key's public half in its `trustedKeys`. The tests do exactly th
 | `cohort add <github-login> [note]` | Lets a GitHub login into the cohort |
 | `cohort remove <github-login>` | Takes a login out of the cohort; teams and machines it already has stay |
 | `cohort list` | Lists the cohort |
+| `billing announce <start-date-iso>` | Sets the date charges start and emails every team owner who hasn't had the notice. Needs the billing variables |
 
 ## Tests
 

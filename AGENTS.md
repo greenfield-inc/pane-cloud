@@ -3,6 +3,7 @@
 A pnpm workspace. Each package lives in `packages/<name>`.
 
 - `packages/service`: the Pane Cloud service (S1). Its README covers configuration, running it locally and the operator CLI.
+- `packages/billing`: Stripe billing (B1), wired into the service. Its README covers billing states, Stripe setup and its tests.
 
 ## Commands
 
@@ -12,7 +13,7 @@ Run from the repository root:
 - `pnpm typecheck && pnpm lint && pnpm test && pnpm build`
 - `pnpm --filter pane-cloud-service bench`: the hot-path budget (p95 under 200 ms at 500 seats and 500,000 action-log rows)
 
-Tests need Postgres 15 or later: they use `TEST_DATABASE_URL` when it is set, and otherwise start a throwaway cluster with `initdb` and `postgres` from your PATH.
+Tests need Postgres 15 or later: they use `TEST_DATABASE_URL` when it is set, and otherwise start a throwaway cluster with `initdb` and `postgres` from your PATH. Billing's store tests run only with `TEST_DATABASE_URL`, and its Stripe request checks only with `STRIPE_MOCK_PORT` pointing at [stripe-mock](https://github.com/stripe/stripe-mock); CI sets both.
 
 ## Rules
 

@@ -21,19 +21,9 @@ founding and the owner from the service's team tables.
 
 ## Wiring
 
-```ts
-import { createBilling, createPgStore, createStripeGateway } from '@pane-cloud/billing';
-
-const billing = createBilling({
-  stripe: createStripeGateway(process.env.STRIPE_SECRET_KEY),
-  webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
-  store: createPgStore(pool),
-  teams,    // getTeam(teamId) -> { id, createdAt, founding, ownerAccountId, ownerEmail, seats }; listTeamIds()
-  machines, // stopTeamMachines(teamId, reason): the signed stop, logged with actor 'service'
-  mailer,   // send({ to, subject, text })
-  returnUrl: 'https://runpane.com/cloud',
-});
-```
+`packages/service/src/billing.ts` builds billing on the service's database: its team tables, the
+service's signed machine stop (logged with actor `service`), the Postgres store and a mailer. The
+service turns billing on when `STRIPE_SECRET_KEY` is set; its README lists the variables.
 
 | Service call | Billing call |
 | --- | --- |
@@ -41,15 +31,15 @@ const billing = createBilling({
 | `POST /v1/billing/webhook` (raw body, `Stripe-Signature` header) | `handleWebhook(rawBody, signature)` |
 | Create or start a machine | refuse when `machinesAllowed(teamId)` is false |
 | A member joins or is removed | `syncSeats(teamId)` |
-| Every few minutes | `enforce()` |
-| Operator sends the notice | `announceCharges(startAt)`, from a service operator command |
+| Every few minutes | `enforce()`, which also catches up seat counts a failed Stripe call missed |
+| `billing announce <start-date-iso>` (operator command) | `announceCharges(startAt)` |
 
 `migrations/100_billing.sql` creates `billing_teams` and `billing_notice`; the service's migration
 runner applies it after the service's own migrations.
 
 ## Stripe setup (test mode)
 
-1. Create the product, the two $49 prices and the customer portal configuration. The script is safe to run again:
+1. Create the product, the two $49 prices and the customer portal configuration. The script reuses whatever already exists:
 
    ```sh
    STRIPE_SECRET_KEY=sk_test_... pnpm --filter @pane-cloud/billing stripe:setup
