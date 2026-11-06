@@ -1,0 +1,5 @@
+packages:
+  - packages/*
+allowBuilds:
+  pane-cloud-contract@https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5#path:/packages/pane-cloud-contract: true
+  esbuild: true
