@@ -188,11 +188,14 @@ describe('fair use', () => {
     await run('m-burner', 'create');
     const vm = host.fake.vms.get('m-burner');
     if (!vm) throw new Error('no vm');
+    // F4 counts a machine's day from its first check.
+    await polls(host, 'm-burner');
     await writeFile(join(vm.cgroupPath, 'cpu.stat'), `usage_usec ${(MACHINE_LIMITS.dailyCpuSeconds + 60) * 1e6}\n`);
 
     const metrics = await eventually(() => h.client.getMetrics('m-burner'), (m) => m.throttled);
     expect(metrics.cpuSecondsUsed).toBeGreaterThanOrEqual(MACHINE_LIMITS.dailyCpuSeconds);
-    expect((await readFile(join(vm.cgroupPath, 'cpu.max'), 'utf8')).trim()).toBe('50000 100000');
+    // Each poll writes F4's ceilings and then the budget's cpu.max, so read between polls.
+    await eventually(async () => (await readFile(join(vm.cgroupPath, 'cpu.max'), 'utf8')).trim(), (cpuMax) => cpuMax === '50000 100000');
     const { events } = await h.client.listEvents(undefined, 500);
     expect(events).toContainEqual(expect.objectContaining({ machineId: 'm-burner', kind: 'budget_exhausted' }));
 
