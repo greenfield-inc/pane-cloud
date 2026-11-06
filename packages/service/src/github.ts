@@ -49,27 +49,34 @@ async function postForm(url: string, form: Record<string, string>): Promise<unkn
 const RELEASE_CACHE_MS = 5 * 60_000;
 
 export function createGithub(config: ServiceConfig['github']) {
-  let releaseCache: { at: number; releases: PaneRelease[] } | null = null;
+  let releaseCache: { at: number; releases: { version: string; sumsUrl: string }[] } | null = null;
+  const checksums = new Map<string, string>();
 
-  const fetchReleases = async (): Promise<PaneRelease[]> => {
+  /** Published releases that ship an arm64 .deb and a SHA256SUMS.txt, oldest first, without checksums yet. */
+  const listReleases = async () => {
     const response = await fetch(`${config.apiUrl}/repos/${config.releasesRepo}/releases?per_page=30`, { headers: { accept: 'application/vnd.github+json' } });
     if (!response.ok) throw unavailable('releases');
-    const releases = z.array(Release).parse(await response.json());
-    const found: PaneRelease[] = [];
-    for (const release of releases) {
-      if (release.draft || release.prerelease) continue;
+    const found: { version: string; sumsUrl: string }[] = [];
+    for (const release of z.array(Release).parse(await response.json())) {
       const version = release.tag_name.replace(/^v/, '');
-      if (!/^\d+\.\d+\.\d+$/.test(version)) continue;
-      const debName = `Pane-${version}-linux-arm64.deb`;
+      if (release.draft || release.prerelease || !/^\d+\.\d+\.\d+$/.test(version)) continue;
       const sums = release.assets.find((a) => a.name === 'SHA256SUMS.txt');
-      if (!sums || !release.assets.some((a) => a.name === debName)) continue;
-      const sumsResponse = await fetch(sums.browser_download_url);
-      if (!sumsResponse.ok) continue;
-      const line = (await sumsResponse.text()).split('\n').find((l) => l.trim().split(/\s+\*?/)[1] === debName);
-      const sha = line?.trim().split(/\s+/)[0]?.toLowerCase();
-      if (sha && /^[0-9a-f]{64}$/.test(sha)) found.push({ version, arch: 'arm64', debSha256: sha });
+      if (sums && release.assets.some((a) => a.name === `Pane-${version}-linux-arm64.deb`)) found.push({ version, sumsUrl: sums.browser_download_url });
     }
     return found.sort((a, b) => compareVersions(a.version, b.version));
+  };
+
+  const checksumOf = async (version: string, sumsUrl: string): Promise<string | null> => {
+    const cached = checksums.get(version);
+    if (cached) return cached;
+    const response = await fetch(sumsUrl);
+    if (!response.ok) throw unavailable('release checksum');
+    const debName = `Pane-${version}-linux-arm64.deb`;
+    const line = (await response.text()).split('\n').find((l) => l.trim().split(/\s+\*?/)[1] === debName);
+    const sha = line?.trim().split(/\s+/)[0]?.toLowerCase();
+    if (!sha || !/^[0-9a-f]{64}$/.test(sha)) return null;
+    checksums.set(version, sha);
+    return sha;
   };
 
   return {
@@ -102,12 +109,17 @@ export function createGithub(config: ServiceConfig['github']) {
       return { status: 'complete', identity: { id: user.id, login: user.login, name: user.name ?? null, email: user.email ?? null } };
     },
 
-    /** Published Pane releases with an arm64 .deb and its checksum, oldest first. */
-    async publishedReleases(): Promise<PaneRelease[]> {
-      if (releaseCache && Date.now() - releaseCache.at < RELEASE_CACHE_MS) return releaseCache.releases;
-      const releases = await fetchReleases();
-      releaseCache = { at: Date.now(), releases };
-      return releases;
+    /**
+     * A published Pane release with the checksum of its arm64 .deb: the named version, or the latest.
+     * Returns the published versions instead when there is no such release.
+     */
+    async release(version?: string): Promise<PaneRelease | { published: string[] }> {
+      if (!releaseCache || Date.now() - releaseCache.at >= RELEASE_CACHE_MS) releaseCache = { at: Date.now(), releases: await listReleases() };
+      const { releases } = releaseCache;
+      const chosen = version ? releases.find((r) => r.version === version) : releases.at(-1);
+      const sha = chosen ? await checksumOf(chosen.version, chosen.sumsUrl) : null;
+      if (!chosen || !sha) return { published: releases.map((r) => r.version) };
+      return { version: chosen.version, arch: 'arm64', debSha256: sha };
     },
   };
 }

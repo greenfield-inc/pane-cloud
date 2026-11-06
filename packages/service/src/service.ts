@@ -211,16 +211,15 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
     }
   };
   const releaseFor = async (version?: string) => {
-    const releases = await github.publishedReleases();
-    const release = version ? releases.find((r) => r.version === version) : releases.at(-1);
-    if (!release) {
+    const found = await github.release(version);
+    if ('published' in found) {
       throw new CloudApiError(
         'release_not_published',
         version ? `Pane ${version} is not a published release.` : 'No published Pane release is available.',
-        releases.length ? `Pick one of: ${releases.map((r) => r.version).join(', ')}.` : 'Try again once a Pane release is published.',
+        found.published.length ? `Pick one of: ${found.published.join(', ')}.` : 'Try again once a Pane release is published.',
       );
     }
-    return release;
+    return found;
   };
 
   const teamView = async (teamId: string): Promise<Team> => {
