@@ -35,9 +35,10 @@ work="$(mktemp -d)"
 lower="$work/lower" root="$work/root"
 mkdir -p "$lower" "$root" "$work/upper" "$work/work"
 cleanup() {
-  [ -n "${daemon_pid:-}" ] && kill "$daemon_pid" 2>/dev/null
-  for m in dev/shm dev/pts dev sys proc; do umount -l "$root/$m" 2>/dev/null; done
-  umount -l "$root" "$lower" 2>/dev/null
+  # Stops the daemon and everything else still running inside the image.
+  fuser -k -m "$root" >/dev/null 2>&1 || true
+  for m in dev/shm dev/pts dev sys proc; do umount -l "$root/$m" 2>/dev/null || true; done
+  umount -l "$root" "$lower" 2>/dev/null || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -78,7 +79,6 @@ mount -t tmpfs shm "$root/dev/shm"
 chroot "$root" runuser -u pane -- sh -c 'mkdir -p /home/pane/.pane && echo "{\"workspaces\":{\"enabled\":true}}" >/home/pane/.pane/config.json'
 chroot "$root" runuser -u pane -- env -i HOME=/home/pane PATH=/usr/local/bin:/usr/bin:/bin ELECTRON_OZONE_PLATFORM_HINT=headless \
   /opt/Pane/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane >"$work/daemon.log" 2>&1 &
-daemon_pid=$!
 for _ in $(seq 1 90); do compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null && break; sleep 1; done
 if ! compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null; then
   fail "the Pane daemon opened its control socket"; tail -40 "$work/daemon.log"
