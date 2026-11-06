@@ -3,8 +3,9 @@
  * writes to FLEET_TEST_ARTIFACTS (firecracker, jailer, vmlinux, rootfs.ext4). The test rootfs prints
  * PANE_BOOT_OK on its console once systemd reaches multi-user, then PANE_TICK <n> every 200 ms.
  */
+import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { createRuntime, type MachineSpec, type Runtime, type Vm } from './index.js';
@@ -93,6 +94,10 @@ describe.skipIf(!canRun)('fleet runtime on KVM', () => {
     // Inside its mount namespace the jail is "/": its root holds the machine's own disk and nothing of the host's.
     expect((await stat(`/proc/${vm.pid}/root/disk.ext4`)).ino).toBe((await stat(s.diskPath)).ino);
     expect(existsSync(`/proc/${vm.pid}/root/srv`)).toBe(false);
+    // The machine's uid can't swap its API socket for a link to another machine's.
+    const swap = spawnSync('setpriv', ['--reuid', String(s.uid), '--regid', String(s.gid), '--clear-groups', 'ln', '-sf', '/srv', join(vm.chrootPath, 'api.sock')]);
+    expect(swap.status).not.toBe(0);
+    expect((await lstat(join(vm.chrootPath, 'api.sock'))).isSocket()).toBe(true);
   }, 60_000);
 
   test('a snapshot resumes the same running guest, not a reboot', async () => {

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
-import { access, chown, copyFile, link, mkdir, open, readFile, rename, rm, rmdir } from 'node:fs/promises';
+import { access, chmod, chown, copyFile, lchown, link, lstat, mkdir, open, readFile, rename, rm, rmdir } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { firecrackerApi, type FirecrackerApi } from './api.js';
 
@@ -176,8 +176,15 @@ export function createRuntime(config: RuntimeConfig): Runtime {
         await api.call('PUT', '/snapshot/create', { snapshot_type: 'Full', snapshot_path: state, mem_file_path: mem });
         await mkdir(destDir, { recursive: true });
         const files = { statePath: join(destDir, 'vmstate'), memPath: join(destDir, 'mem') };
-        await rename(join(chroot, state), files.statePath);
-        await rename(join(chroot, mem), files.memPath);
+        // The jailed process can swap entries in /snapshot, so check what arrived only once it sits in destDir,
+        // a directory it cannot reach: a regular file it owns, with no other links.
+        for (const [from, to] of [
+          [state, files.statePath],
+          [mem, files.memPath],
+        ] as const) {
+          await rename(join(chroot, from), to);
+          await assertOwnSnapshotFile(to, spec.uid);
+        }
         return files;
       },
       setBalloon: async (amountMiB) => {
@@ -228,6 +235,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
           await api.call('PUT', '/balloon', { amount_mib: 0, deflate_on_oom: spec.balloon.deflateOnOom, stats_polling_interval_s: spec.balloon.statsPollingIntervalS });
         }
         await api.call('PUT', '/entropy', {});
+        await lockJail(chroot);
         await api.call('PUT', '/actions', { action_type: 'InstanceStart' });
       } catch (error) {
         await killAndWait(pid);
@@ -242,17 +250,20 @@ export function createRuntime(config: RuntimeConfig): Runtime {
           [snapshot.statePath, 'vmstate'],
           [snapshot.memPath, 'mem'],
         ] as const) {
+          await assertOwnSnapshotFile(from, spec.uid);
           const target = join(jail, JAIL.snapshotDir, name);
           await linkOrCopy(from, target);
-          await chown(target, spec.uid, spec.gid);
+          await lchown(target, spec.uid, spec.gid);
         }
       });
       try {
         await api.call('PUT', '/snapshot/load', {
           snapshot_path: join(JAIL.snapshotDir, 'vmstate'),
           mem_backend: { backend_type: 'File', backend_path: join(JAIL.snapshotDir, 'mem') },
-          resume_vm: true,
+          resume_vm: false,
         });
+        await lockJail(chroot);
+        await api.call('PATCH', '/vm', { state: 'Resumed' });
       } catch (error) {
         await killAndWait(pid);
         throw error;
@@ -262,11 +273,33 @@ export function createRuntime(config: RuntimeConfig): Runtime {
 
     async attach(spec) {
       const chroot = chrootOf(spec.machineId);
+      // Trust the jail's pid file and sockets only once the jail root is locked, and only for a process of this machine's uid.
+      const root = await lstat(chroot).catch(() => null);
+      if (!root?.isDirectory() || root.uid !== 0 || (root.mode & 0o022) !== 0) return null;
       const pid = await readPid(chroot, execName);
       if (pid === null || !(await isAlive(pid))) return null;
+      const status = await readFile(`/proc/${pid}/status`, 'utf8').catch(() => '');
+      if (!new RegExp(`^Uid:\\s+${spec.uid}\\s`, 'm').test(status)) return null;
       return vmFor(spec, firecrackerApi(join(chroot, JAIL.apiSock)), pid, chroot);
     },
   };
+}
+
+/**
+ * Once Firecracker has created its API and vsock sockets, the jail root goes back to root, so the
+ * jailed process can no longer replace a socket or the pid file with a link to another machine's.
+ */
+async function lockJail(chroot: string): Promise<void> {
+  await chown(chroot, 0, 0);
+  await chmod(chroot, 0o755);
+}
+
+async function assertOwnSnapshotFile(path: string, uid: number): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.uid !== uid || info.nlink !== 1) {
+    await rm(path, { force: true });
+    throw new Error(`Refused snapshot file ${path}: it is not a regular file owned only by the machine's uid ${uid}.`);
+  }
 }
 
 function rateLimiter(limit: RateLimit) {
