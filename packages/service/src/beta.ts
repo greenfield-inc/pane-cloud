@@ -11,6 +11,15 @@ export interface BetaConfig {
   ownAwsTemplateUrl: string | null;
 }
 
+/** The end date and its links, from BETA_ENDS_AT, BETA_ANNOUNCEMENT_URL and OWN_AWS_TEMPLATE_URL. */
+export function betaConfigFromEnv(env: NodeJS.ProcessEnv = process.env): BetaConfig {
+  return {
+    endsAt: env.BETA_ENDS_AT ? new Date(env.BETA_ENDS_AT).toISOString() : null,
+    announcementUrl: env.BETA_ANNOUNCEMENT_URL ?? null,
+    ownAwsTemplateUrl: env.OWN_AWS_TEMPLATE_URL ?? null,
+  };
+}
+
 const DAY_MS = 86_400_000;
 export const PUSH_WINDOW_MS = BETA_PUSH_WINDOW_MINUTES * 60_000;
 

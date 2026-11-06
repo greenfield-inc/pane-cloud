@@ -20,9 +20,12 @@ and calls the fleet API on the user's behalf.
 - **Team directory**: owners can list a machine for their team and leave a single-use connection
   code for one teammate. Neither admits anyone: the owner approves teammates on the host.
 - **End of the beta**: `GET /v1/beta` publishes `BETA_ENDS_AT` and the phases that follow from it.
-  Notice starts 30 days before the end. From 14 days before, no machine can be created, and a start
-  runs for a 60-minute push window, after which the service stops the machine. Once the beta ends,
-  machines no longer start.
+  Notice starts 30 days before the end, and `beta announce` emails it to everyone with a seat, once
+  per end date. From 14 days before, no machine can be created, and a start runs for a 60-minute
+  push window, after which the service stops the machine. A machine already on when the push
+  windows begin gets one window from then, and no window runs past the end date. Once the beta
+  ends, machines no longer start, and `beta delete-machines --approved-by <name>` deletes them and
+  their disks.
 - **When the fleet is down**: reads answer from the last known state, and queued steps go out when
   the fleet answers again.
 
@@ -66,11 +69,16 @@ with the signing key's public half in its `trustedKeys`. The tests do exactly th
 | `cohort add <github-login> [note]` | Lets a GitHub login into the cohort |
 | `cohort remove <github-login>` | Takes a login out of the cohort; teams and machines it already has stay |
 | `cohort list` | Lists the cohort |
+| `beta announce` | Emails the end date to everyone with a seat who hasn't had it for this date. Needs an email transport, which waits on SES production access |
+| `beta delete-machines [--approved-by <name>]` | After the end date, lists the machines left. With `--approved-by`, deletes each machine and its disk, logged with the approver's name |
+
+The `beta` commands read `BETA_ENDS_AT`, `BETA_ANNOUNCEMENT_URL` and `OWN_AWS_TEMPLATE_URL`, as the service does.
 
 ## Tests
 
 `pnpm test` runs P0's service contract cases against this service, backed by P0's fleet stub and a
-fake GitHub, and adds checks for the release on first boot, host stops, the fleet being down, and a
-search of the whole database for the test accounts' GitHub tokens. `pnpm bench` checks the hot-path
+fake GitHub, and adds checks for the release on first boot, host stops, the fleet being down, the
+end of the beta (push windows, stops at the end date, the notice email and approved deletion), and
+a search of the whole database for the test accounts' GitHub tokens. `pnpm bench` checks the hot-path
 budget: p95 under 200 ms for the team's machine list, the roster and a machine's action log at 500
 seats and 500,000 action-log rows.

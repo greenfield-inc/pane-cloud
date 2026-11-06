@@ -235,24 +235,32 @@ export function createWorker({ db, fleet, signer, intervalMs, beta, log = consol
     }
   };
 
-  /** In the beta's push-window phase, queues a stop for each machine whose hour since its start is up. */
+  /**
+   * From the push-window phase on, queues a stop for each running machine whose window is over: an
+   * hour after its latest start in the phase (or after the phase began, for a machine already on),
+   * and at the end date at the latest, so nothing runs once the beta has ended.
+   */
   const endPushWindows = async () => {
     const status = betaStatus(beta);
-    if (status.phase !== 'push_windows' || !status.pushWindowsFrom) return;
+    if ((status.phase !== 'push_windows' && status.phase !== 'ended') || !status.pushWindowsFrom || !status.endsAt) return;
+    const ended = status.phase === 'ended';
     const { rows } = await db.query<{ id: string }>(
       `SELECT m.id FROM machines m
        WHERE m.state = 'running'
          AND NOT EXISTS (SELECT 1 FROM action_log o WHERE o.machine_id = m.id AND o.status IN ('accepted', 'running'))
-         AND (SELECT max(s.requested_at) FROM action_log s WHERE s.machine_id = m.id AND s.operation = 'start' AND s.requested_at >= $1) <= $2`,
-      [status.pushWindowsFrom, new Date(Date.now() - PUSH_WINDOW_MS)],
+         AND LEAST(COALESCE((SELECT max(s.requested_at) FROM action_log s WHERE s.machine_id = m.id AND s.operation = 'start' AND s.requested_at >= $1), $1) + $2 * interval '1 millisecond', $3) <= now()`,
+      [status.pushWindowsFrom, PUSH_WINDOW_MS, status.endsAt],
     );
+    const reason = ended
+      ? `The Pane Cloud beta ended on ${status.endsAt}, so this machine stopped. Its disk is kept until the machines are deleted.`
+      : 'Your 60-minute push window before the end of the beta is over.';
     for (const { id } of rows) {
       await transaction(db, async (client) => {
         const machine = (await client.query<MachineRow>('SELECT * FROM machines WHERE id = $1 FOR UPDATE', [id])).rows[0];
         if (machine?.state !== 'running') return;
         await logSteps(client, id, [
           { operation: 'prepare_to_stop', fleetOperation: 'prepare_to_stop', parameters: {}, actor: { kind: 'service' }, reason: 'Let Pane finish writing before the stop.' },
-          { operation: 'stop', fleetOperation: 'stop', parameters: {}, actor: { kind: 'service' }, reason: 'Your 60-minute push window before the end of the beta is over.' },
+          { operation: 'stop', fleetOperation: 'stop', parameters: {}, actor: { kind: 'service' }, reason },
         ]);
         await client.query("UPDATE machines SET state = 'stopping', state_reason = NULL, updated_at = now() WHERE id = $1", [id]);
       });
