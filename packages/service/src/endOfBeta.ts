@@ -47,11 +47,14 @@ export async function announceEnd(db: Db, config: BetaConfig, mailer: Mailer): P
   return rows.length;
 }
 
+// TODO(A4): run push-all on the machine once A4's host additions and an allow-listed operation for it exist.
+/** Whether pushAllBeforeDelete really pushes; the deletion listing warns while it doesn't. */
+const PUSH_ALL_AVAILABLE = false;
+
 /**
  * A4's push-all: pushes every worktree on the machine's unpushed-work list, before an end-of-beta
  * delete. A4 hasn't landed, so this stub reports that it did not run.
  */
-// TODO(A4): run push-all on the machine once A4's host additions and an allow-listed operation for it exist.
 export async function pushAllBeforeDelete(_machineId: string): Promise<'pushed' | 'not available yet'> {
   return 'not available yet';
 }
@@ -70,7 +73,8 @@ export async function deleteEndedMachines(db: Db, config: BetaConfig, approvedBy
   );
   const lines = rows.map((m) => `${m.id}\t${m.github_login}\t${m.state}`);
   if (!approvedBy) {
-    return [`${rows.length} machines to delete:`, ...lines, 'Nothing was deleted. Run again with --approved-by <name> to delete these machines and their disks.'].join('\n');
+    const warning = PUSH_ALL_AVAILABLE ? [] : ["Push-all is not available yet: work that users haven't pushed is lost when their machine is deleted."];
+    return [`${rows.length} machines to delete:`, ...lines, ...warning, 'Nothing was deleted. Run again with --approved-by <name> to delete these machines and their disks.'].join('\n');
   }
   const out = [`Deleting ${rows.length} machines, approved by ${approvedBy}:`];
   for (const m of rows) {

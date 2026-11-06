@@ -66,6 +66,7 @@ describe('end of beta: stops, notice and deletion', () => {
     await machineIn(owner, machine.id, (m) => m.state === 'stopped', 'stopped at the end date');
     const plan = await runCommand(harness.db, ['beta', 'delete-machines'], { beta: beta(endsAt) });
     expect(plan).toContain(`${machine.id}\tdelete-at-end\tstopped`);
+    expect(plan).toContain("Push-all is not available yet: work that users haven't pushed is lost when their machine is deleted.");
     expect(plan).toContain('Nothing was deleted. Run again with --approved-by <name> to delete these machines and their disks.');
     expect((await owner.getMachine(machine.id)).state).toBe('stopped');
 
