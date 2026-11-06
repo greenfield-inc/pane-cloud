@@ -8,6 +8,31 @@ importers:
 
   .: {}
 
+  fair-use:
+    dependencies:
+      '@pane-cloud/fleet-runtime':
+        specifier: workspace:*
+        version: link:../runtime
+    devDependencies:
+      '@eslint/js':
+        specifier: ^9.17.0
+        version: 9.39.5
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.5
+      eslint:
+        specifier: ^9.17.0
+        version: 9.39.5
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      typescript-eslint:
+        specifier: ^8.19.0
+        version: 8.72.1(eslint@9.39.5)(typescript@5.9.3)
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@22.20.5)
+
   network:
     devDependencies:
       '@eslint/js':
