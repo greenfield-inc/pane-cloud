@@ -1,6 +1,6 @@
 # Bridge runbook
 
-The bridge gives every team that asks one always-on machine per person before Conductor Cloud goes read-only on November 13, 2026. Each machine is an `m7g.xlarge` (4 vCPU, 16 GiB, 50 GB disk) in the Pane Cloud AWS account, running today's Pane release as a Remote Pane host. Teams move to Pane Cloud machines when the fleet is live (package R3).
+The bridge gives every team that asks one always-on machine per person before Conductor Cloud goes read-only on November 13, 2026. Each machine is an `m7g.xlarge` (4 vCPU, 16 GiB, 50 GB disk) in the Pane Cloud AWS account, running today's Pane release as a Remote Pane host. Teams move to Pane Cloud machines when the fleet is live ([MIGRATION.md](MIGRATION.md)).
 
 Target: each person has a working machine on their own tailnet within 30 minutes of intake.
 
