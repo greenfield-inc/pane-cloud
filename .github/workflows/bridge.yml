@@ -1,0 +1,25 @@
+name: bridge
+
+on:
+  pull_request:
+    paths: ['ops/bridge/**', '.github/workflows/bridge.yml']
+  push:
+    branches: [main]
+    paths: ['ops/bridge/**', '.github/workflows/bridge.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ops/bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - run: bash -n bootstrap.sh && shellcheck bootstrap.sh

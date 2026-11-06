@@ -52,6 +52,7 @@ as_user bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
 pane_version_flag=()
 [ "${PANE_VERSION}" = latest ] || pane_version_flag=(--version "v${PANE_VERSION#v}")
 as_user runpane install client --format deb "${pane_version_flag[@]}"
+# shellcheck disable=SC2016 # expands in the user's shell
 as_user bash -c 'mkdir -p ~/.pane_remote && f=~/.pane_remote/config.json &&
   if [ -s "$f" ]; then jq ".workspaces.enabled = true" "$f" > "$f.tmp" && mv "$f.tmp" "$f";
   else echo "{\"workspaces\":{\"enabled\":true}}" > "$f"; fi'
