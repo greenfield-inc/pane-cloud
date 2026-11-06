@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC2329 # the install_* functions are called as "install_$name"
+# shellcheck disable=SC2317,SC2329 # the install_* functions are called as "install_$name"
 # Installs the five agent CLIs with each vendor's official installer, as the user that runs it
 # (the `pane` user on a machine). The image ships none of them. A CLI already on PATH is skipped,
 # so a re-run installs only what is missing. One failed installer does not stop the others.

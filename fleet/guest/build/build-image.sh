@@ -139,5 +139,5 @@ case "$what" in
   all) build_kernel; build_rootfs ;;
   *) echo "unknown target $what" >&2; exit 2 ;;
 esac
-(cd "$out" && sha256sum ./*.ext4 ./vmlinux-* 2>/dev/null >SHA256SUMS || true)
+(cd "$out" && { sha256sum ./*.ext4 ./vmlinux-* 2>/dev/null >SHA256SUMS || true; })
 say "done: $(ls "$out")"

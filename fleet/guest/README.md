@@ -140,6 +140,9 @@ one link, so the `pane` user cannot point the root-run agent at another file.
     `runpane workspace state` (one baseline entry per agent panel).
   - `clientsConnected`: `connectedClients` in `remote-daemon:get-host-state`, the list Settings ›
     Remote Access shows (`main/src/daemon/httpApiServer.ts` keeps it per open event stream).
+    **Pane 2.4.215 does not serve that channel on the control socket** (it is an `ipcMain` handler
+    for the desktop window, `main/src/ipc/remoteDaemon.ts`), so `clientsConnected` is 0 until Pane
+    registers it as a daemon command. `check-image.sh` prints whether the baked-in Pane serves it.
   - `lastActivityAt`: now while anything is active, else the later of the last time the agent saw
     activity (kept in `/var/lib/pane-cloud/last-activity`) and the newest workspace entry. `null`
     before any activity.
@@ -158,8 +161,8 @@ CI (`.github/workflows/fleet-guest.yml`) runs the unit tests on Ubuntu 24.04's P
 shellcheck, then builds the image on GitHub's `ubuntu-24.04-arm` runner and runs `check-image.sh`.
 That checks the kernel config, the image size and filesystem, and the files, users and units inside
 the ext4. It then starts the Pane daemon inside the image (`--daemon-headless`, on a throwaway
-overlay) and sends the guest agent a `status` request, which must reach both daemon channels and
-report the baked-in Pane version. Only the kernel and its config are kept, as a workflow artifact
+overlay) and sends the guest agent a `status` request, which must reach the daemon's workspace
+state and report the baked-in Pane version. Only the kernel and its config are kept, as a workflow artifact
 for 3 days.
 
 ## Not verified here
@@ -169,4 +172,5 @@ These need KVM or a real host, so CI does not run them:
 - Booting the image under Firecracker, and first boot growing the disk and installing the CLIs
   in the guest. The installers themselves are checked by `check-cli-installers.sh`.
 - `tailscale up`, the login link in `status`, and Pane's `--remote-setup` after the join.
-- Nonzero activity counts. CI shows both daemon channels answer, with no agents and no clients.
+- Nonzero activity counts. CI shows `runpane:workspace:state` answers and `status` reports no
+  agents and no clients.
