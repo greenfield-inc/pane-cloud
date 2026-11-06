@@ -494,6 +494,80 @@ function handOver(opts, { env, out }) {
   return 0;
 }
 
+// ---------- moving to the fleet (R3) ----------
+
+const RETIRE_AFTER_DAYS = 14;
+const tag = (key) => `Tags[?Key=='${key}']|[0].Value`;
+
+function inventory(aws, ids) {
+  return aws.read([
+    'ec2', 'describe-instances',
+    ...(ids ? ['--instance-ids', ...ids] : ['--filters', 'Name=tag:pane:bridge,Values=true', `Name=instance-state-name,Values=${LIVE_STATES}`]),
+    '--query', `Reservations[].Instances[].{Id:InstanceId,Name:${tag('Name')},Team:${tag('pane:team')},User:${tag('pane:user')},Stage:${tag('pane:stage')},DeleteAfter:${tag('pane:delete-after')}}`,
+  ], (ids ?? []).map((Id) => ({ Id, Name: `<name of ${Id}>`, User: '<user>', Stage: 'moving', DeleteAfter: '2000-01-01' })));
+}
+
+const isoDay = (date) => date.toISOString().slice(0, 10);
+const longDay = (day) => new Date(`${day}T00:00:00Z`).toLocaleDateString('en-US', { timeZone: 'UTC', month: 'long', day: 'numeric', year: 'numeric' });
+
+// Marks that a user's Pane Cloud machine is live. Their bridge machine is
+// deleted 14 days later; the printed notice is the email that starts that clock.
+function moved(opts, { env, out }) {
+  const id = instanceArg(opts);
+  const liveOn = required(opts, 'live-on', "the day the user's Pane Cloud machine went live, yyyy-mm-dd");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(liveOn) || Number.isNaN(Date.parse(liveOn))) throw new BridgeError('--live-on must be a date like 2026-11-12.');
+  const aws = makeAws({ dryRun: Boolean(opts['dry-run']), region: regionFromEnv(env), out });
+  const [machine] = inventory(aws, [id]);
+  if (!machine) throw new BridgeError(`No bridge machine ${id}.`);
+  const deleteAfter = isoDay(new Date(Date.parse(`${liveOn}T00:00:00Z`) + RETIRE_AFTER_DAYS * 86400000));
+  aws.write(['ec2', 'create-tags', '--resources', id, '--tags', 'Key=pane:stage,Value=moving',
+    `Key=pane:fleet-live-on,Value=${liveOn}`, `Key=pane:delete-after,Value=${deleteAfter}`]);
+  out(`Email ${machine.User} today (MIGRATION.md has the full text):`);
+  out('');
+  out(`  Your Pane Cloud machine is live. Your bridge machine (${machine.Name}) will be deleted on ${longDay(deleteAfter)}.`);
+  out('  Before then, hand off your tasks to the Pane Cloud machine with runpane handoff, and push every branch you want to keep.');
+  out('  Anything left only on the bridge machine is deleted with it.');
+  return 0;
+}
+
+// Writes the machines past their delete date to a batch file for Parsa to approve.
+function retireBatch(opts, { env, out }) {
+  const path = required(opts, 'out', 'where to write the batch file');
+  const aws = makeAws({ dryRun: Boolean(opts['dry-run']), region: regionFromEnv(env), out });
+  const today = isoDay(new Date());
+  const due = inventory(aws).filter((m) => m.Stage === 'moving' && m.DeleteAfter && m.DeleteAfter <= today);
+  writeFileSync(path, `${JSON.stringify({ created: new Date().toISOString(), instances: due.map((m) => ({ id: m.Id, team: m.Team, user: m.User, deleteAfter: m.DeleteAfter })) }, null, 2)}\n`);
+  for (const m of due) out(`${m.Id}  ${m.Team}/${m.User}  due ${m.DeleteAfter}`);
+  out(`${due.length} machine(s) in ${path}. Send it to Parsa; after his written OK run: bridge retire --batch ${path} --approved-by parsa`);
+  return 0;
+}
+
+// Deletes an approved batch. Every machine must still be due, or nothing is deleted.
+function retire(opts, { env, out }) {
+  const path = required(opts, 'batch', 'the file retire-batch wrote');
+  const approver = required(opts, 'approved-by', 'who approved this batch in writing; deletion waits on Parsa per batch');
+  const ids = JSON.parse(readFileSync(path, 'utf8')).instances.map((m) => m.id);
+  if (!ids.length) { out('The batch is empty.'); return 0; }
+  const region = regionFromEnv(env);
+  const aws = makeAws({ dryRun: Boolean(opts['dry-run']), region, out });
+  const today = isoDay(new Date());
+  const machines = inventory(aws, ids);
+  const notDue = ids.filter((id) => {
+    const m = machines.find((x) => x.Id === id);
+    return !m || m.Stage !== 'moving' || !m.DeleteAfter || m.DeleteAfter > today;
+  });
+  if (notDue.length) throw new BridgeError(`Not due for deletion: ${notDue.join(', ')}. Make a new batch with retire-batch.`);
+
+  for (const m of machines) {
+    aws.write(['ec2', 'create-tags', '--resources', m.Id, '--tags', `Key=pane:retire-approved-by,Value=${approver}`, `Key=pane:retired-on,Value=${today}`]);
+    aws.write(['ec2', 'modify-instance-attribute', '--instance-id', m.Id, '--no-disable-api-termination']);
+    aws.write(['cloudwatch', 'delete-alarms', '--alarm-names', `${m.Name}-egress`, `${m.Name}-cpu`]);
+    aws.write(['ec2', 'terminate-instances', '--instance-ids', m.Id]);
+    out(`Deleted ${m.Id} (${m.Team}/${m.User}) and its disk.`);
+  }
+  return 0;
+}
+
 // ---------- intake ----------
 
 const MIN_ACCOUNT_AGE_DAYS = 90;
@@ -531,7 +605,7 @@ function vet(opts, { out }) {
 
 // ---------- main ----------
 
-const COMMANDS = { vet, 'account-setup': accountSetup, status, launch, ssh, 'login-link': loginLink, 'check-owner': checkOwner, 'hand-over': handOver };
+const COMMANDS = { vet, 'account-setup': accountSetup, status, launch, ssh, 'login-link': loginLink, 'check-owner': checkOwner, 'hand-over': handOver, moved, 'retire-batch': retireBatch, retire };
 
 const USAGE = `Usage: bridge <command> [options] [--dry-run]
 
@@ -546,6 +620,9 @@ Commands (in runbook order):
   login-link <instance> [--hostname <name>]              Tailscale sign-in link for the user
   check-owner <instance> --login <tailscale login>       Confirm the user owns the node, untagged
   hand-over <instance> --login <tailscale login>         Remove operator access and prove it
+  moved <instance> --live-on <yyyy-mm-dd>                The user's Pane Cloud machine is live; start the 14 days
+  retire-batch --out <file>                              Machines past their delete date, for Parsa's approval
+  retire --batch <file> --approved-by <name>             Delete an approved batch
 
 Environment: AWS_PROFILE, AWS_REGION; PANE_CLOUD_ACCOUNT_ID (optional check);
 PANE_VERSION (default latest); BRIDGE_EGRESS_GB_PER_DAY, BRIDGE_CPU_PERCENT and
