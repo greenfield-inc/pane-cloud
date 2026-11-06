@@ -9,7 +9,8 @@ out="$(realpath "${1:?usage: check-image.sh <output dir>}")"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=versions.env
 source "$here/versions.env"
-image="$out/pane-guest-$UBUNTU_RELEASE-pane-$PANE_VERSION.ext4"
+arch="$(dpkg --print-architecture)"
+image="$out/pane-guest-$UBUNTU_RELEASE-pane-$PANE_VERSION-$arch.ext4"
 config="$out/config-$KERNEL_VERSION"
 failures=0
 
@@ -18,7 +19,9 @@ fail() { echo "FAIL $*"; failures=$((failures + 1)); }
 check() { local what="$1"; shift; if "$@"; then pass "$what"; else fail "$what"; fi; }
 
 echo "== kernel"
-check "vmlinux-$KERNEL_VERSION is an arm64 boot Image" grep -q 'ARM64 boot executable Image' <(file "$out/vmlinux-$KERNEL_VERSION")
+kernel_type='ARM64 boot executable Image'
+[ "$arch" = amd64 ] && kernel_type='ELF 64-bit LSB executable, x86-64'
+check "vmlinux-$KERNEL_VERSION is $kernel_type" grep -q "$kernel_type" <(file "$out/vmlinux-$KERNEL_VERSION")
 for option in $REQUIRED_KERNEL_CONFIG; do
   check "CONFIG_$option=y" grep -qx "CONFIG_$option=y" "$config"
 done

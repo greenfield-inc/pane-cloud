@@ -9,9 +9,10 @@ the five allow-listed guest operations the host agent sends, and nothing else.
 | Path | What it does |
 | --- | --- |
 | [`build/versions.env`](build/versions.env) | Every pinned input with its SHA-256 |
-| [`build/build-image.sh`](build/build-image.sh) | Builds the ext4 root filesystem and the kernel on an arm64 Ubuntu builder |
+| [`build/build-image.sh`](build/build-image.sh) | Builds the ext4 root filesystem and the kernel on an arm64 (or, for CI, amd64) Ubuntu builder |
 | [`build/build-in-docker.sh`](build/build-in-docker.sh) | Runs the build in `docker run --privileged --platform linux/arm64` |
 | [`build/check-image.sh`](build/check-image.sh) | Checks a built image and probes the Pane daemon inside it |
+| [`build/boot-check.sh`](build/boot-check.sh) | CI only: boots the amd64 image under Firecracker and checks first boot over vsock |
 | [`build/check-cli-installers.sh`](build/check-cli-installers.sh) | Runs the first-boot CLI installer in a fresh arm64 Ubuntu container |
 | [`rootfs/`](rootfs) | Files copied into the image: systemd units, first-boot scripts, user environment |
 | [`agent/pane_guest_agent.py`](agent/pane_guest_agent.py) | The guest agent, Python 3 standard library only |
@@ -22,8 +23,13 @@ the five allow-listed guest operations the host agent sends, and nothing else.
 bash build/build-in-docker.sh all out/      # or: sudo bash build/build-image.sh all out/ on an arm64 Ubuntu 24.04 host
 ```
 
-It writes `out/pane-guest-<ubuntu release>-pane-<version>.ext4`, `out/vmlinux-<version>`,
-`out/packages.txt` and `out/SHA256SUMS`. Nothing is published.
+It writes `out/pane-guest-<ubuntu release>-pane-<version>-<arch>.ext4`, `out/vmlinux-<version>`,
+`out/config-<version>`, `out/packages.txt` and `out/SHA256SUMS`. Nothing is published.
+
+The build targets the builder's own architecture. **arm64 is the production image.** The amd64
+variant exists only so CI can boot the image on GitHub's x86_64 KVM runners: same scripts and units,
+with its own pinned Ubuntu tarball, Node, Pane `.deb` and Firecracker x86_64 kernel config. The guest
+agent's `update_pane` still fetches the arm64 `.deb`, so an amd64 machine cannot update.
 
 - **Root filesystem.** Canonical's Ubuntu 24.04 minimal cloud image root tarball for arm64, pinned by
   release date and SHA-256. The build removes cloud-init, installs git, Python 3, Node (official
@@ -58,14 +64,17 @@ Three system units, all enabled in the image:
    `--pane-dir /home/pane/.pane`, so Pane's logs land where the contract's `DIAGNOSTIC_FILES`
    expects them. Then it sets `workspaces.enabled: true` in that directory's `config.json`, which a
    daemon outside `~/.pane` otherwise leaves off, and restarts the daemon. The setup prints a
-   `pane-remote://` pairing code; it goes to a 0600 file in `/home/pane` and is redacted there.
+   `pane-remote://` connection code. Only its status lines (data directory, config, channel, service)
+   reach the log; every other line is replaced before it is written, so the code and any tunnel
+   command never touch disk.
 3. **`pane-guest-agent.service`**, the guest agent.
 
 The order follows #909's bootstrap (identity, hostname, Tailscale, join, Pane install, setup),
 without its upload of a Tailscale key and agent tokens: the user logs in to Tailscale, GitHub and
 each agent themselves.
 
-Both scripts log to `/var/log/pane-cloud/bootstrap.log`.
+Both scripts log to `/var/log/pane-cloud/bootstrap.log`, mode 0600 in a 0700 directory that only
+root reads.
 
 ### Update on boot
 
@@ -158,19 +167,24 @@ sudo bash build/check-image.sh out/                  # checks it and probes the 
 ```
 
 CI (`.github/workflows/fleet-guest.yml`) runs the unit tests on Ubuntu 24.04's Python 3.12 and
-shellcheck, then builds the image on GitHub's `ubuntu-24.04-arm` runner and runs `check-image.sh`.
+shellcheck. The `image` job builds the arm64 image on GitHub's `ubuntu-24.04-arm` runner and runs
+`check-image.sh`.
 That checks the kernel config, the image size and filesystem, and the files, users and units inside
 the ext4. It then starts the Pane daemon inside the image (`--daemon-headless`, on a throwaway
 overlay) and sends the guest agent a `status` request, which must reach the daemon's workspace
-state and report the baked-in Pane version. Only the kernel and its config are kept, as a workflow artifact
-for 3 days.
+state and report the baked-in Pane version. Only the kernel and its config are kept, as a workflow
+artifact for 3 days.
+
+The `boot` job builds the amd64 image on `ubuntu-24.04`, runs `check-image.sh`, then runs
+`boot-check.sh`. That boots the image under F1's pinned Firecracker and jailer with a NAT'd tap, the
+kernel `ip=` argument and a 16 GiB disk. Over vsock (`CONNECT 1024`) it waits for the guest agent's
+`status`, then for first boot to finish, reading `bootstrap.log` through `collect_diagnostics`. Each
+of the five CLIs must have installed and run `--version` inside the guest, and `status.tailnet` must
+show the login URL from `tailscale up`, which joins no tailnet.
 
 ## Not verified here
 
-These need KVM or a real host, so CI does not run them:
-
-- Booting the image under Firecracker, and first boot growing the disk and installing the CLIs
-  in the guest. The installers themselves are checked by `check-cli-installers.sh`.
-- `tailscale up`, the login link in `status`, and Pane's `--remote-setup` after the join.
+- Booting the arm64 image: CI boots the amd64 variant, since GitHub's arm64 runners have no KVM.
+- Joining a tailnet, and Pane's `--remote-setup` after the join.
 - Nonzero activity counts. CI shows `runpane:workspace:state` answers and `status` reports no
   agents and no clients.

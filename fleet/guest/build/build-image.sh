@@ -1,11 +1,12 @@
 #!/bin/bash
-# Builds the Pane Cloud guest: an Ubuntu 24.04 arm64 ext4 root filesystem and a Firecracker guest kernel.
-# Runs as root on an arm64 Ubuntu 24.04 builder, or in `docker run --privileged --platform linux/arm64`
+# Builds the Pane Cloud guest: an Ubuntu 24.04 ext4 root filesystem and a Firecracker guest kernel,
+# for the builder's own architecture. arm64 is the production image; amd64 is for CI's KVM boot only.
+# Runs as root on an Ubuntu 24.04 builder, or in `docker run --privileged --platform linux/arm64`
 # (see build-in-docker.sh). Every download is checked against build/versions.env.
 #
 # Usage: build-image.sh <rootfs|kernel|all> <output dir>
-# Writes pane-guest-<UBUNTU_RELEASE>-pane-<PANE_VERSION>.ext4, vmlinux-<KERNEL_VERSION>, config-<KERNEL_VERSION>,
-# packages.txt, SHA256SUMS.
+# Writes pane-guest-<UBUNTU_RELEASE>-pane-<PANE_VERSION>-<arch>.ext4, vmlinux-<KERNEL_VERSION>,
+# config-<KERNEL_VERSION>, packages.txt, SHA256SUMS.
 set -euo pipefail
 
 what="${1:?usage: build-image.sh <rootfs|kernel|all> <output dir>}"
@@ -14,6 +15,15 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 guest="$(dirname "$here")"
 # shellcheck source-path=SCRIPTDIR source=versions.env
 source "$here/versions.env"
+arch="$(dpkg --print-architecture)"
+case "$arch" in
+  arm64) kernel_arch=arm64 fc_arch=aarch64 kernel_target=Image kernel_file=arch/arm64/boot/Image ;;
+  # Firecracker boots the uncompressed ELF vmlinux on x86_64.
+  amd64) kernel_arch=x86_64 fc_arch=x86_64 kernel_target=vmlinux kernel_file=vmlinux ;;
+  *) echo "unsupported architecture $arch" >&2; exit 2 ;;
+esac
+# pin <NAME>: the versions.env pin NAME_<arch>.
+pin() { local name="${1}_$arch"; echo "${!name}"; }
 work="${WORK_DIR:-/var/tmp/pane-guest-build}"
 mkdir -p "$out" "$work"
 
@@ -33,22 +43,21 @@ build_deps() {
 }
 
 build_kernel() {
-  local src="$work/linux-$KERNEL_VERSION" config="$work/microvm-kernel-ci-aarch64-6.1.config"
-  say "kernel $KERNEL_VERSION with Firecracker $FIRECRACKER_COMMIT's aarch64 6.1 guest config"
+  local src="$work/linux-$KERNEL_VERSION" config="$work/microvm-kernel-ci-$fc_arch-6.1.config"
+  say "kernel $KERNEL_VERSION with Firecracker $FIRECRACKER_COMMIT's $fc_arch 6.1 guest config"
   [ -f "$work/linux.tar.xz" ] || fetch "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz" "$KERNEL_SHA256" "$work/linux.tar.xz"
-  fetch "https://raw.githubusercontent.com/firecracker-microvm/firecracker/$FIRECRACKER_COMMIT/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config" \
-    "$KERNEL_CONFIG_SHA256" "$config"
+  fetch "https://raw.githubusercontent.com/firecracker-microvm/firecracker/$FIRECRACKER_COMMIT/resources/guest_configs/microvm-kernel-ci-$fc_arch-6.1.config" \
+    "$(pin KERNEL_CONFIG_SHA256)" "$config"
   rm -rf "$src" && tar -xJf "$work/linux.tar.xz" -C "$work"
   cp "$config" "$src/.config"
-  make -C "$src" ARCH=arm64 olddefconfig >/dev/null
+  make -C "$src" ARCH="$kernel_arch" olddefconfig >/dev/null
   # The devices the fleet relies on must survive olddefconfig, built in (the config has no modules).
   local option
   for option in $REQUIRED_KERNEL_CONFIG; do
     grep -qx "CONFIG_$option=y" "$src/.config" || { echo "kernel config lacks CONFIG_$option=y" >&2; exit 1; }
   done
-  make -C "$src" ARCH=arm64 -j"$(nproc)" Image >/dev/null
-  # Firecracker boots the uncompressed arm64 Image.
-  cp "$src/arch/arm64/boot/Image" "$out/vmlinux-$KERNEL_VERSION"
+  make -C "$src" ARCH="$kernel_arch" -j"$(nproc)" "$kernel_target" >/dev/null
+  cp "$src/$kernel_file" "$out/vmlinux-$KERNEL_VERSION"
   cp "$src/.config" "$out/config-$KERNEL_VERSION"
 }
 
@@ -56,9 +65,9 @@ build_kernel() {
 in_root() { chroot "$work/rootfs" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive HOME=/root "$@"; }
 
 build_rootfs() {
-  local root="$work/rootfs" image="$out/pane-guest-$UBUNTU_RELEASE-pane-$PANE_VERSION.ext4"
+  local root="$work/rootfs" image="$out/pane-guest-$UBUNTU_RELEASE-pane-$PANE_VERSION-$arch.ext4"
   say "root filesystem from Ubuntu 24.04 minimal $UBUNTU_RELEASE"
-  [ -f "$work/root.tar.xz" ] || fetch "$UBUNTU_ROOT_URL" "$UBUNTU_ROOT_SHA256" "$work/root.tar.xz"
+  [ -f "$work/root.tar.xz" ] || fetch "$UBUNTU_ROOT_BASE/ubuntu-24.04-minimal-cloudimg-$arch-root.tar.xz" "$(pin UBUNTU_ROOT_SHA256)" "$work/root.tar.xz"
   rm -rf "$root" && mkdir -p "$root"
   tar -xJf "$work/root.tar.xz" -C "$root" --numeric-owner
   mount -t proc proc "$root/proc"
@@ -77,7 +86,7 @@ build_rootfs() {
     e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg >/dev/null
 
   say "Node $NODE_VERSION"
-  fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-arm64.tar.xz" "$NODE_SHA256_arm64" "$work/node.tar.xz"
+  fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-${kernel_arch/x86_64/x64}.tar.xz" "$(pin NODE_SHA256)" "$work/node.tar.xz"
   tar -xJf "$work/node.tar.xz" -C "$root/usr/local" --strip-components=1 --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md
 
   say "Tailscale $TAILSCALE_VERSION from pkgs.tailscale.com"
@@ -88,8 +97,8 @@ build_rootfs() {
   in_root apt-get install -y -qq "tailscale=$TAILSCALE_VERSION" >/dev/null
 
   say "Pane $PANE_VERSION"
-  fetch "https://github.com/greenfield-inc/Pane/releases/download/v$PANE_VERSION/Pane-$PANE_VERSION-linux-arm64.deb" \
-    "$PANE_DEB_SHA256" "$root/tmp/pane.deb"
+  fetch "https://github.com/greenfield-inc/Pane/releases/download/v$PANE_VERSION/Pane-$PANE_VERSION-linux-$arch.deb" \
+    "$(pin PANE_DEB_SHA256)" "$root/tmp/pane.deb"
   # The .deb's Depends miss two libraries its Electron binary links: libgbm and libasound.
   in_root apt-get install -y -qq /tmp/pane.deb libgbm1 libasound2t64 >/dev/null
   rm -f "$root/tmp/pane.deb"
