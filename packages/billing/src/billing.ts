@@ -88,6 +88,16 @@ export function createBilling(deps: BillingDeps) {
     return derive(record ?? emptyRecord(teamId), notice).status;
   }
 
+  /** Matches the subscription's seat count to the team's; a no-op without a live subscription or when they agree. */
+  async function syncSeats(teamId: string): Promise<void> {
+    const [team, record] = await Promise.all([requireTeam(teamId), store.getRecord(teamId)]);
+    const sub = record?.subscription;
+    if (!record || !sub || sub.status === 'canceled' || sub.status === 'incomplete_expired' || sub.quantity === team.seats) return;
+    await stripe.setSeatQuantity(sub.id, team.seats);
+    record.subscription = { ...sub, quantity: team.seats };
+    await store.saveRecord(record);
+  }
+
   return {
     /** GET /v1/billing. Only the owner gets a manage link; creating it may call Stripe. */
     async getBillingStatus(teamId: string, viewerAccountId: string): Promise<BillingStatus> {
@@ -113,15 +123,8 @@ export function createBilling(deps: BillingDeps) {
       return !STOPPED_STATES.has(await status(teamId));
     },
 
-    /** Call after a member joins or leaves (E2). Prorates the change onto the next invoice. */
-    async syncSeats(teamId: string): Promise<void> {
-      const [team, record] = await Promise.all([requireTeam(teamId), store.getRecord(teamId)]);
-      const sub = record?.subscription;
-      if (!record || !sub || sub.status === 'canceled' || sub.status === 'incomplete_expired' || sub.quantity === team.seats) return;
-      await stripe.setSeatQuantity(sub.id, team.seats);
-      record.subscription = { ...sub, quantity: team.seats };
-      await store.saveRecord(record);
-    },
+    /** Call after a member joins or leaves (E2). Stripe prorates the change onto the next invoice. */
+    syncSeats,
 
     /** Sets the date charges start for every team and emails each owner once. Safe to run again. */
     async announceCharges(chargesStartAt: Date): Promise<void> {
@@ -155,13 +158,23 @@ export function createBilling(deps: BillingDeps) {
       await store.saveRecord(record);
     },
 
-    /** Run on a schedule: stops the machines of teams whose grace ran out or whose subscription ended. */
+    /**
+     * Run on a schedule: catches up seat counts a failed Stripe call missed, and stops the machines of
+     * teams whose grace ran out or whose subscription ended.
+     */
     async enforce(): Promise<void> {
+      const failures: unknown[] = [];
       for (const teamId of await teams.listTeamIds()) {
-        const s = await status(teamId);
-        if (s === 'past_due') await deps.machines.stopTeamMachines(teamId, 'Payment failed and the 7-day grace period ended. Your disk is kept; machines start again once the bill is paid.');
-        if (s === 'canceled') await deps.machines.stopTeamMachines(teamId, 'The Pane Cloud subscription ended. Your disk is kept.');
+        try {
+          const s = await status(teamId);
+          if (s === 'past_due') await deps.machines.stopTeamMachines(teamId, 'Payment failed and the 7-day grace period ended. Your disk is kept; machines start again once the bill is paid.');
+          if (s === 'canceled') await deps.machines.stopTeamMachines(teamId, 'The Pane Cloud subscription ended. Your disk is kept.');
+          await syncSeats(teamId);
+        } catch (error) {
+          failures.push(error);
+        }
       }
+      if (failures.length) throw new AggregateError(failures, `Billing enforcement failed for ${failures.length} team(s).`);
     },
   };
 }

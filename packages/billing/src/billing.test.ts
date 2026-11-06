@@ -153,6 +153,17 @@ describe('charges', () => {
     expect(await t.status()).toMatchObject({ status: 'active', graceEndsAt: null });
   });
 
+  test('a seat change that never reached Stripe is caught up by the next enforce', async () => {
+    const t = setup({ seats: 1 });
+    await t.billing.announceCharges(new Date(NOV_5.getTime() + 14 * DAY));
+    await t.addCard();
+    t.team.seats = 3;
+    await t.billing.enforce();
+    t.advance(14 * DAY);
+    await t.deliver(t.stripe.advanceTo(new Date(NOV_5.getTime() + 14 * DAY)));
+    expect(t.stripe.invoices()).toEqual([{ amountCents: 14700, paid: true }]);
+  });
+
   test('a teammate who joins adds a $49 seat to the bill', async () => {
     const t = setup({ seats: 1 });
     await t.billing.announceCharges(new Date(NOV_5.getTime() + 14 * DAY));
