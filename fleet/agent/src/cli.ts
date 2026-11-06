@@ -7,7 +7,6 @@
  * required). Tokens never go in it: they come from the environment or from systemd credentials.
  */
 import { readFile } from 'node:fs/promises';
-import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { createHostNetwork } from '@pane-cloud/fleet-network';
 import { createRuntime } from '@pane-cloud/fleet-runtime';
@@ -16,7 +15,8 @@ import { z } from 'zod';
 import { startFleet } from './fleet.js';
 import { cloudWatchHostMetrics } from './aws.js';
 import { createHostAgent, DEFAULT_EGRESS_POLICY } from './host.js';
-import { adoptedVolumeRecovery, fileMaintenanceSignal, fleetFairUse, localDiagnosticsStore, localSnapshotStore, noHostMetrics, releasesFrom } from './local.js';
+import { stsEndpoint, stsHostAuth, stsHostCredential } from './identity.js';
+import { adoptedVolumeRecovery, fileMaintenanceSignal, fleetFairUse, localDiagnosticsStore, localSnapshotStore, releasesFrom } from './local.js';
 import { fileStore } from './store.js';
 
 const TrustedKeys = z.record(z.string().min(1), z.string().startsWith('-----BEGIN PUBLIC KEY-----'));
@@ -31,13 +31,18 @@ const FleetConfig = z
     stateFile: z.string().default('/var/lib/pane-fleet/fleet-state.json'),
     hostLostAfterSeconds: z.number().positive().default(120),
     newMachineMiB: z.number().positive().default(3072),
+    /** The hosts' instance role. A host proves it holds this role, and its instance id is its host id. */
+    hostRoleArn: z.string(),
+    /** Region of the STS endpoint that checks host identities; defaults to AWS_REGION. */
+    awsRegion: z.string().optional(),
+    /** Names this fleet in host identity tokens; hosts must use the same. */
+    fleetId: z.string().default('pane-cloud'),
   })
   .strict();
 
 const HostConfig = z
   .object({
     fleetUrl: z.url(),
-    hostId: z.string().default(hostname()),
     trustedKeys: TrustedKeys,
     releases: Releases,
     dataDir: z.string().default('/srv/fleet'),
@@ -52,8 +57,10 @@ const HostConfig = z
     diagnosticsDir: z.string().default('/srv/fleet-diagnostics'),
     /** Where a lost host's data volume is mounted, as `<dir>/<hostId>`. */
     adoptedDir: z.string().default('/srv/adopted'),
-    /** Region for CloudWatch host metrics; defaults to AWS_REGION. With neither, metrics are off. */
+    /** Region for STS host identity and CloudWatch host metrics; defaults to AWS_REGION. */
     awsRegion: z.string().optional(),
+    /** The fleet's `fleetId`, named in this host's identity tokens. */
+    fleetId: z.string().default('pane-cloud'),
     /** Overrides of the plan's egress thresholds (D-23 keeps the real ones in private config). */
     egress: z.object({ monthlyAlertBytes: z.number().positive(), abuseBytes: z.number().positive(), abuseWindowSeconds: z.number().positive() }).partial().default({}),
     /** The host drains while this file exists. */
@@ -69,6 +76,12 @@ async function secret(envName: string, credential: string): Promise<string> {
   const fromFile = dir ? (await readFile(join(dir, credential), 'utf8').catch(() => '')).trim() : '';
   if (fromFile) return fromFile;
   throw new Error(`Set ${envName}, or give the unit LoadCredential=${credential}:<file>.`);
+}
+
+function region(configured: string | undefined): string {
+  const found = configured ?? process.env.AWS_REGION;
+  if (!found) throw new Error('Set awsRegion in the config, or AWS_REGION.');
+  return found;
 }
 
 async function readConfig<S extends z.ZodType>(schema: S, path: string): Promise<z.output<S>> {
@@ -93,7 +106,7 @@ async function main(argv: string[]): Promise<void> {
     const fleet = await startFleet(
       {
         serviceToken: await secret('FLEET_SERVICE_TOKEN', 'fleet-service-token'),
-        hostToken: await secret('FLEET_HOST_TOKEN', 'fleet-host-token'),
+        hostAuth: stsHostAuth({ endpoint: stsEndpoint(region(config.awsRegion)), fleetId: config.fleetId, hostRoleArn: config.hostRoleArn }),
         trustedKeys: config.trustedKeys,
         releases: releasesFrom(config.releases),
         store: fileStore(config.stateFile),
@@ -108,12 +121,13 @@ async function main(argv: string[]): Promise<void> {
 
   if (mode === 'serve-host') {
     const config = await readConfig(HostConfig, configPath ?? '/etc/pane-fleet/host.json');
-    const region = config.awsRegion ?? process.env.AWS_REGION;
-    if (!region) console.log(JSON.stringify({ msg: 'no AWS region; host metrics are off' }));
+    const awsRegion = region(config.awsRegion);
+    const credential = stsHostCredential({ endpoint: stsEndpoint(awsRegion), region: awsRegion, fleetId: config.fleetId });
     const agent = await createHostAgent({
-      hostId: config.hostId,
+      // The instance id, from the instance role's session: the identity the fleet checks.
+      hostId: await credential.hostId(),
       fleetUrl: config.fleetUrl,
-      token: await secret('FLEET_HOST_TOKEN', 'fleet-host-token'),
+      credential: credential.token,
       trustedKeys: config.trustedKeys,
       runtime: createRuntime({ firecrackerBin: config.firecrackerBin, jailerBin: config.jailerBin, chrootBase: config.chrootBase, cgroupParent: config.cgroupParent }),
       releases: releasesFrom(config.releases),
@@ -123,7 +137,7 @@ async function main(argv: string[]): Promise<void> {
       maintenance: fileMaintenanceSignal(config.maintenanceFile),
       fairUse: fleetFairUse(join(config.dataDir, 'state', 'cpu-budget')),
       network: createHostNetwork(),
-      hostMetrics: region ? cloudWatchHostMetrics(region) : noHostMetrics,
+      hostMetrics: cloudWatchHostMetrics(awsRegion),
       egressPolicy: {
         ...DEFAULT_EGRESS_POLICY,
         ...(config.egress.monthlyAlertBytes ? { monthlyAlertBytes: config.egress.monthlyAlertBytes } : {}),

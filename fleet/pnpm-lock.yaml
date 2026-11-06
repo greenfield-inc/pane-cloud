@@ -13,6 +13,9 @@ importers:
       '@aws-sdk/client-cloudwatch':
         specifier: ^3.1163.0
         version: 3.1163.0
+      '@aws-sdk/credential-provider-node':
+        specifier: ^3.972.93
+        version: 3.972.93
       '@pane-cloud/fleet-fair-use':
         specifier: workspace:*
         version: link:../fair-use
@@ -22,6 +25,9 @@ importers:
       '@pane-cloud/fleet-runtime':
         specifier: workspace:*
         version: link:../runtime
+      '@smithy/signature-v4':
+        specifier: ^5.7.5
+        version: 5.7.5
       pane-cloud-contract:
         specifier: github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract
         version: https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5#path:/packages/pane-cloud-contract

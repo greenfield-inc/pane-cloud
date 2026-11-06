@@ -60,6 +60,10 @@ metrics, the event feed, and the last event id taken from each host.
 
 A stopped machine is on no host (`hostId: null`); `resume` can place it on any host.
 
+The host agent also refuses a slot the fleet sends when another active machine on the host holds
+it, and a recovery of a machine already active there: a slot is a uid and a network, so a wrong one
+from the fleet would hand one tenant's to another.
+
 On start the host agent writes its host id to `<dataDir>/host-id`, reattaches to every machine that
 is still running (`runtime.attach`), and installs F3's firewall when no machine is running. The
 firewall lasts until the host reboots, and replacing it would cut off running machines. A machine
@@ -148,20 +152,32 @@ here because it could not be tested without AWS.
 
 `serve-fleet` reads `/etc/pane-fleet/fleet.json` and `serve-host` reads `/etc/pane-fleet/host.json`
 (or `--config <file>`). The schemas and defaults are at the top of [`src/cli.ts`](src/cli.ts). The
-required fields are `trustedKeys` (key id to PEM public key) and `releases`; the host also needs
-`fleetUrl`. The host id defaults to the hostname.
+required fields are `trustedKeys` (key id to PEM public key) and `releases`; the fleet also needs
+`hostRoleArn`, and the host `fleetUrl`. Both need an AWS region, from `awsRegion` or `AWS_REGION`.
 
-Tokens are never in the config file. Each one comes from an environment variable, or from a systemd
-credential file:
-
-| Token | Who sends it | Environment variable | systemd credential |
-| --- | --- | --- | --- |
-| Service token | The service, on every fleet API route | `FLEET_SERVICE_TOKEN` | `fleet-service-token` |
-| Host token | Host agents, on the sync route only | `FLEET_HOST_TOKEN` | `fleet-host-token` |
-
-The units in [`systemd/`](systemd) load them with `LoadCredential=` from
-`/etc/pane-fleet/credentials/`. In production F6 writes those files from Secrets Manager at boot.
+The service token is never in the config file. It comes from `FLEET_SERVICE_TOKEN`, or from the
+systemd credential `fleet-service-token`, which the API unit loads with `LoadCredential=` from
+`/etc/pane-fleet/credentials/`. In production F6 writes that file from Secrets Manager at boot.
 The fleet API speaks plain HTTP, so it must listen only inside the VPC behind a TLS load balancer.
+
+### Host identity
+
+Hosts share no secret. Each sync carries a presigned `sts:GetCallerIdentity` request
+([`src/identity.ts`](src/identity.ts)), signed with the host's instance role and with a signed
+`x-pane-fleet-id` header naming the fleet (`fleetId`, default `pane-cloud`). The fleet checks that
+the token is exactly that request for its region's STS endpoint, sends it to STS, and accepts the
+caller when STS answers with a session of `hostRoleArn`. The session name of an instance role is the
+EC2 instance id, and that is the host id: the host reads it the same way at start, and the fleet
+refuses a sync whose path or report names another host. A verified token is remembered until it
+expires (15 minutes), so STS sees about one call per host every 10 minutes.
+
+The fleet then trusts a host only for its own machines: it records events only for machines it
+placed on that host, stamps them with its own clock, and takes only an operation's outcome
+(`status`, `error`, `result`, `finishedAt`) from a host, never which machine or operation it was.
+A diagnostics result must carry the archive key the host agent derives for that operation.
+
+F6 needs no host token and no IAM permission for this (`GetCallerIdentity` needs none). The fleet
+API needs outbound HTTPS to `sts.<region>.amazonaws.com`, and its config names the host role.
 
 ## State store
 

@@ -5,7 +5,8 @@
  */
 import { createHash } from 'node:crypto';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { createServer, type Socket } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
+import { type AddressInfo, createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { addressForSlot, type MachineAddress } from '@pane-cloud/fleet-network';
 import type { MachineSpec, RateLimit, Runtime, SnapshotFiles, Vm } from '@pane-cloud/fleet-runtime';
@@ -204,5 +205,41 @@ export function createFakeNetwork(): FakeNetwork {
         counters.delete(machineId);
       },
     },
+  };
+}
+
+export interface FakeSts {
+  url: string;
+  /** The host role every fake session belongs to. */
+  hostRoleArn: string;
+  /** Credentials whose session name is `hostId`, as an instance role's is its instance id. */
+  credentialsFor(hostId: string): { accessKeyId: string; secretAccessKey: string };
+  close(): Promise<void>;
+}
+
+/**
+ * STS's GetCallerIdentity for presigned requests. It trusts the access key instead of checking the
+ * signature, and answers only requests that signed and sent `x-pane-fleet-id`, as real STS would.
+ */
+export async function startFakeSts(): Promise<FakeSts> {
+  const account = '123456789012';
+  const role = 'fleet-host';
+  const server = createHttpServer((request, response) => {
+    const query = new URL(request.url ?? '/', 'http://sts').searchParams;
+    const accessKeyId = (query.get('X-Amz-Credential') ?? '').split('/')[0] ?? '';
+    const signed = (query.get('X-Amz-SignedHeaders') ?? '').split(';');
+    const ok = query.get('Action') === 'GetCallerIdentity' && accessKeyId.startsWith('host:') && signed.includes('x-pane-fleet-id') && request.headers['x-pane-fleet-id'] === 'pane-cloud';
+    response.writeHead(ok ? 200 : 403, { 'content-type': 'application/json' });
+    const arn = `arn:aws:sts::${account}:assumed-role/${role}/${accessKeyId.slice('host:'.length)}`;
+    response.end(JSON.stringify(ok ? { GetCallerIdentityResponse: { GetCallerIdentityResult: { Arn: arn, Account: account, UserId: 'AROAFAKE' } } } : { Error: { Code: 'SignatureDoesNotMatch' } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  // SAFETY: a server listening on a TCP port reports an AddressInfo.
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    hostRoleArn: `arn:aws:iam::${account}:role/${role}`,
+    credentialsFor: (hostId) => ({ accessKeyId: `host:${hostId}`, secretAccessKey: 'fake' }),
+    close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 }

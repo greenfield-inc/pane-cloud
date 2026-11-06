@@ -6,3 +6,4 @@ export { adoptedVolumeRecovery, fileMaintenanceSignal, fleetFairUse, localDiagno
 export type * from './ports.js';
 export { createSaver, fileStore, memoryStore, type StateStore } from './store.js';
 export { HostReport, Placement, SyncAnswer, syncRoute, Work } from './sync.js';
+export { type HostCredential, stsEndpoint, stsHostAuth, stsHostCredential } from './identity.js';

@@ -10,7 +10,6 @@ Requires=fleet-host-boot.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/node /opt/pane-fleet/agent/dist/cli.js serve-host --config /etc/pane-fleet/host.json
-LoadCredential=fleet-host-token:/etc/pane-fleet/credentials/fleet-host-token
 RuntimeDirectory=pane-fleet
 RuntimeDirectoryPreserve=yes
 KillMode=process

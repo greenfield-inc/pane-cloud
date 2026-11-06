@@ -16,7 +16,7 @@ import {
   type OperationStatus,
   verifyOperation,
 } from 'pane-cloud-contract';
-import { bind, createApiServer } from './http.js';
+import { type Authenticate, bind, createApiServer } from './http.js';
 import type { ReleaseList } from './ports.js';
 import { createSaver, type StateStore } from './store.js';
 import { type HostReport, type Placement, syncRoute, type Work } from './sync.js';
@@ -57,8 +57,8 @@ export interface FleetState {
 export interface FleetOptions {
   /** Bearer token the service sends on the fleet API. */
   serviceToken: string;
-  /** Bearer token hosts send on the sync route. */
-  hostToken: string;
+  /** Who a host's bearer token belongs to (`stsHostAuth`): the sync route trusts this, never the path or body. */
+  hostAuth: Authenticate;
   /** Service signing keys, by key id (PEM public keys). */
   trustedKeys: Record<string, string>;
   releases: ReleaseList;
@@ -105,8 +105,9 @@ export async function startFleet(options: FleetOptions, listen: { host?: string;
     if (machine.hostId && !hosts.has(machine.hostId)) hosts.set(machine.hostId, { report: null, seenAt: now().getTime(), lost: false });
   }
 
-  const record = (event: Omit<FleetEvent, 'id' | 'at'> & { at?: string }) => {
-    state.events.push({ at: iso(), ...event, id: String(state.nextEventId++) });
+  /** Stores an event, stamped with the fleet's own clock and cursor. */
+  const record = (event: Omit<FleetEvent, 'id' | 'at'>) => {
+    state.events.push({ ...event, at: iso(), id: String(state.nextEventId++) });
     if (state.events.length > MAX_EVENTS) state.events.splice(0, state.events.length - MAX_EVENTS);
   };
 
@@ -233,26 +234,31 @@ export async function startFleet(options: FleetOptions, listen: { host?: string;
     if (status.operation === 'resume' && existing.machine.state === 'resuming') existing.machine = { ...existing.machine, state: 'stopped', hostId: null, updatedAt: iso() };
   }
 
+  /** A host's report, from a host whose identity the sync route checked. */
   async function sync(hostId: string, report: HostReport) {
-    if (report.hostId !== hostId) throw new CloudApiError('invalid_request', 'The report names a different host than the path.', 'Send the report for this host.');
     const view = hosts.get(hostId);
     if (view?.lost) {
       throw new CloudApiError('invalid_state', `Host ${hostId} was declared lost and its machines were moved.`, 'Stop this host; it must not run machines again.');
     }
     hosts.set(hostId, { report, seenAt: now().getTime(), lost: false });
 
-    for (const status of report.operations) {
-      const op = state.operations[status.requestId];
-      if (!op || op.hostId !== hostId || op.status.finishedAt) continue;
-      op.status = status;
-      op.delivered = true;
-      if (status.status === 'failed') undoRefused(hostId, status, report);
-    }
+    // Events first, while machines the report stops or deletes still name this host.
     const cursor = Number(state.hostCursors[hostId] ?? 0);
     for (const event of report.events) {
       if (Number(event.id) <= cursor) continue;
-      record(event);
       state.hostCursors[hostId] = event.id;
+      // A host speaks only for machines the fleet placed on it.
+      if (state.machines[event.machineId]?.machine.hostId !== hostId) continue;
+      record({ machineId: event.machineId, kind: event.kind, state: event.state, reason: event.reason, requestId: event.requestId });
+    }
+    for (const reported of report.operations) {
+      const op = state.operations[reported.requestId];
+      if (!op || op.hostId !== hostId || op.status.finishedAt) continue;
+      // Only the outcome comes from the host; which machine and operation it was stays the fleet's.
+      const result = reported.result && op.status.operation === 'collect_diagnostics' && reported.result.archiveKey === `diagnostics/${op.status.machineId}/${op.status.requestId}.tar.gz` ? reported.result : null;
+      op.status = { ...op.status, status: reported.status, error: reported.error, result, finishedAt: reported.finishedAt };
+      op.delivered = true;
+      if (reported.status === 'failed') undoRefused(hostId, op.status, report);
     }
     const waiting = new Set(Object.values(state.operations).filter((op) => op.hostId === hostId && !op.delivered).map((op) => op.status.machineId));
     for (const { machine, metrics } of report.machines) absorb(hostId, machine, metrics, waiting);
@@ -361,7 +367,12 @@ export async function startFleet(options: FleetOptions, listen: { host?: string;
         const page = state.events.filter((e) => Number(e.id) > after).slice(0, query.limit ?? 100);
         return { events: page, nextCursor: page.at(-1)?.id ?? query.after ?? null };
       }),
-      bind(syncRoute, o.hostToken, async ({ params, body }) => sync(params.hostId ?? '', body)),
+      bind(syncRoute, o.hostAuth, async ({ caller, params, body }) => {
+        if (params.hostId !== caller || body.hostId !== caller) {
+          throw new CloudApiError('unauthenticated', `This host identity is ${caller}, not ${params.hostId}.`, 'Sync only as the host the credential names.');
+        }
+        return sync(caller, body);
+      }),
     ],
     log,
   );

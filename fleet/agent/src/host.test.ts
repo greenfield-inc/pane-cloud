@@ -240,3 +240,28 @@ describe('collect_diagnostics', () => {
     expect(bad.error?.message).toMatch(/SHA-256/);
   });
 });
+
+describe('the host checks the slot the fleet sends', () => {
+  test('refuses a slot an active machine holds, and a recovery of a machine already active', async () => {
+    h = await startHarness({ hosts: [{ id: 'host-a' }] });
+    const host = hostOf('host-a');
+    await run('m-first', 'create');
+    const [held] = host.net.attached;
+    if (!held) throw new Error('no attach');
+    const placement = (slot: number) => ({ slot, egressBytesThisMonth: 0 });
+
+    await host.inject({ kind: 'operation', envelope: await h.sign('m-squatter', 'create'), placement: placement(held.slot) });
+    await host.inject({ kind: 'recover', machineId: 'm-first', fromHostId: 'host-gone', placement: placement(held.slot + 1) });
+    await host.inject({ kind: 'recover', machineId: 'm-lost', fromHostId: 'host-gone', placement: placement(held.slot) });
+    // A slot no machine holds still works, so the refusals above are the check's doing.
+    await host.inject({ kind: 'operation', envelope: await h.sign('m-free', 'create'), placement: placement(held.slot + 7) });
+    await eventually(async () => host.fake.started, (started) => started.includes('m-free'));
+
+    expect(host.fake.started).toEqual(['m-first', 'm-free']);
+    expect(host.net.attached.map((a) => [a.machineId, a.slot])).toEqual([
+      ['m-first', held.slot],
+      ['m-free', held.slot + 7],
+    ]);
+    expect((await h.client.getMachine('m-first')).state).toBe('running');
+  });
+});

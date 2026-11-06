@@ -79,8 +79,8 @@ export interface HostState {
 export interface HostAgentOptions {
   hostId: string;
   fleetUrl: string;
-  /** Bearer token for the fleet's host sync route. */
-  token: string;
+  /** The bearer token for the fleet's host sync route, which names this host (`stsHostCredential`). */
+  credential: () => Promise<string>;
   /** Service signing keys this host trusts, by key id (PEM public keys). */
   trustedKeys: Record<string, string>;
   runtime: Runtime;
@@ -181,7 +181,11 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     record({ machineId: m.machine.machineId, kind: 'state_changed', state: next, reason, requestId });
     void save();
   };
+  /** A new record for a machine the fleet hands this host, refusing a slot another active machine here holds. */
   const newRecord = (machineId: string, placement: Placement, from?: HostMachine): HostMachine => {
+    // The slot is the machine's uid and network. Reusing an active one would hand that machine's to another tenant.
+    const holder = Object.values(state.machines).find((x) => x.machine.machineId !== machineId && x.slot === placement.slot && ACTIVE.includes(x.machine.state));
+    if (holder) throw new Error(`Slot ${placement.slot} belongs to machine ${holder.machine.machineId} on this host; the fleet sent it for ${machineId}.`);
     const m: HostMachine = {
       machine: {
         machineId,
@@ -417,8 +421,14 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
 
   function recover(machineId: string, fromHostId: string, placement: Placement) {
     const existing = state.machines[machineId];
-    if (existing && ACTIVE.includes(existing.machine.state)) return;
-    const m = newRecord(machineId, placement, existing);
+    let m: HostMachine;
+    try {
+      if (existing && ACTIVE.includes(existing.machine.state)) throw new Error(`Machine ${machineId} is already ${existing.machine.state} on this host.`);
+      m = newRecord(machineId, placement, existing);
+    } catch (error) {
+      log({ msg: 'recovery refused', machineId, fromHostId, error: String(error) });
+      return;
+    }
     setState(m, 'resuming', 'host_lost');
     log({ msg: 'recovering machine from a lost host', machineId, fromHostId });
     void enqueue(machineId, async () => {
@@ -597,7 +607,7 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
     await save();
     const body = await report();
     const sent = new Set(changedOperations);
-    const answer = await callRoute({ baseUrl: o.fleetUrl, token: o.token }, syncRoute, { params: { hostId: o.hostId }, body });
+    const answer = await callRoute({ baseUrl: o.fleetUrl, token: await o.credential() }, syncRoute, { params: { hostId: o.hostId }, body });
     for (const id of sent) {
       if (state.operations[id]?.status === body.operations.find((op) => op.requestId === id)?.status) changedOperations.delete(id);
     }

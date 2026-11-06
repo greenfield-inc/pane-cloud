@@ -17,7 +17,9 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { type Fleet, type FleetState, startFleet } from './fleet.js';
 import { createHostAgent, type HostAgent, type HostState } from './host.js';
 import { fleetFairUse, localDiagnosticsStore, localSnapshotStore, localVolumeRecovery, noHostMetrics, releasesFrom } from './local.js';
+import { stsHostAuth, stsHostCredential } from './identity.js';
 import { memoryStore } from './store.js';
+import { type FakeSts, startFakeSts } from './testing/fakes.js';
 import { eventually } from './testing/harness.js';
 
 const artifacts = process.env.FLEET_TEST_ARTIFACTS ?? '';
@@ -36,15 +38,17 @@ describe.skipIf(!canRun)('host agent on KVM', () => {
   let work: string;
   let fleet: Fleet;
   let agent: HostAgent;
+  let sts: FakeSts;
   const signer = createLocalSigner('kvm-key');
 
   beforeAll(async () => {
     work = await mkdtemp('/srv/fleet-agent-test-');
     await copyFile(join(artifacts, 'vmlinux'), join(work, 'vmlinux'));
     const quiet = () => undefined;
+    sts = await startFakeSts();
     fleet = await startFleet({
       serviceToken: 'kvm-service',
-      hostToken: 'kvm-host',
+      hostAuth: stsHostAuth({ endpoint: sts.url, fleetId: 'pane-cloud', hostRoleArn: sts.hostRoleArn }),
       trustedKeys: { 'kvm-key': signer.publicKeyPem },
       releases: releasesFrom([]),
       store: memoryStore<FleetState>(),
@@ -54,7 +58,7 @@ describe.skipIf(!canRun)('host agent on KVM', () => {
     agent = await createHostAgent({
       hostId: 'kvm-host',
       fleetUrl: fleet.url,
-      token: 'kvm-host',
+      credential: stsHostCredential({ endpoint: sts.url, region: 'us-east-1', fleetId: 'pane-cloud', credentials: sts.credentialsFor('kvm-host') }).token,
       trustedKeys: { 'kvm-key': signer.publicKeyPem },
       runtime: createRuntime({ firecrackerBin: join(artifacts, 'firecracker'), jailerBin: join(artifacts, 'jailer'), chrootBase: join(work, 'jail'), cgroupParent: 'fleet-test' }),
       releases: releasesFrom([]),
@@ -81,6 +85,7 @@ describe.skipIf(!canRun)('host agent on KVM', () => {
   afterAll(async () => {
     await agent?.close();
     await fleet?.close();
+    await sts?.close();
     if (work) await rm(work, { recursive: true, force: true });
   }, 60_000);
 

@@ -4,21 +4,27 @@ import { CloudApiError, type Route, type RouteResponse } from 'pane-cloud-contra
 import { z } from 'zod';
 
 type Input<T> = {
+  /** Who the bearer token says is calling: `service`, or a host id. */
+  caller: string;
   params: Record<string, string>;
   body: T extends Route<infer B, z.ZodType, z.ZodType> ? z.output<B> : never;
   query: T extends Route<z.ZodType, infer Q, z.ZodType> ? z.output<Q> : never;
 };
 
+/** Returns who a bearer token belongs to, or null when the route does not accept it. */
+export type Authenticate = (token: string) => Promise<string | null>;
+
 export interface Bound {
   route: Route;
-  /** The bearer token this route accepts. */
-  token: string;
+  authenticate: Authenticate;
   handle(input: Input<Route>): Promise<unknown>;
 }
 
-export function bind<T extends Route>(route: T, token: string, handle: (input: Input<T>) => Promise<RouteResponse<T>>): Bound {
+/** Binds a route to its callers: one fixed token (the caller is `service`), or an authenticator. */
+export function bind<T extends Route>(route: T, auth: string | Authenticate, handle: (input: Input<T>) => Promise<RouteResponse<T>>): Bound {
+  const authenticate: Authenticate = typeof auth === 'string' ? async (given) => (sameToken(given, auth) ? 'service' : null) : auth;
   // SAFETY: the server calls handle only with input parsed by the route's own schemas.
-  return { route, token, handle: handle as (input: Input<Route>) => Promise<unknown> };
+  return { route, authenticate, handle: handle as (input: Input<Route>) => Promise<unknown> };
 }
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -80,13 +86,13 @@ export function createApiServer(routes: Bound[], log: (entry: Record<string, unk
           }
         }
         if (!found) throw new CloudApiError('invalid_request', `No route for ${request.method} ${url.pathname}.`, 'Check the method and path against the fleet API.');
-        const { route, token, handle } = found.bound;
+        const { route, authenticate, handle } = found.bound;
         const authorization = request.headers.authorization ?? '';
-        if (!authorization.startsWith('Bearer ') || !sameToken(authorization.slice('Bearer '.length), token)) {
-          throw new CloudApiError('unauthenticated', 'This call needs the fleet API token.', 'Send the configured token as a Bearer token.');
-        }
+        const caller = authorization.startsWith('Bearer ') ? await authenticate(authorization.slice('Bearer '.length)) : null;
+        if (caller === null) throw new CloudApiError('unauthenticated', 'This call needs a fleet API credential.', 'Send the configured token, or a host identity token, as a Bearer token.');
         const raw = await readBody(request);
         const input = {
+          caller,
           params: found.params,
           body: route.body ? parse('body', route.body, raw) : undefined,
           query: route.query ? parse('query', route.query, Object.fromEntries(url.searchParams)) : {},
