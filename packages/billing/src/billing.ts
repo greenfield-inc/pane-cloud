@@ -5,8 +5,6 @@ import { PRICE_LOOKUP_KEYS, type SeatPrice, type StripeGateway } from './stripeG
 
 const DAY_MS = 86_400_000;
 export const GRACE_DAYS = 7;
-/** Stripe needs a trial to end at least 48 hours out; a start date closer than that charges at checkout. */
-const MIN_TRIAL_MS = 48 * 3_600_000;
 
 /** What billing reads from the service's team tables. */
 export interface BillingTeam {
@@ -62,8 +60,7 @@ export function createBilling(deps: BillingDeps) {
       if (!notice || !started) return { plan: 'cohort', status: 'free', graceEndsAt: null };
       return { plan: 'paid', ...grace(new Date(notice.chargesStartAt.getTime() + GRACE_DAYS * DAY_MS)) };
     }
-    if (sub.status === 'trialing') return { plan: started ? 'paid' : 'cohort', status: started ? 'active' : 'free', graceEndsAt: null };
-    if (sub.status === 'active') return { plan: 'paid', status: 'active', graceEndsAt: null };
+    if (sub.status === 'active' || sub.status === 'trialing') return started ? { plan: 'paid', status: 'active', graceEndsAt: null } : { plan: 'cohort', status: 'free', graceEndsAt: null };
     // past_due, unpaid, incomplete, paused: the card failed or was never confirmed.
     return { plan: 'paid', ...grace(record.graceEndsAt ?? new Date(t.getTime() + GRACE_DAYS * DAY_MS)) };
   }
@@ -82,8 +79,8 @@ export function createBilling(deps: BillingDeps) {
     if (sub && sub.status !== 'canceled' && sub.status !== 'incomplete_expired') {
       return stripe.createPortalSession({ customerId, returnUrl: deps.returnUrl });
     }
-    const trialEnd = notice.chargesStartAt.getTime() - now().getTime() >= MIN_TRIAL_MS ? notice.chargesStartAt : null;
-    return stripe.createCheckoutSession({ customerId, teamId: team.id, priceId: price.id, quantity: team.seats, trialEnd, returnUrl: deps.returnUrl });
+    const firstChargeAt = notice.chargesStartAt > now() ? notice.chargesStartAt : null;
+    return stripe.createCheckoutSession({ customerId, teamId: team.id, priceId: price.id, quantity: team.seats, firstChargeAt, returnUrl: deps.returnUrl });
   }
 
   async function status(teamId: string): Promise<BillingStatus['status']> {

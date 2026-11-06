@@ -18,8 +18,8 @@ describe.skipIf(!port)('against stripe-mock', () => {
     expect(price.id).toMatch(/^price_/);
     const customerId = await stripe.createCustomer({ teamId: 'team_a', email: 'owner@example.com' });
     expect(customerId).toMatch(/^cus_/);
-    const trialEnd = new Date(Date.now() + 14 * 86_400_000);
-    const checkout = await stripe.createCheckoutSession({ customerId, teamId: 'team_a', priceId: price.id, quantity: 3, trialEnd, returnUrl: 'https://runpane.com/cloud' });
+    const firstChargeAt = new Date(Date.now() + 14 * 86_400_000);
+    const checkout = await stripe.createCheckoutSession({ customerId, teamId: 'team_a', priceId: price.id, quantity: 3, firstChargeAt, returnUrl: 'https://runpane.com/cloud' });
     expect(checkout).toMatch(/^https:/);
     expect(await stripe.createPortalSession({ customerId, returnUrl: 'https://runpane.com/cloud' })).toMatch(/^https:/);
     const sub = await stripe.latestSubscription(customerId);

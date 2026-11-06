@@ -41,7 +41,7 @@ function setup(options: { founding?: boolean; seats?: number } = {}) {
     addCard: async () => {
       const status = await billing.getBillingStatus(team.id, team.ownerAccountId);
       if (!status.manageUrl) throw new Error('owner has no manage link');
-      for (const event of stripe.completeCheckout(status.manageUrl)) await billing.handleWebhook(event.body, event.signature);
+      for (const event of stripe.completeCheckout(status.manageUrl, now)) await billing.handleWebhook(event.body, event.signature);
     },
     deliver: async (events: { body: string; signature: string }[]) => {
       for (const event of events) await billing.handleWebhook(event.body, event.signature);
@@ -130,6 +130,27 @@ describe('charges', () => {
     expect(status.status).toBe('active');
     expect(status.currentPeriodEnd).toBe('2026-12-19T12:00:00.000Z');
     expect(status.manageUrl).toMatch(/^https:\/\/billing\.stripe\.test\//);
+  });
+
+  test('a card added the day before the start date is first charged on the start date', async () => {
+    const t = setup();
+    await t.billing.announceCharges(new Date(NOV_5.getTime() + 14 * DAY));
+    t.advance(13 * DAY);
+    await t.addCard();
+    expect(t.stripe.invoices()).toEqual([]);
+    expect((await t.status()).status).toBe('free');
+    t.advance(DAY);
+    await t.deliver(t.stripe.advanceTo(new Date(NOV_5.getTime() + 14 * DAY)));
+    expect(t.stripe.invoices()).toEqual([{ amountCents: 4900, paid: true }]);
+  });
+
+  test('a card added after the start date is charged at once', async () => {
+    const t = setup();
+    await t.billing.announceCharges(new Date(NOV_5.getTime() + 14 * DAY));
+    t.advance(15 * DAY);
+    await t.addCard();
+    expect(t.stripe.invoices()).toEqual([{ amountCents: 4900, paid: true }]);
+    expect(await t.status()).toMatchObject({ status: 'active', graceEndsAt: null });
   });
 
   test('a teammate who joins adds a $49 seat to the bill', async () => {

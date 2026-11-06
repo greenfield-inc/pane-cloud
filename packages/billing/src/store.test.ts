@@ -34,7 +34,7 @@ describe.each(stores)('%s store', (_name, open) => {
     const record = {
       ...emptyRecord('team_a'),
       customerId: 'cus_1',
-      subscription: { id: 'sub_1', status: 'past_due' as const, quantity: 3, currentPeriodEnd: new Date('2026-12-19T12:00:00Z'), cancelAtPeriodEnd: false, trialEnd: null },
+      subscription: { id: 'sub_1', status: 'past_due' as const, quantity: 3, currentPeriodEnd: new Date('2026-12-19T12:00:00Z'), cancelAtPeriodEnd: false },
       graceEndsAt: new Date('2026-11-26T12:00:00Z'),
     };
     await store.saveRecord(record);

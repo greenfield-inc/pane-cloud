@@ -9,7 +9,7 @@ export interface Queryable {
 interface RecordRow {
   team_id: string;
   stripe_customer_id: string | null;
-  subscription: (Omit<SubscriptionSnapshot, 'currentPeriodEnd' | 'trialEnd'> & { currentPeriodEnd: string | null; trialEnd: string | null }) | null;
+  subscription: (Omit<SubscriptionSnapshot, 'currentPeriodEnd'> & { currentPeriodEnd: string | null }) | null;
   grace_ends_at: Date | null;
   notice_sent_at: Date | null;
 }
@@ -21,7 +21,7 @@ function fromRow(row: RecordRow): BillingRecord {
   return {
     teamId: row.team_id,
     customerId: row.stripe_customer_id,
-    subscription: sub && { ...sub, currentPeriodEnd: toDate(sub.currentPeriodEnd), trialEnd: toDate(sub.trialEnd) },
+    subscription: sub && { ...sub, currentPeriodEnd: toDate(sub.currentPeriodEnd) },
     graceEndsAt: row.grace_ends_at,
     noticeSentAt: row.notice_sent_at,
   };

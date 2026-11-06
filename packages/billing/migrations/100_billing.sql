@@ -2,7 +2,7 @@
 CREATE TABLE billing_teams (
   team_id text PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
   stripe_customer_id text UNIQUE,
-  -- Stripe's latest view of the team's subscription, refreshed on every webhook: { id, status, quantity, currentPeriodEnd, cancelAtPeriodEnd, trialEnd }.
+  -- Stripe's latest view of the team's subscription, refreshed on every webhook: { id, status, quantity, currentPeriodEnd, cancelAtPeriodEnd }.
   subscription jsonb,
   grace_ends_at timestamptz,
   notice_sent_at timestamptz,

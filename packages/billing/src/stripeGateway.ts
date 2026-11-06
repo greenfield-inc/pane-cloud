@@ -11,7 +11,6 @@ export interface SubscriptionSnapshot {
   quantity: number;
   currentPeriodEnd: Date | null;
   cancelAtPeriodEnd: boolean;
-  trialEnd: Date | null;
 }
 
 export interface SeatPrice {
@@ -28,8 +27,8 @@ export interface StripeGateway {
     teamId: string;
     priceId: string;
     quantity: number;
-    /** Stripe charges on this date; null charges now. */
-    trialEnd: Date | null;
+    /** The first charge lands on this date and nothing is charged before it; null charges now. */
+    firstChargeAt: Date | null;
     returnUrl: string;
   }): Promise<string>;
   createPortalSession(input: { customerId: string; returnUrl: string }): Promise<string>;
@@ -61,7 +60,7 @@ export function createStripeGateway(secretKey: string, options: { host?: string;
       return customer.id;
     },
 
-    async createCheckoutSession({ customerId, teamId, priceId, quantity, trialEnd, returnUrl }) {
+    async createCheckoutSession({ customerId, teamId, priceId, quantity, firstChargeAt, returnUrl }) {
       const session = await stripe.checkout.sessions.create({
         mode: 'subscription',
         customer: customerId,
@@ -69,7 +68,7 @@ export function createStripeGateway(secretKey: string, options: { host?: string;
         line_items: [{ price: priceId, quantity }],
         subscription_data: {
           metadata: { team_id: teamId },
-          ...(trialEnd ? { trial_end: Math.floor(trialEnd.getTime() / 1000) } : {}),
+          ...(firstChargeAt ? { billing_cycle_anchor: Math.floor(firstChargeAt.getTime() / 1000), proration_behavior: 'none' as const } : {}),
         },
         success_url: returnUrl,
         cancel_url: returnUrl,
@@ -96,7 +95,6 @@ export function createStripeGateway(secretKey: string, options: { host?: string;
         quantity: item?.quantity ?? 0,
         currentPeriodEnd: item ? new Date(item.current_period_end * 1000) : null,
         cancelAtPeriodEnd: sub.cancel_at_period_end,
-        trialEnd: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
       };
     },
 
