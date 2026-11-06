@@ -67,8 +67,10 @@ export function createHostNetwork(options: HostNetworkOptions = {}): HostNetwork
       await ip('tuntap', 'add', 'dev', tap, 'mode', 'tap', 'user', String(owner.uid));
       // No IPv6 link-local address on the host side of the tap.
       await ip('link', 'set', 'dev', tap, 'addrgenmode', 'none');
-      await ip('addr', 'add', `${address.gatewayIp}/30`, 'dev', tap);
+      // Up before the address: the resolver (dnsmasq, bind-dynamic) binds when it sees a new address,
+      // and only on an interface that is already up.
       await ip('link', 'set', 'dev', tap, 'up');
+      await ip('addr', 'add', `${address.gatewayIp}/30`, 'dev', tap);
       await nftApply(renderAttach(machineId, tap));
       return address;
     },

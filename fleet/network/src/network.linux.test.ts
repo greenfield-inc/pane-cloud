@@ -176,6 +176,18 @@ describe.skipIf(!canRun)('host network on Linux', () => {
     expect(logged).toBe(received);
   });
 
+  test('the running resolver answers on a tap attached after it started', async () => {
+    await net.attach(C, 3, { uid: 0 });
+    const deadline = Date.now() + 2000;
+    let sockets = '';
+    while (Date.now() < deadline && !sockets.includes('10.200.0.13:53')) {
+      sockets = await sh('ss -lnu');
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(sockets).toContain('10.200.0.13:53');
+    await net.detach(C);
+  });
+
   test('detach removes the tap and the counter', async () => {
     await net.attach(C, 3, { uid: 0 });
     expect(await net.egressBytes(C)).toBe(0);
