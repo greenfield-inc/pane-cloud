@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Pane Cloud in your own AWS account: one always-on arm64 machine running the Pane Cloud image
+  and Pane's stock daemon, joined to your tailnet. Greenfield has no access to it.
+  Source: https://github.com/greenfield-inc/pane-cloud/tree/main/own-aws
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Machine }
+        Parameters: [MachineName, InstanceType, ImageId, AvailabilityZone]
+    ParameterLabels:
+      MachineName: { default: Machine name (its Tailscale and Pane name) }
+      InstanceType: { default: Instance type }
+      ImageId: { default: Pane Cloud image (AMI ID in this region) }
+      AvailabilityZone: { default: Availability Zone (blank picks the first one) }
+
+Parameters:
+  MachineName:
+    Type: String
+    Default: pane-cloud
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+    ConstraintDescription: Lowercase letters, digits and hyphens, starting with a letter or digit.
+  InstanceType:
+    Type: String
+    Default: m7g.xlarge
+    AllowedValues: [m7g.large, m7g.xlarge, m7g.2xlarge, m7g.4xlarge, r7g.large, r7g.xlarge, r7g.2xlarge, c7g.xlarge, c7g.2xlarge]
+    Description: Graviton (arm64) only, because the image is arm64. m7g.xlarge (4 vCPU, 16 GiB) matches a Pane Cloud machine.
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: The published Pane Cloud image for this region. The Launch Stack link fills it in.
+  AvailabilityZone:
+    Type: String
+    Default: ""
+
+Conditions:
+  PickFirstZone: !Equals [!Ref AvailabilityZone, ""]
+
+Resources:
+  Network:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.80.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref MachineName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Ref MachineName }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Network
+      InternetGatewayId: !Ref InternetGateway
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Network
+      CidrBlock: 10.80.0.0/24
+      AvailabilityZone: !If [PickFirstZone, !Select [0, !GetAZs ""], !Ref AvailabilityZone]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Ref MachineName }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Network
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+  # No inbound rules: the machine is reached only over your tailnet, which it dials out to.
+  MachineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Pane Cloud machine, outbound only
+      VpcId: !Ref Network
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0, Description: "Outbound to Tailscale, GitHub, package registries and agent APIs" }
+
+  # Lets you open a shell from the AWS console (Session Manager) if Tailscale needs fixing.
+  MachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  MachineProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref MachineRole]
+
+  # Signalled by the first boot with the Tailscale login link, or with the step that failed.
+  ReadyHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  MachineLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs: { VolumeSize: 50, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              # First boot of a Pane Cloud machine in your own AWS account.
+              # Sets up Pane's daemon for the ubuntu user, turns on workspaces, starts Tailscale's
+              # login, and hands the login link to the stack. Full log: /var/log/pane-own-aws.log
+              set -euo pipefail
+              HANDLE='${ReadyHandle}'
+              NAME='${MachineName}'
+              PANE_USER=ubuntu
+              step="checking the image"
+
+              exec 3>&1
+              exec >>/var/log/pane-own-aws.log 2>&1
+
+              signal() {
+                local body
+                body=$(node -e 'console.log(JSON.stringify({Status: process.argv[1], Reason: process.argv[2], UniqueId: "login", Data: process.argv[3]}))' "$1" "$2" "$3")
+                curl -fsS --retry 5 -X PUT -H 'Content-Type:' --data-binary "$body" "$HANDLE"
+              }
+              fail() {
+                trap - ERR
+                echo "pane-own-aws: failed while $step: $1" >&3
+                signal FAILURE "Failed while $step: $1 Log: /var/log/pane-own-aws.log" "" || true
+                exit 1
+              }
+              trap 'fail "a command exited with an error."' ERR
+
+              for tool in tailscale node npx git; do
+                command -v "$tool" >/dev/null || fail "$tool is missing. Launch this stack with the Pane Cloud image."
+              done
+
+              step="installing the Pane daemon"
+              home=$(getent passwd "$PANE_USER" | cut -d: -f6)
+              # The setup output holds a pairing code, so it stays in a file only the ubuntu user can read.
+              setup_log="$home/pane-daemon-setup.log"
+              install -m 600 -o "$PANE_USER" -g "$PANE_USER" /dev/null "$setup_log"
+              # shellcheck disable=SC2024 # the root shell writes the file, which is created above for the ubuntu user
+              sudo -iu "$PANE_USER" npx --yes runpane@latest install daemon --format deb --label "$NAME" --yes >>"$setup_log" 2>&1 \
+                || fail "runpane install daemon exited with an error. Its output is in $setup_log."
+
+              step="turning on workspaces"
+              sudo -iu "$PANE_USER" npx --yes runpane@latest workspace enable --pane-dir "$home/.pane_remote"
+
+              step="starting Tailscale"
+              systemctl enable --now tailscaled
+              setsid tailscale up --hostname="$NAME" >/var/log/pane-tailscale-up.log 2>&1 </dev/null &
+
+              step="waiting for the Tailscale login link"
+              url=""
+              for _ in $(seq 1 90); do
+                url=$( (tailscale status --json || true) | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).AuthURL||"")}catch{console.log("")}})')
+                [ -n "$url" ] && break
+                sleep 2
+              done
+              [ -n "$url" ] || fail "Tailscale gave no login link within 3 minutes."
+
+              signal SUCCESS "Open the login link to add $NAME to your tailnet." "$url"
+              echo "pane-own-aws: ready; the login link is in the stack's outputs" >&3
+
+  Machine:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicRoute
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref Subnet
+      SecurityGroupIds: [!Ref MachineSecurityGroup]
+      IamInstanceProfile: !Ref MachineProfile
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MachineLaunchTemplate
+        Version: !GetAtt MachineLaunchTemplate.LatestVersionNumber
+      Tags: [{ Key: Name, Value: !Ref MachineName }]
+
+  MachineReady:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Machine
+    Properties:
+      Handle: !Ref ReadyHandle
+      Timeout: "900"
+      Count: 1
+
+Outputs:
+  TailscaleLoginLink:
+    Description: >-
+      Open this link and sign in to Tailscale as yourself. The machine joins your tailnet as your own
+      device, then desktop Pane shows it under Settings > Remote Access > Switch to.
+    Value: !GetAtt MachineReady.Data
+  InstanceId:
+    Description: Start, stop and delete the machine from the EC2 console, or delete this stack.
+    Value: !Ref Machine
