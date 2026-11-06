@@ -166,6 +166,40 @@ importers:
 
   .: {}
 
+  packages/billing:
+    dependencies:
+      pane-cloud-contract:
+        specifier: github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract
+        version: https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5#path:/packages/pane-cloud-contract
+      pg:
+        specifier: ^8.13.1
+        version: 8.23.1
+      stripe:
+        specifier: ^23.1.0
+        version: 23.1.0(@types/node@22.20.5)
+    devDependencies:
+      '@eslint/js':
+        specifier: ^9.17.0
+        version: 9.39.5
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.5
+      '@types/pg':
+        specifier: ^8.11.10
+        version: 8.23.1
+      eslint:
+        specifier: ^9.17.0
+        version: 9.39.5(supports-color@7.2.0)
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      typescript-eslint:
+        specifier: ^8.19.0
+        version: 8.72.1(eslint@9.39.5(supports-color@7.2.0))(supports-color@7.2.0)(typescript@5.9.3)
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.5)(supports-color@7.2.0)
+
   packages/service:
     dependencies:
       pane-cloud-contract:
@@ -1238,6 +1272,15 @@ packages:
     resolution: {integrity: sha512-6fPc+R4ihwqP6N/aIv2f1gMH8lOVtWQHoqC4yK6oSDVVocumAsfCqjkXnqiYMhmMwS/mEHLp7Vehlt3ql6lEig==}
     engines: {node: '>=8'}
 
+  stripe@23.1.0:
+    resolution: {integrity: sha512-fVUfMSfTPoukfoV//MUKAx2+YxyKmYaYtnAL9VkfnHfaPNQylFdWZMD+zgUFerI8rjbaiER8Vzj2XEUQ2AhAsQ==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@types/node': '>=20'
+    peerDependenciesMeta:
+      '@types/node':
+        optional: true
+
   supports-color@7.2.0:
     resolution: {integrity: sha512-qpCAvRl9stuOHveKsn7HncJRvv501qIacKzQlO/+Lwxc9+0q2wLyv4Dfvt80/DPn2pqOBsJdDiogXGR9+OvwRw==}
     engines: {node: '>=8'}
@@ -2275,6 +2318,10 @@ snapshots:
   std-env@3.10.0: {}
 
   strip-json-comments@3.1.1: {}
+
+  stripe@23.1.0(@types/node@22.20.5):
+    optionalDependencies:
+      '@types/node': 22.20.5
 
   supports-color@7.2.0:
     dependencies:

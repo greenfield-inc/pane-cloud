@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import pg from 'pg';
 import { afterAll, describe, expect, test } from 'vitest';
 import { createPgStore } from './pgStore.ts';
@@ -12,7 +13,7 @@ async function pgStore(): Promise<{ store: BillingStore; close: () => Promise<vo
   // The service's 001 migration owns teams; billing only needs its key.
   await client.query('CREATE TABLE teams (id text PRIMARY KEY)');
   await client.query("INSERT INTO teams (id) VALUES ('team_a'), ('team_b')");
-  await client.query(await readFile(new URL('../migrations/100_billing.sql', import.meta.url), 'utf8'));
+  await client.query(await readFile(join(__dirname, '../migrations/100_billing.sql'), 'utf8'));
   return { store: createPgStore(client), close: async () => (await client.query(`DROP SCHEMA ${schema} CASCADE`), await client.end()) };
 }
 

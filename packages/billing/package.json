@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "license": "AGPL-3.0",
-  "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -18,23 +17,32 @@
     "build": "tsc -p tsconfig.build.json",
     "prepare": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint src scripts",
     "test": "vitest run",
-    "stripe:setup": "node --experimental-strip-types scripts/setup-stripe.ts"
+    "stripe:setup": "node --experimental-strip-types scripts/setup-stripe.mts"
   },
   "dependencies": {
     "pane-cloud-contract": "github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract",
-    "pg": "^8.23.1",
+    "pg": "^8.13.1",
     "stripe": "^23.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.17.0",
     "@types/node": "^22.10.2",
-    "@types/pg": "^8.23.1",
-    "typescript": "^5.9.3",
-    "vitest": "^4.0.0"
+    "@types/pg": "^8.11.10",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.0",
+    "vitest": "^2.1.8"
   },
   "files": [
     "dist",
     "migrations",
     "README.md"
-  ]
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
+  }
 }
