@@ -161,7 +161,8 @@ export async function startHarness(options: HarnessOptions): Promise<Harness> {
       for (const host of hosts.values()) await host.agent.close();
       for (const host of hosts.values()) await host.fake.crash();
       await fleet.close();
-      await rm(tmp, { recursive: true, force: true });
+      // Machine work that close() leaves running may still be writing here.
+      await rm(tmp, { recursive: true, force: true, maxRetries: 10 });
     },
   };
 }

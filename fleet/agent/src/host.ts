@@ -3,7 +3,7 @@
  * runtime, F3's network, F4's fair use and the guest agent. It has no inbound port; it calls the
  * fleet API to report and to receive work (`sync.ts`).
  */
-import { readFile, rename, rm, stat } from 'node:fs/promises';
+import { lchown, lstat, readFile, rename, rm, stat } from 'node:fs/promises';
 import { freemem, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { createDiskFromTemplate, type MachineSpec, type Runtime, type Vm } from '@pane-cloud/fleet-runtime';
@@ -240,9 +240,20 @@ export async function createHostAgent(options: HostAgentOptions): Promise<HostAg
           await boot(m);
           break;
         case 'resume': {
+          // Start from an empty directory so every file in it is one the store just wrote.
+          await rm(snapshotDir(id), { recursive: true, force: true });
           const files = await o.snapshots.get(id, snapshotDir(id));
           if (!files) throw new CloudApiError('invalid_state', `Machine ${id} has no saved snapshot to resume from.`, 'Create a new machine, or collect diagnostics.');
           await rename(files.diskPath, diskPath(id));
+          // F1 restores only snapshot files owned by the machine's uid, which this host may have changed.
+          // The agent runs as root on a host; a non-root agent (tests) cannot chown and needs not.
+          if (process.getuid?.() === 0) {
+            for (const path of [files.statePath, files.memPath]) {
+              const info = await lstat(path);
+              if (!info.isFile() || info.nlink !== 1) throw new Error(`Snapshot file ${path} is not a regular file the store just wrote.`);
+              await lchown(path, uidBase + m.slot, uidBase + m.slot);
+            }
+          }
           await boot(m, files);
           await rm(snapshotDir(id), { recursive: true, force: true });
           break;

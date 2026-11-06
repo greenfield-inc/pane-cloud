@@ -82,7 +82,7 @@ describe.skipIf(!canRun)('host agent on KVM', () => {
       // SAFETY: anything other than an error is the OperationStatus the client parsed.
       const { requestId } = accepted as { requestId: string };
       const finished = await eventually(() => client.getOperation(requestId), (s) => s.finishedAt !== null, 120_000);
-      expect(finished.error).toBeNull();
+      expect(finished.error?.message ?? null).toBeNull();
     };
     const machineIn = (state: FleetMachine['state']) => eventually(() => client.getMachine(machineId), (m) => m.state === state, 30_000);
     const consolePath = join(work, 'data', 'console', `${machineId}.log`);
