@@ -28,10 +28,10 @@ On-demand cost in us-east-1 is about $127 a month at the default size: $119 for 
 
 1. Open the Launch Stack link (or upload `pane-cloud.yaml` in the CloudFormation console), pick a region, and keep or change the machine name and instance type.
 2. Tick the box that acknowledges IAM resources, then **Create stack**. The stack waits up to 15 minutes for the machine to finish its first boot.
-3. When the stack reaches `CREATE_COMPLETE`, open its **Outputs** tab. `TailscaleLoginLink` reads `{"login":"https://login.tailscale.com/a/..."}`. Open that link and sign in as yourself. The machine joins your tailnet as your own device.
+3. When the stack reaches `CREATE_COMPLETE`, open its **Outputs** tab. `TailscaleLoginLink` reads `{"login":"https://login.tailscale.com/a/..."}`. Open that link right away and sign in as yourself. The machine joins your tailnet as your own device; check that it shows you as its owner at <https://login.tailscale.com/admin/machines>. Anyone in the account who can read the stack's outputs can see the link, and whoever opens it first gets the machine.
 4. In desktop Pane, open **Settings → Remote Access → Switch to** and pick the machine. Sign in to GitHub and to your agents (Claude Code, Codex, Cursor, OpenCode, Gemini) from the machine's own terminal in Pane.
 
-If the stack fails, its events name the step that failed. The machine's full first-boot log is `/var/log/pane-own-aws.log`, which you can read from a Session Manager shell (set the console's **Behavior on provisioning failure** to *Preserve* to keep the instance). The daemon's setup output, including a `pane-remote://` pairing code for browsers and phones, is in `/home/ubuntu/pane-daemon-setup.log`, readable only by the `ubuntu` user.
+If the stack fails, its events name the step that failed. The machine's full first-boot log is `/var/log/pane-own-aws.log`, which you can read from a Session Manager shell (to keep the instance after a failure, launch with the console's stack failure option **Preserve successfully provisioned resources**). The daemon's setup output, including a `pane-remote://` pairing code for browsers and phones, is in `/home/ubuntu/pane-daemon-setup.log`, readable only by the `ubuntu` user.
 
 If the login link has expired before you open it, run `sudo tailscale up` from a Session Manager shell and open the link it prints.
 
