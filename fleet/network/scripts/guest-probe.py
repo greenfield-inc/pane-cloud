@@ -64,6 +64,14 @@ def stun(host):
         return "timeout"
 
 words = os.environ.get("PANE_PROBE_ARGS") or open("/proc/cmdline").read()
+def send_bulk(host, datagrams=1000, size=1000):
+    """Sends a known volume over UDP and returns the IP bytes sent (payload plus 28 bytes of headers)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sent = 0
+    for _ in range(datagrams):
+        sent += s.sendto(b"\0" * size, (host, 9)) + 28
+    return sent
+
 args = dict(a.split("=", 1) for a in words.split() if "=" in a)
 role = args.get("pane_probe")
 time.sleep(2)
@@ -92,4 +100,6 @@ elif role == "client":
     say("PANE_PROBE tailscale-derp %s" % tcp(resolve("derp1.tailscale.com"), 443))
     # DERP servers answer only Tailscale's own STUN requests, so this uses a public STUN server on the same port.
     say("PANE_PROBE stun %s" % stun(resolve("stun.cloudflare.com")))
+    # 192.0.2.1 (TEST-NET-1) is never routed on the internet, so this only crosses the host's uplink.
+    say("PANE_PROBE egress-sent %d" % send_bulk("192.0.2.1"))
     say("PANE_PROBE_DONE")

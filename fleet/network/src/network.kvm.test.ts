@@ -161,6 +161,12 @@ describe.skipIf(!canRun)('journey 7: isolation from real guests', () => {
     expect(results.client['tailscale-control']).toBe('open');
     expect(results.client['tailscale-derp']).toBe('open');
     expect(results.client.stun).toBe('open');
-    expect(await hostNet.egressBytes('net-client')).toBeGreaterThan(1000);
+    // The probe's checks above send well under 1 KB out (handshakes and one STUN packet; DNS stays on
+    // the host and refused flows are not counted), then it sends a known ~1 MB over UDP.
+    const sent = Number(results.client['egress-sent']);
+    expect(sent).toBe(1_028_000);
+    const counted = await hostNet.egressBytes('net-client');
+    expect(counted).toBeGreaterThanOrEqual(sent);
+    expect(counted).toBeLessThan(sent + 10_000);
   });
 });
