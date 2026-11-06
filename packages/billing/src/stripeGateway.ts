@@ -21,7 +21,7 @@ export interface SeatPrice {
 /** The Stripe calls billing makes. `createStripeGateway` is the real one; tests use `createFakeStripe`. */
 export interface StripeGateway {
   findPrice(lookupKey: string): Promise<SeatPrice>;
-  createCustomer(input: { teamId: string; email: string }): Promise<string>;
+  createCustomer(input: { teamId: string; email: string | null }): Promise<string>;
   createCheckoutSession(input: {
     customerId: string;
     teamId: string;
@@ -56,7 +56,7 @@ export function createStripeGateway(secretKey: string, options: { host?: string;
     },
 
     async createCustomer({ teamId, email }) {
-      const customer = await stripe.customers.create({ email, metadata: { team_id: teamId } }, { idempotencyKey: `pane-cloud-customer-${teamId}` });
+      const customer = await stripe.customers.create({ ...(email ? { email } : {}), metadata: { team_id: teamId } }, { idempotencyKey: `pane-cloud-customer-${teamId}` });
       return customer.id;
     },
 

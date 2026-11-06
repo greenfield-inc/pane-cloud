@@ -39,7 +39,7 @@ export function createFakeStripe(options: { standardSeatCents: number }) {
   let seq = 0;
   const id = (prefix: string) => `${prefix}_${++seq}`;
   const prices: Price[] = [{ id: 'price_founding', lookupKey: PRICE_LOOKUP_KEYS.founding, unitAmountCents: 4900 }];
-  const customers = new Map<string, { teamId: string; email: string }>();
+  const customers = new Map<string, { teamId: string; email: string | null }>();
   const sessions = new Map<string, { customerId: string; priceId: string; quantity: number; firstChargeAt: Date | null }>();
   const subscriptions: Subscription[] = [];
   const invoices: { customerId: string; amountCents: number; paid: boolean }[] = [];

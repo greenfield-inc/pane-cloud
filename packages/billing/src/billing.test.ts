@@ -15,7 +15,7 @@ function setup(options: { founding?: boolean; seats?: number } = {}) {
     createdAt: new Date('2026-11-01T00:00:00Z'),
     founding: options.founding ?? true,
     ownerAccountId: 'acct_owner',
-    ownerEmail: 'owner@example.com',
+    ownerEmail: 'owner@example.com' as string | null,
     seats: options.seats ?? 1,
   };
   const stopped: { teamId: string; reason: string }[] = [];
@@ -98,6 +98,16 @@ describe('the billing notice', () => {
     const status = await t.status();
     expect(status.chargesStartAt).toBe('2026-11-19T12:00:00.000Z');
     expect(status.status).toBe('free');
+  });
+
+  test('skips an owner with no email, reports the team, and emails them on a later run', async () => {
+    const t = setup();
+    t.team.ownerEmail = null;
+    const startAt = new Date(NOV_5.getTime() + 14 * DAY);
+    expect(await t.billing.announceCharges(startAt)).toEqual({ emailed: 0, noEmail: ['team_a'] });
+    t.team.ownerEmail = 'owner@example.com';
+    expect(await t.billing.announceCharges(startAt)).toEqual({ emailed: 1, noEmail: [] });
+    expect(t.outbox.map((m) => m.to)).toEqual(['owner@example.com']);
   });
 
   test('refuses a start date that is not in the future', async () => {

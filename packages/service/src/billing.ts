@@ -49,7 +49,7 @@ export function createServiceBilling(
         );
         const t = rows[0];
         if (!t) return null;
-        return { id: t.id, createdAt: t.created_at, founding: t.founding, ownerAccountId: t.owner_account_id, ownerEmail: t.email ?? '', seats: Number(t.seats) };
+        return { id: t.id, createdAt: t.created_at, founding: t.founding, ownerAccountId: t.owner_account_id, ownerEmail: t.email, seats: Number(t.seats) };
       },
       async listTeamIds() {
         const { rows } = await db.query<{ id: string }>('SELECT id FROM teams ORDER BY id');

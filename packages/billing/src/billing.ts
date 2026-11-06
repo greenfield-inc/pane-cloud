@@ -13,7 +13,8 @@ export interface BillingTeam {
   /** Joined during the free cohort: every seat keeps the founding $49 price. */
   founding: boolean;
   ownerAccountId: string;
-  ownerEmail: string;
+  /** Null when the owner's GitHub email is private; they get no notice until it is known. */
+  ownerEmail: string | null;
   /** Billed seats: the owner plus every member. */
   seats: number;
 }
@@ -126,19 +127,29 @@ export function createBilling(deps: BillingDeps) {
     /** Call after a member joins or leaves (E2). Stripe prorates the change onto the next invoice. */
     syncSeats,
 
-    /** Sets the date charges start for every team and emails each owner once. Safe to run again. */
-    async announceCharges(chargesStartAt: Date): Promise<void> {
+    /**
+     * Sets the date charges start for every team and emails each owner once. Running it again emails
+     * only owners who haven't had it. Returns how many were emailed, and the teams whose owner has no email.
+     */
+    async announceCharges(chargesStartAt: Date): Promise<{ emailed: number; noEmail: string[] }> {
       if (chargesStartAt <= now()) throw new Error('The charge start date must be in the future.');
       const existing = await store.getNotice();
       await store.saveNotice({ issuedAt: existing?.issuedAt ?? now(), chargesStartAt });
+      const result = { emailed: 0, noEmail: [] as string[] };
       for (const teamId of await teams.listTeamIds()) {
         const record = (await store.getRecord(teamId)) ?? emptyRecord(teamId);
         if (record.noticeSentAt) continue;
         const team = await requireTeam(teamId);
-        await deps.mailer.send(noticeEmail(team, (await seatPrice(team)).unitAmountCents, chargesStartAt));
+        if (!team.ownerEmail) {
+          result.noEmail.push(teamId);
+          continue;
+        }
+        await deps.mailer.send(noticeEmail({ ...team, ownerEmail: team.ownerEmail }, (await seatPrice(team)).unitAmountCents, chargesStartAt));
         record.noticeSentAt = now();
         await store.saveRecord(record);
+        result.emailed += 1;
       }
+      return result;
     },
 
     /** POST /v1/billing/webhook with the raw body and the Stripe-Signature header. Throws on a bad signature. */
@@ -183,7 +194,7 @@ export type Billing = ReturnType<typeof createBilling>;
 
 const dollars = (cents: number) => `$${(cents / 100).toFixed(cents % 100 === 0 ? 0 : 2)}`;
 
-function noticeEmail(team: BillingTeam, seatCents: number, startAt: Date) {
+function noticeEmail(team: BillingTeam & { ownerEmail: string }, seatCents: number, startAt: Date) {
   const date = startAt.toLocaleDateString('en-US', { timeZone: 'UTC', month: 'long', day: 'numeric', year: 'numeric' });
   const seats = `${team.seats} ${team.seats === 1 ? 'seat' : 'seats'}`;
   const lines = [

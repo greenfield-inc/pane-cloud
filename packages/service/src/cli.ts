@@ -42,8 +42,10 @@ export async function runCommand(
     if (Number.isNaN(startAt.getTime())) throw new Error(`"${login}" is not a date. Use an ISO date such as 2026-11-26T17:00:00Z.`);
     const billing = billingFromEnv(env);
     if (!billing) throw new Error('Billing is off: set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET.');
-    await createServiceBilling(db, billing, overrides).announceCharges(startAt);
-    return `Charges start ${startAt.toISOString()}. Every team owner without the notice has been emailed.`;
+    const { emailed, noEmail } = await createServiceBilling(db, billing, overrides).announceCharges(startAt);
+    const lines = [`Charges start ${startAt.toISOString()}. Emailed ${emailed} team owner(s).`];
+    if (noEmail.length) lines.push(`No email on file for the owners of ${noEmail.join(', ')}: reach them another way, then run this again once they have one.`);
+    return lines.join('\n');
   }
   throw new Error('Usage: migrate | cohort add <github-login> [note] | cohort remove <github-login> | cohort list | billing announce <start-date-iso>');
 }
