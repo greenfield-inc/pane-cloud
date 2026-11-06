@@ -29,8 +29,8 @@ Every command takes `--dry-run`, which prints the AWS calls it would make and ma
 ## Before the first team (once)
 
 1. **AWS account.** Parsa has finished `aws-setup.md` (account, credits, the 800-vCPU quota, budget alarms) and said go (D-21).
-2. **People.** A named operator, and an abuse contact who answers within a day. The alert email below goes to the abuse contact.
-3. **Terms.** Parsa has approved the bridge terms that teams accept at intake ([INTAKE.md](INTAKE.md)).
+2. **People.** The operator and abuse contact is hello@dcouple.ai for now; whoever reads it answers abuse reports within a day. Alarm and budget emails go there too.
+3. **Terms.** The bridge terms that teams accept at intake ([INTAKE.md](INTAKE.md)) have passed Parsa's legal review.
 4. **Private abuse thresholds.** Write `~/.config/pane-bridge/abuse.env` (mode 600) from the values Parsa keeps privately. They stay out of this public repo (D-23):
    ```sh
    export BRIDGE_EGRESS_GB_PER_DAY=...   # a machine that sends more in a day is stopped
@@ -39,7 +39,7 @@ Every command takes `--dry-run`, which prints the AWS calls it would make and ma
    ```
 5. **Account setup.** Creates the alarm topic and its email subscription, turns on GuardDuty and routes its findings to email, sets gross-spend budgets at $5K, $10K and $15K a month and at 50% and 75% of the credits, and creates the network: three security groups and one EC2 Instance Connect Endpoint. Safe to run again; it skips what exists.
    ```sh
-   node bridge.mjs account-setup --alert-email <abuse contact> --credits-usd <credit total> --credits-start <yyyy-mm-dd>
+   node bridge.mjs account-setup --alert-email hello@dcouple.ai --credits-usd <credit total> --credits-start <yyyy-mm-dd>
    ```
    The abuse contact must click the confirmation link AWS emails.
 6. **Preflight.** Run steps 1 to 4 below for one test user (a teammate, on their own tailnet) before the first real team, and record the time each step took.
@@ -47,7 +47,7 @@ Every command takes `--dry-run`, which prints the AWS calls it would make and ma
 ## Step 0 · Intake (about 5 minutes per team)
 
 1. Check the bridge has room: `node bridge.mjs status --operator-hours <hours this week>`. If it says **Pause intake: yes**, reply with the waitlist message ([INTAKE.md](INTAKE.md)) and stop.
-2. Read the intake form. Every seat needs a GitHub login, a Tailscale login and an email.
+2. Read the team's reply to the intake email. Every seat needs a GitHub login, a Tailscale login and an email.
 3. Vet the team: `node bridge.mjs vet --org <github org> --user <login> --user <login> ...`. It passes when the organization exists and every seat's GitHub account is older than 90 days. On a fail, reply with the reason and stop.
 4. Confirm the team accepted the bridge terms.
 
