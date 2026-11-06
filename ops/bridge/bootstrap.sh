@@ -16,7 +16,8 @@ export DEBIAN_FRONTEND=noninteractive
 echo "pane-bridge bootstrap: ${BRIDGE_MACHINE_NAME}, Pane ${PANE_VERSION}, $(date -u +%FT%TZ)"
 
 apt-get update -q
-apt-get install -yq git jq curl ca-certificates gnupg build-essential unzip
+# libasound2t64: Pane's .deb needs libasound.so.2 but doesn't declare it (2.4.215).
+apt-get install -yq git jq curl ca-certificates gnupg build-essential unzip libasound2t64
 
 # Node 22 (Pane needs 22.23.4 or later on the 22 line).
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -41,8 +42,13 @@ npm install -g "runpane@${PANE_VERSION}" @openai/codex
 # Pane's daemon is a systemd user service; lingering keeps it up with nobody logged in.
 loginctl enable-linger "${BRIDGE_USER}"
 uid=$(id -u "${BRIDGE_USER}")
+home=$(getent passwd "${BRIDGE_USER}" | cut -d: -f6)
 for _ in $(seq 1 30); do [ -S "/run/user/${uid}/bus" ] && break; sleep 1; done
-as_user() { sudo -iu "${BRIDGE_USER}" env XDG_RUNTIME_DIR="/run/user/${uid}" "$@"; }
+as_user() { sudo -u "${BRIDGE_USER}" -H env XDG_RUNTIME_DIR="/run/user/${uid}" "$@"; }
+
+# Claude Code installs into ~/.local/bin; put it on every shell's PATH.
+# shellcheck disable=SC2016 # expands at login
+echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac' > /etc/profile.d/pane-bridge-path.sh
 
 # Claude Code's official installer, into the user's home.
 as_user bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
@@ -56,7 +62,7 @@ as_user runpane install client --format deb "${pane_version_flag[@]}"
 as_user bash -c 'mkdir -p ~/.pane_remote && f=~/.pane_remote/config.json &&
   if [ -s "$f" ]; then jq ".workspaces.enabled = true" "$f" > "$f.tmp" && mv "$f.tmp" "$f";
   else echo "{\"workspaces\":{\"enabled\":true}}" > "$f"; fi'
-as_user runpane daemon repair --pane-dir "/home/${BRIDGE_USER}/.pane_remote" --yes
+as_user runpane daemon repair --pane-dir "${home}/.pane_remote" --yes
 
 # Lets the user make their own connection code for a phone or browser, through
 # `runpane workspace <machine> exec -- pane-bridge-new-code`.
