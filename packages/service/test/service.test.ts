@@ -124,6 +124,59 @@ describe('Pane Cloud service', () => {
     expect((await owner.getBilling()).seats).toBe(2);
   });
 
+  it('stops a removed teammate’s machine with its disk kept, and lets them start it once for a 60-minute push window (D-27)', async () => {
+    const owner = await invitedOwner('remover');
+    const mate = harness.client(await harness.signIn(person('removed-mate')));
+    await mate.acceptInvite((await owner.createInvite('removed-mate')).id);
+    const mateId = (await mate.getAccount()).id;
+    const { machine } = await mate.createMachine('mine', randomUUID());
+    await machineIn(mate, machine.id, (m) => m.state === 'running', 'running');
+
+    await owner.removeMember(mateId);
+    const stopped = await machineIn(mate, machine.id, (m) => m.state === 'stopped', 'stopped after removal');
+    expect(stopped.pushWindowEndsAt).toBeNull();
+    const [removalStop] = (await mate.listActionLog(machine.id)).entries;
+    expect(removalStop).toMatchObject({
+      operation: 'stop',
+      actor: { kind: 'service' },
+      reason: 'You were removed from your team. Your disk is kept: start this machine once for 60 minutes to push your work.',
+    });
+
+    const started = await mate.startMachine(machine.id);
+    expect(started.operation.reason).toBe('You started this machine for a 60-minute push window after leaving your team.');
+    expect(Date.parse(started.machine.pushWindowEndsAt ?? '')).toBe(Date.parse(started.operation.requestedAt) + 60 * 60_000);
+    await machineIn(mate, machine.id, (m) => m.state === 'running', 'running in its push window');
+
+    // An hour passes: move the removal and the start back past the window.
+    await harness.db.query("UPDATE machines SET seat_removed_at = now() - interval '62 minutes' WHERE id = $1", [machine.id]);
+    await harness.db.query("UPDATE action_log SET requested_at = now() - interval '61 minutes' WHERE machine_id = $1 AND operation = 'start'", [machine.id]);
+    await machineIn(mate, machine.id, (m) => m.state === 'stopped', 'stopped when the window ends');
+    expect((await mate.listActionLog(machine.id)).entries[0]).toMatchObject({ operation: 'stop', actor: { kind: 'service' }, reason: 'Your 60-minute push window after leaving your team is over.' });
+    await expectError('invalid_state', () => mate.startMachine(machine.id));
+
+    await mate.acceptInvite((await owner.createInvite('removed-mate')).id);
+    const back = await mate.startMachine(machine.id);
+    expect(back.operation.reason).toBe('You started this machine.');
+    expect(back.machine.pushWindowEndsAt).toBeNull();
+  });
+
+  it('lets a cohort login with a pending invite join the team that invited it, and gives it its own team once the invite is gone', async () => {
+    const owner = await invitedOwner('cohort-lead');
+    const invite = await owner.createInvite('cohort-mate');
+    await harness.cohort('cohort-mate');
+    const mate = harness.client(await harness.signIn(person('cohort-mate')));
+    expect(await mate.getAccount()).toMatchObject({ teamId: null, pendingInvites: [{ id: invite.id }] });
+    await mate.acceptInvite(invite.id);
+    expect(await mate.getAccount()).toMatchObject({ teamId: (await owner.getAccount()).teamId, role: 'member' });
+
+    const declined = await owner.createInvite('cohort-solo');
+    await harness.cohort('cohort-solo');
+    const solo = harness.client(await harness.signIn(person('cohort-solo')));
+    expect((await solo.getAccount()).teamId).toBeNull();
+    await owner.revokeInvite(declined.id);
+    expect(await solo.getAccount()).toMatchObject({ role: 'owner', pendingInvites: [] });
+  });
+
   it('keeps answering while the fleet is unreachable, and sends what was asked once it is back', async () => {
     const owner = await invitedOwner('durable');
     const { machine } = await owner.createMachine('m', randomUUID());

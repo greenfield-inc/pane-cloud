@@ -235,24 +235,35 @@ export function createWorker({ db, fleet, signer, intervalMs, beta, log = consol
     }
   };
 
-  /** In the beta's push-window phase, queues a stop for each machine whose hour since its start is up. */
+  /** Queues a stop for each running machine whose push window is up, in the beta's last 14 days or after its owner lost their seat (D-27). */
   const endPushWindows = async () => {
     const status = betaStatus(beta);
-    if (status.phase !== 'push_windows' || !status.pushWindowsFrom) return;
-    const { rows } = await db.query<{ id: string }>(
-      `SELECT m.id FROM machines m
+    const betaFrom = status.phase === 'push_windows' ? status.pushWindowsFrom : null;
+    // A machine whose owner lost their seat stops at once if it has not started since, and an hour
+    // after that start if it has. In the beta's push-window phase, an hour after its latest start.
+    const { rows } = await db.query<{ id: string; started_since_removal: boolean }>(
+      `SELECT m.id, ls.at IS NOT NULL AS started_since_removal FROM machines m
+       LEFT JOIN LATERAL (SELECT max(s.requested_at) AS at FROM action_log s
+                          WHERE s.machine_id = m.id AND s.operation = 'start' AND s.requested_at >= m.seat_removed_at) ls ON true
        WHERE m.state = 'running'
          AND NOT EXISTS (SELECT 1 FROM action_log o WHERE o.machine_id = m.id AND o.status IN ('accepted', 'running'))
-         AND (SELECT max(s.requested_at) FROM action_log s WHERE s.machine_id = m.id AND s.operation = 'start' AND s.requested_at >= $1) <= $2`,
-      [status.pushWindowsFrom, new Date(Date.now() - PUSH_WINDOW_MS)],
+         AND ((m.seat_removed_at IS NOT NULL AND COALESCE(ls.at, '-infinity') <= $2)
+           OR ($1::timestamptz IS NOT NULL AND (SELECT max(s.requested_at) FROM action_log s WHERE s.machine_id = m.id AND s.operation = 'start' AND s.requested_at >= $1) <= $2))`,
+      [betaFrom, new Date(Date.now() - PUSH_WINDOW_MS)],
     );
-    for (const { id } of rows) {
+    for (const { id, started_since_removal } of rows) {
       await transaction(db, async (client) => {
         const machine = (await client.query<MachineRow>('SELECT * FROM machines WHERE id = $1 FOR UPDATE', [id])).rows[0];
         if (machine?.state !== 'running') return;
+        let reason = 'Your 60-minute push window before the end of the beta is over.';
+        if (machine.seat_removed_at) {
+          reason = started_since_removal
+            ? 'Your 60-minute push window after leaving your team is over.'
+            : 'You were removed from your team. Your disk is kept: start this machine once for 60 minutes to push your work.';
+        }
         await logSteps(client, id, [
           { operation: 'prepare_to_stop', fleetOperation: 'prepare_to_stop', parameters: {}, actor: { kind: 'service' }, reason: 'Let Pane finish writing before the stop.' },
-          { operation: 'stop', fleetOperation: 'stop', parameters: {}, actor: { kind: 'service' }, reason: 'Your 60-minute push window before the end of the beta is over.' },
+          { operation: 'stop', fleetOperation: 'stop', parameters: {}, actor: { kind: 'service' }, reason },
         ]);
         await client.query("UPDATE machines SET state = 'stopping', state_reason = NULL, updated_at = now() WHERE id = $1", [id]);
       });
