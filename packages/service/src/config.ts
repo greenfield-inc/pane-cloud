@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import type { BetaConfig } from './beta';
 
 export interface ServiceConfig {
   databaseUrl: string;
@@ -16,6 +17,7 @@ export interface ServiceConfig {
   signing: { keyId: string; privateKeyPem: string };
   /** How often the worker polls the fleet for operation status and events. */
   workerIntervalMs: number;
+  beta: BetaConfig;
 }
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -40,5 +42,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServiceConf
     fleet: { url: required(env, 'FLEET_URL'), token: required(env, 'FLEET_TOKEN') },
     signing: { keyId: required(env, 'SIGNING_KEY_ID'), privateKeyPem },
     workerIntervalMs: Number(env.WORKER_INTERVAL_MS ?? 1000),
+    beta: {
+      endsAt: env.BETA_ENDS_AT ? new Date(env.BETA_ENDS_AT).toISOString() : null,
+      announcementUrl: env.BETA_ANNOUNCEMENT_URL ?? null,
+      ownAwsTemplateUrl: env.OWN_AWS_TEMPLATE_URL ?? null,
+    },
   };
 }

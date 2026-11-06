@@ -18,7 +18,7 @@
     "bench": "BENCH=1 vitest run test/bench"
   },
   "dependencies": {
-    "pane-cloud-contract": "github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract",
+    "pane-cloud-contract": "github:greenfield-inc/Pane#84e3698e7975ad4712b18bd6c7c644f17996573a&path:/packages/pane-cloud-contract",
     "pg": "^8.13.1",
     "zod": "^4.6.7"
   },

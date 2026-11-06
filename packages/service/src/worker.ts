@@ -17,6 +17,7 @@ import {
 } from 'pane-cloud-contract';
 import type { PoolClient } from 'pg';
 import { type Db, transaction } from './db';
+import { type BetaConfig, betaStatus, PUSH_WINDOW_MS } from './beta';
 import { type ActionRow, logSteps, type MachineRow, TRANSITIONAL_STATES } from './records';
 
 const OPERATION_LIFETIME_MS = 120_000;
@@ -39,10 +40,11 @@ export interface WorkerDeps {
   fleet: FleetClient;
   signer: OperationSigner;
   intervalMs: number;
+  beta: BetaConfig;
   log?: (line: string) => void;
 }
 
-export function createWorker({ db, fleet, signer, intervalMs, log = console.log }: WorkerDeps) {
+export function createWorker({ db, fleet, signer, intervalMs, beta, log = console.log }: WorkerDeps) {
   let running: Promise<void> | null = null;
   let again = false;
   let timer: NodeJS.Timeout | null = null;
@@ -233,6 +235,31 @@ export function createWorker({ db, fleet, signer, intervalMs, log = console.log 
     }
   };
 
+  /** In the beta's push-window phase, queues a stop for each machine whose hour since its start is up. */
+  const endPushWindows = async () => {
+    const status = betaStatus(beta);
+    if (status.phase !== 'push_windows' || !status.pushWindowsFrom) return;
+    const { rows } = await db.query<{ id: string }>(
+      `SELECT m.id FROM machines m
+       WHERE m.state = 'running'
+         AND NOT EXISTS (SELECT 1 FROM action_log o WHERE o.machine_id = m.id AND o.status IN ('accepted', 'running'))
+         AND (SELECT max(s.requested_at) FROM action_log s WHERE s.machine_id = m.id AND s.operation = 'start' AND s.requested_at >= $1) <= $2`,
+      [status.pushWindowsFrom, new Date(Date.now() - PUSH_WINDOW_MS)],
+    );
+    for (const { id } of rows) {
+      await transaction(db, async (client) => {
+        const machine = (await client.query<MachineRow>('SELECT * FROM machines WHERE id = $1 FOR UPDATE', [id])).rows[0];
+        if (machine?.state !== 'running') return;
+        await logSteps(client, id, [
+          { operation: 'prepare_to_stop', fleetOperation: 'prepare_to_stop', parameters: {}, actor: { kind: 'service' }, reason: 'Let Pane finish writing before the stop.' },
+          { operation: 'stop', fleetOperation: 'stop', parameters: {}, actor: { kind: 'service' }, reason: 'Your 60-minute push window before the end of the beta is over.' },
+        ]);
+        await client.query("UPDATE machines SET state = 'stopping', state_reason = NULL, updated_at = now() WHERE id = $1", [id]);
+      });
+    }
+    if (rows.length) await processQueue();
+  };
+
   const tick = async () => {
     const client = await db.connect();
     try {
@@ -241,6 +268,7 @@ export function createWorker({ db, fleet, signer, intervalMs, log = console.log 
       try {
         await processQueue();
         await processEvents();
+        await endPushWindows();
       } finally {
         await client.query('SELECT pg_advisory_unlock($1)', [WORKER_LOCK]);
       }

@@ -35,8 +35,8 @@ export async function startService(config: ServiceConfig, options: { log?: (line
     token: config.fleet.token,
     fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(FLEET_TIMEOUT_MS) }),
   });
-  const worker = createWorker({ db, fleet, signer: localSigner(config.signing.keyId, config.signing.privateKeyPem), intervalMs: config.workerIntervalMs, log });
-  const server = createRouteServer(serviceHandlers({ db, github: createGithub(config.github), fleet, worker }), log);
+  const worker = createWorker({ db, fleet, signer: localSigner(config.signing.keyId, config.signing.privateKeyPem), intervalMs: config.workerIntervalMs, beta: config.beta, log });
+  const server = createRouteServer(serviceHandlers({ db, github: createGithub(config.github), fleet, worker, beta: config.beta }), log);
   await new Promise<void>((resolve) => server.listen(config.port, resolve));
   worker.start();
   // SAFETY: a server listening on a TCP port reports an AddressInfo.

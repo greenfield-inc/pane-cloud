@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import type { ActionLogEntry, FleetOperationName, Machine } from 'pane-cloud-contract';
 import { MACHINE_LIMITS } from 'pane-cloud-contract';
 import type { PoolClient } from 'pg';
+import { type BetaConfig, betaStatus, PUSH_WINDOW_MS } from './beta';
 
 type Queryable = Pick<PoolClient, 'query'>;
 
@@ -46,7 +47,7 @@ export interface ActionRow {
 /** States the service sets itself while a lifecycle step is queued; the fleet's state waits until it is done. */
 export const TRANSITIONAL_STATES: readonly Machine['state'][] = ['stopping', 'resuming', 'deleting'];
 
-export function machineView(row: MachineRow, usage: Machine['usage']): Machine {
+export function machineView(row: MachineRow, usage: Machine['usage'], pushWindowEndsAt: string | null): Machine {
   return {
     id: row.id,
     name: row.name,
@@ -64,6 +65,7 @@ export function machineView(row: MachineRow, usage: Machine['usage']): Machine {
     },
     usage,
     shared: row.shared_at !== null,
+    pushWindowEndsAt,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };
@@ -112,4 +114,19 @@ export async function logSteps(client: Queryable, machineId: string, steps: Step
     if (row) rows.push(row);
   }
   return rows;
+}
+
+/**
+ * When the machine's push window ends: in the beta's push-window phase, an hour after the latest
+ * start inside that phase, while the machine is running or resuming. Null otherwise.
+ */
+export async function pushWindowEndsAt(client: Queryable, row: MachineRow, beta: BetaConfig): Promise<string | null> {
+  const status = betaStatus(beta);
+  if (status.phase !== 'push_windows' || !status.pushWindowsFrom || (row.state !== 'running' && row.state !== 'resuming')) return null;
+  const { rows } = await client.query<{ at: Date | null }>(
+    "SELECT max(requested_at) AS at FROM action_log WHERE machine_id = $1 AND operation = 'start' AND requested_at >= $2",
+    [row.id, status.pushWindowsFrom],
+  );
+  const started = rows[0]?.at;
+  return started ? new Date(started.getTime() + PUSH_WINDOW_MS).toISOString() : null;
 }

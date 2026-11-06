@@ -20,7 +20,8 @@ import {
 import type { PoolClient } from 'pg';
 import { type Db, transaction } from './db';
 import type { Github } from './github';
-import { actionView, type ActionRow, logSteps, machineView, type MachineRow, newId, type Step } from './records';
+import { assertCanCreate, assertCanStart, type BetaConfig, betaStatus } from './beta';
+import { actionView, type ActionRow, logSteps, machineView, type MachineRow, newId, pushWindowEndsAt, type Step } from './records';
 import { bind, type BoundRoute } from './router';
 import type { Worker } from './worker';
 
@@ -54,6 +55,7 @@ export interface ServiceDeps {
   github: Github;
   fleet: FleetClient;
   worker: Pick<Worker, 'kick'>;
+  beta: BetaConfig;
 }
 
 const hashToken = (token: string) => createHash('sha256').update(token).digest();
@@ -73,7 +75,8 @@ const notOnTeam = () => new CloudApiError('not_team_member', 'This account is no
 const CALLER_SQL = `SELECT a.id, a.github_id, a.github_login, a.name, a.email, a.tailscale_login, s.team_id, s.role
   FROM accounts a LEFT JOIN seats s ON s.account_id = a.id`;
 
-export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): BoundRoute[] {
+export function serviceHandlers({ db, github, fleet, worker, beta }: ServiceDeps): BoundRoute[] {
+  const view = async (row: MachineRow, usage: Machine['usage']) => machineView(row, usage, await pushWindowEndsAt(db, row, beta));
   const caller = async (token: string | null): Promise<CallerRow> => {
     const { rows } = await db.query<CallerRow>(
       `${CALLER_SQL} JOIN sessions t ON t.account_id = a.id WHERE t.token_hash = $1 AND t.expires_at > now()`,
@@ -183,7 +186,7 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
         // The fleet is unreachable; the stored state is still the best answer.
       }
     }
-    return machineView(current, await usageFor(current));
+    return view(current, await usageFor(current));
   };
 
   /** Checks the machine's state and queues steps for it in one transaction, then wakes the worker. */
@@ -303,13 +306,14 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
         if (!existing) return null;
         const entry = await db.query<ActionRow>("SELECT * FROM action_log WHERE machine_id = $1 AND operation = 'create' ORDER BY id LIMIT 1", [existing.id]);
         const first = entry.rows[0];
-        return first ? { machine: machineView(existing, await usageFor(existing)), operation: actionView(first) } : null;
+        return first ? { machine: await view(existing, await usageFor(existing)), operation: actionView(first) } : null;
       };
       const earlier = await repeated();
       if (earlier) return earlier;
       if (!who.team_id) {
         throw new CloudApiError('not_invited', "You're on the list. Pane Cloud is invite-only for now.", 'Wait for your invite, or ask a team owner to invite your GitHub login.');
       }
+      assertCanCreate(beta);
       const release = await releaseFor();
       const seatTaken = () => new CloudApiError('seat_has_machine', 'Your seat already has a machine.', 'Open your existing machine, or delete it before creating another.');
       let created;
@@ -343,18 +347,21 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
         throw error;
       }
       void worker.kick();
-      return { machine: machineView(created.machine, null), operation: actionView(created.entry) };
+      return { machine: await view(created.machine, null), operation: actionView(created.entry) };
     }),
 
     bind(r.getMachine, async ({ token, params }) => ownerView(await machineRow(db, await caller(token), params.machineId ?? ''))),
 
     bind(r.startMachine, async ({ token, params }) => {
       const who = await caller(token);
+      assertCanStart(beta);
+      const pushWindow = betaStatus(beta).phase === 'push_windows';
       const { machine, entry } = await queue(who, params.machineId ?? '', (m) => {
         requireState(m, 'stopped', 'Start');
-        return { steps: [{ operation: 'start', fleetOperation: 'resume', parameters: {}, actor: userActor(who), reason: 'You started this machine.' }], state: 'resuming', userStep: 0 };
+        const reason = pushWindow ? 'You started this machine for a 60-minute push window before the beta ends.' : 'You started this machine.';
+        return { steps: [{ operation: 'start', fleetOperation: 'resume', parameters: {}, actor: userActor(who), reason }], state: 'resuming', userStep: 0 };
       });
-      return { machine: machineView(machine, null), operation: actionView(entry) };
+      return { machine: await view(machine, null), operation: actionView(entry) };
     }),
 
     bind(r.stopMachine, async ({ token, params }) => {
@@ -370,7 +377,7 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
           userStep: 1,
         };
       });
-      return { machine: machineView(machine, null), operation: actionView(entry) };
+      return { machine: await view(machine, null), operation: actionView(entry) };
     }),
 
     bind(r.deleteMachine, async ({ token, params }) => {
@@ -383,7 +390,7 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
         return { steps: [{ operation: 'delete', fleetOperation: 'delete', parameters: {}, actor: userActor(who), reason: 'You deleted this machine and its disk.' }], state: 'deleting', userStep: 0 };
       });
       await db.query('DELETE FROM connection_codes WHERE machine_id = $1', [machine.id]);
-      return { machine: machineView(machine, null), operation: actionView(entry) };
+      return { machine: await view(machine, null), operation: actionView(entry) };
     }),
 
     bind(r.requestOperation, async ({ token, params, body }) => {
@@ -460,6 +467,8 @@ export function serviceHandlers({ db, github, fleet, worker }: ServiceDeps): Bou
       }
       return { machineId: params.machineId ?? '', code: handoff.code, tailnetHostname: handoff.tailnet_hostname, expiresAt: handoff.expires_at.toISOString() };
     }),
+
+    bind(r.getBeta, async () => betaStatus(beta)),
 
     bind(r.getBilling, async ({ token }): Promise<BillingStatus> => {
       const who = await caller(token);

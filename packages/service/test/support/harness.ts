@@ -24,11 +24,13 @@ export interface Harness {
   cohort(login: string): Promise<void>;
   signIn(user: FakeGithubUser): Promise<string>;
   client(token?: string): ServiceClient;
+  /** Restarts the service on the same database with a new beta end date, as an operator would. */
+  restart(options: { betaEndsAt: string | null }): Promise<void>;
   close(): Promise<void>;
 }
 
 /** A running service on its own fresh database, with P0's fleet stub and a fake GitHub behind it. */
-export async function startHarness(options: { fleetUrl?: string } = {}): Promise<Harness> {
+export async function startHarness(options: { fleetUrl?: string; betaEndsAt?: string } = {}): Promise<Harness> {
   const admin = new Client({ connectionString: inject('adminDatabaseUrl') });
   await admin.connect();
   const name = `pane_cloud_test_${randomBytes(6).toString('hex')}`;
@@ -42,22 +44,30 @@ export async function startHarness(options: { fleetUrl?: string } = {}): Promise
     publishedReleases: RELEASES.map((r) => ({ version: r.version, arch: 'arm64' as const, debSha256: r.debSha256 })),
   });
   const github = await startFakeGithub({ releases: RELEASES });
-  const app = await startService(
-    {
-      databaseUrl,
-      port: 0,
-      github: { clientId: 'Iv1.test', webUrl: github.url, apiUrl: github.url, releasesRepo: 'greenfield-inc/Pane' },
-      fleet: { url: options.fleetUrl ?? fleet.url, token: 'fleet-test-token' },
-      signing: { keyId: 'service-test-key', privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString() },
-      workerIntervalMs: 50,
-    },
-    { log: () => undefined },
-  );
+  const signingKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const start = (betaEndsAt: string | null, port: number) =>
+    startService(
+      {
+        databaseUrl,
+        port,
+        github: { clientId: 'Iv1.test', webUrl: github.url, apiUrl: github.url, releasesRepo: 'greenfield-inc/Pane' },
+        fleet: { url: options.fleetUrl ?? fleet.url, token: 'fleet-test-token' },
+        signing: { keyId: 'service-test-key', privateKeyPem: signingKeyPem },
+        workerIntervalMs: 50,
+        beta: { endsAt: betaEndsAt, announcementUrl: null, ownAwsTemplateUrl: null },
+      },
+      { log: () => undefined },
+    );
+  let app = await start(options.betaEndsAt ?? null, 0);
   const db = createDb(databaseUrl);
   const client = (token?: string) => createServiceClient({ baseUrl: app.url, token });
   return {
-    app,
-    url: app.url,
+    get app() {
+      return app;
+    },
+    get url() {
+      return app.url;
+    },
     fleet,
     github,
     db,
@@ -74,6 +84,11 @@ export async function startHarness(options: { fleetUrl?: string } = {}): Promise
       return result.token;
     },
     client,
+    async restart({ betaEndsAt }) {
+      const port = Number(new URL(app.url).port);
+      await app.close();
+      app = await start(betaEndsAt, port);
+    },
     async close() {
       await app.close();
       await db.end();

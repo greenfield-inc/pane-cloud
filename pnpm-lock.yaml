@@ -169,8 +169,8 @@ importers:
   packages/service:
     dependencies:
       pane-cloud-contract:
-        specifier: github:greenfield-inc/Pane#5c3d3c6dea1cb49a772eab06f5929183ad3059b5&path:/packages/pane-cloud-contract
-        version: https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5#path:/packages/pane-cloud-contract
+        specifier: github:greenfield-inc/Pane#84e3698e7975ad4712b18bd6c7c644f17996573a&path:/packages/pane-cloud-contract
+        version: https://codeload.github.com/greenfield-inc/Pane/tar.gz/84e3698e7975ad4712b18bd6c7c644f17996573a#path:/packages/pane-cloud-contract
       pg:
         specifier: ^8.13.1
         version: 8.23.1
@@ -1102,8 +1102,8 @@ packages:
     resolution: {integrity: sha512-LaNjtRWUBY++zB5nE/NwcaoMylSPk+S+ZHNB1TzdbMJMny6dynpAGt7X/tl/QYq3TIeE6nxHppbo2LGymrG5Pw==}
     engines: {node: '>=10'}
 
-  pane-cloud-contract@https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5#path:/packages/pane-cloud-contract:
-    resolution: {gitHosted: true, integrity: sha512-TNMICZ+HB+kWKjg8yp4dFoA1wKMpZXa9z02lE+YIbAkzl22xXjLbEIUkcqhCwkQBi/+tjbKfw2j8MNBV68CPPg==, path: /packages/pane-cloud-contract, tarball: https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5}
+  pane-cloud-contract@https://codeload.github.com/greenfield-inc/Pane/tar.gz/84e3698e7975ad4712b18bd6c7c644f17996573a#path:/packages/pane-cloud-contract:
+    resolution: {gitHosted: true, integrity: sha512-lt4p1Cuy91209Q+iKDytu4DHEIgYqJOBKqso0vaAfQPmpNpAUEoIzpZB3SvRILMskDD90iqguVbQcATmUcInyQ==, path: /packages/pane-cloud-contract, tarball: https://codeload.github.com/greenfield-inc/Pane/tar.gz/84e3698e7975ad4712b18bd6c7c644f17996573a}
     version: 0.1.0
     engines: {node: ^22.23.4 || ^24.22.1 || ^26.12.1}
 
@@ -2147,7 +2147,7 @@ snapshots:
     dependencies:
       p-limit: 3.1.0
 
-  pane-cloud-contract@https://codeload.github.com/greenfield-inc/Pane/tar.gz/5c3d3c6dea1cb49a772eab06f5929183ad3059b5#path:/packages/pane-cloud-contract:
+  pane-cloud-contract@https://codeload.github.com/greenfield-inc/Pane/tar.gz/84e3698e7975ad4712b18bd6c7c644f17996573a#path:/packages/pane-cloud-contract:
     dependencies:
       zod: 4.6.7
 
