@@ -37,6 +37,11 @@ written. The headroom is a ceiling, not a reservation, so it costs memory only w
 The KVM test fills a guest until its own OOM killer fires, measures what the Firecracker process holds
 beyond guest RAM, and checks that this plus 64 MiB of page tables fits in 256 MiB.
 
+Measured in CI (run 42176951522, x86_64 nested KVM, 1 GiB guest filled to 1,007 MiB): 5.5 MiB
+beyond guest RAM, of which 2.0 MiB host page tables and 2.0 MiB stage-2 page tables. Page tables
+scale with guest memory, so a full 16 GiB guest needs about 64 MiB for them plus about 1.5 MiB for
+the rest: roughly 66 MiB, well inside 256 MiB.
+
 ## Daily CPU budget
 
 `createCpuBudget(store).check(machineId, cgroupPath)` reads `usage_usec` from the cgroup's
@@ -117,6 +122,6 @@ These wait for a real `r7g.metal` (D-21):
 - Full density: 109 machines a host, 11 of them bursting to 8 vCPU (journey 6), and the 2-hour load
   test.
 - The rules under real host memory pressure, with real 16 GiB guests and F5's guest image.
-- The 256 MiB headroom measured on arm64 with a full 16 GiB guest; CI measures a 1 GiB guest on x86_64.
+- The headroom on arm64 with a full 16 GiB guest; CI measures a 1 GiB guest on x86_64 and scales it.
 - Budget totals for a machine that resumes on another host the same day: each host keeps its own
   store, so the day's count starts again there.
