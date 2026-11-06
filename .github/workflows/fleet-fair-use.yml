@@ -73,6 +73,7 @@ jobs:
           # Holds pane.hog_mib MiB in one process (tail buffers a line with no end), then lets it go.
           mib="$(sed -n 's/.*pane\.hog_mib=\([0-9]*\).*/\1/p' /proc/cmdline)"
           [ -n "$mib" ] || exit 0
+          echo "PANE_HOG_START ${mib}" > /dev/ttyS0
           head -c "${mib}M" /dev/zero | tail > /dev/null
           echo "PANE_HOG_DONE $?" > /dev/ttyS0
           SCRIPT
@@ -83,6 +84,8 @@ jobs:
           After=multi-user.target
           [Service]
           Type=oneshot
+          # systemd's default OOMPolicy=stop ends the whole unit when the guest kernel kills tail, before the echo.
+          OOMPolicy=continue
           ExecStart=/usr/local/bin/pane-hog
           [Install]
           WantedBy=multi-user.target

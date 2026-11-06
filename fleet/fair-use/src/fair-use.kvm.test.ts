@@ -22,7 +22,7 @@ async function waitForConsole(path: string, pattern: RegExp, timeoutMs: number):
     if (match) return match;
     await new Promise((r) => setTimeout(r, 100));
   }
-  throw new Error(`Console never matched ${pattern} within ${timeoutMs} ms. Tail:\n${(await readFile(path, 'utf8').catch(() => '')).slice(-3000)}`);
+  throw new Error(`Console never matched ${pattern} within ${timeoutMs} ms. Console without ticks:\n${(await readFile(path, 'utf8').catch(() => '')).replace(/^PANE_TICK \d+\r?\n/gm, '').slice(-3000)}`);
 }
 
 const statOf = async (cgroup: string, file: string) =>
@@ -113,6 +113,8 @@ describe.skipIf(!canRun)('fair use on KVM', () => {
     const { vm, spec } = await start('reclaim', guestMiB, 3000, { ...MACHINE_CGROUP });
     expect((await waitForConsole(spec.consoleLogPath, /PANE_HOG_DONE (\d+)/, 120_000))[1]).toBe('0');
 
+    // The guest reports its counters once per polling interval; wait past two so they show the freed memory.
+    await new Promise((r) => setTimeout(r, 3_000));
     let stats = await vm.balloonStats();
     for (let i = 0; i < 30 && stats.availableMemory === undefined; i++) {
       await new Promise((r) => setTimeout(r, 1_000));
@@ -123,6 +125,7 @@ describe.skipIf(!canRun)('fair use on KVM', () => {
 
     const actions = decideReclaim({ totalMiB: 512 * 1024, usedMiB: 64 * 1024 }, [{ machineId: spec.machineId, residentMiB: before, idle: true, balloon: stats, residentAboveLimitForMs: 0 }]);
     const inflate = actions.find((a) => a.kind === 'inflate');
+    console.log(`balloon stats after the hog: ${JSON.stringify(stats)}; resident ${before.toFixed(0)} MiB; actions ${JSON.stringify(actions)}`);
     expect(inflate?.targetMiB).toBeGreaterThan(0);
     const target = inflate?.targetMiB ?? 0;
     await vm.setBalloon(target);
