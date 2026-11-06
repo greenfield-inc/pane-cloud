@@ -1,0 +1,57 @@
+name: fleet-network
+
+# typecheck, lint and the pure tests of fleet/network run in fleet.yml with the rest of the workspace.
+on:
+  pull_request:
+    paths: ['fleet/network/**', 'fleet/host/files/dns/**', 'fleet/runtime/**', '.github/workflows/fleet-network.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fleet
+
+jobs:
+  # The ruleset, resolver, metering and flow logs, with network namespaces standing in for guests.
+  netns:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash network/scripts/test-in-docker.sh
+
+  # Journey 7 from real Firecracker guests.
+  kvm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fleet/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: fleet/pnpm-lock.yaml
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - run: sudo apt-get update -q && sudo apt-get install -y -q squashfs-tools dnsmasq-base nftables
+      - name: Let forwarded packets through Docker's iptables policy
+        run: |
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo iptables -P FORWARD ACCEPT
+      - run: pnpm install --frozen-lockfile
+      - name: Fetch Firecracker and test images
+        run: sudo bash host/fetch-test-artifacts.sh /srv/fleet-artifacts
+      - name: cgroup v2 subtree for test machines
+        run: |
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p /sys/fs/cgroup/fleet-test
+          echo '+cpu +memory +pids' | sudo tee /sys/fs/cgroup/fleet-test/cgroup.subtree_control
+      - name: Isolation tests on KVM
+        env:
+          FLEET_TEST_ARTIFACTS: /srv/fleet-artifacts
+        run: sudo --preserve-env=FLEET_TEST_ARTIFACTS env "PATH=$PATH" pnpm --filter @pane-cloud/fleet-network exec vitest run src/network.kvm.test.ts --reporter=verbose

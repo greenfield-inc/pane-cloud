@@ -70,14 +70,17 @@ vm.vsockPath;                                   // host side of the guest agent'
 ### F3 network (`@pane-cloud/fleet-network`)
 
 ```ts
-const net = createHostNetwork({ uplink: 'ens5', subnet: '10.200.0.0/16', resolverIp });
+const net = createHostNetwork();                // uplink defaults to the default route's interface, subnet to 10.200.0.0/16
 await net.installHostRules();                   // once per host boot
-const m = await net.attach(machineId, slot);    // { tapName, guestMac, guestIp, gatewayIp, kernelIpArg }
-await net.egressBytes(machineId);               // bytes out since the counter was created
+const m = await net.attach(machineId, slot, { uid });  // { tapName, guestMac, guestIp, gatewayIp, kernelIpArg }; the tap is owned by the machine's uid
+await net.egressBytes(machineId);               // bytes out since attach
 await net.detach(machineId);
+checkEgressAbuse(samples, policy);              // pure: { stop: true, reason: 'abuse' } at 10 GB out in an hour
+checkMonthlyEgress(bytesThisMonth, policy);     // pure: { alert, capped } at 30 GB and 100 GiB
 ```
 
-Each machine gets its own `/30` from the slot number. The host forwards nothing between taps.
+Each machine gets its own `/30` from the slot number. The host forwards nothing between taps. The
+guest's DNS resolver is its gateway address. See [`network/`](network).
 
 ### F4 fair use (`@pane-cloud/fleet-fair-use`)
 
