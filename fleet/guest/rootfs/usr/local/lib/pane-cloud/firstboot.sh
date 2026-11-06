@@ -10,8 +10,11 @@ set -uo pipefail
 
 STATE=/var/lib/pane-cloud
 LOG_DIR=/var/log/pane-cloud
-mkdir -p "$STATE" "$LOG_DIR"
+umask 077
+mkdir -p "$STATE"
+install -d -m 700 "$LOG_DIR"
 exec >>"$LOG_DIR/bootstrap.log" 2>&1
+chmod 600 "$LOG_DIR/bootstrap.log"
 
 say() { echo "$(date -u +%FT%TZ) firstboot: $*"; }
 rm -f "$STATE/firstboot.done" "$STATE/firstboot.failed"

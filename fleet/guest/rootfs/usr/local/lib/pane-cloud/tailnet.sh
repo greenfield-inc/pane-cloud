@@ -4,14 +4,18 @@
 #     the login link, which the guest agent's status reports from `tailscale status --json` (AuthURL).
 #   - Joined, daemon not set up: Pane's own remote setup (#909's install-pane step), with
 #     workspaces.enabled so `runpane workspace` and `runpane handoff` reach this machine.
-# Logs to /var/log/pane-cloud/bootstrap.log. The setup output carries a pane-remote:// pairing code,
-# so it goes to a 0600 file and is redacted there.
+# Logs to /var/log/pane-cloud/bootstrap.log (root only). The setup output carries a pane-remote://
+# connection code and may carry tunnel commands with secrets, so only its known status lines reach
+# the log and every other line is replaced before it is written anywhere.
 set -euo pipefail
 
 PANE_UID=1000
 PANE_DIR=/home/pane/.pane
 UNIT=/home/pane/.config/systemd/user/pane-remote-daemon.service
+umask 077
+install -d -m 700 /var/log/pane-cloud
 exec >>/var/log/pane-cloud/bootstrap.log 2>&1
+chmod 600 /var/log/pane-cloud/bootstrap.log
 say() { echo "$(date -u +%FT%TZ) tailnet: $*"; }
 
 backend_state() {
@@ -32,14 +36,13 @@ as_pane() {
 
 if [ ! -f "$UNIT" ]; then
   say "setting up the Pane daemon"
-  setup_log=/home/pane/.pane-cloud-setup.log
-  install -o pane -g pane -m 600 /dev/null "$setup_log"
+  # Keeps the status lines formatSetupRemoteHostResult prints (Pane main/src/daemon/setupRemoteHost.ts)
+  # and blanks the rest: the connection code, tunnel commands and anything Pane adds later.
+  keep='^(Pane remote (setup:|daemon setup)|Data directory:|Config:|Channel:|Service:|Config written:|Connection note:)'
   rc=0
   as_pane env ELECTRON_OZONE_PLATFORM_HINT=headless /opt/Pane/pane --ozone-platform=headless --disable-gpu \
-    --remote-setup --pane-dir "$PANE_DIR" --prefer-tunnel tailscale --auto-listen-port --label "$(hostname)" \
-    >"$setup_log" 2>&1 || rc=$?
-  sed -i -E 's#pane-remote://[^[:space:]]*#<pairing-redacted>#g' "$setup_log"
-  tail -20 "$setup_log"
+    --remote-setup --pane-dir "$PANE_DIR" --prefer-tunnel tailscale --auto-listen-port --label "$(hostname)" 2>&1 \
+    | sed -E "/$keep/!{/^$/!s/.*/  [setup output line withheld]/;}" || rc=$?
   [ "$rc" -eq 0 ] || { say "Pane remote setup exited $rc"; exit 1; }
 fi
 
