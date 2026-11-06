@@ -1,0 +1,15 @@
+[Unit]
+Description=Pane Cloud: join the user's tailnet, then run the Pane daemon with workspaces enabled
+Wants=network-online.target tailscaled.service user@1000.service
+After=network-online.target tailscaled.service user@1000.service pane-cloud-firstboot.service
+
+[Service]
+Type=oneshot
+# Waits for the user to open the Tailscale login link, however long that takes.
+TimeoutStartSec=infinity
+ExecStart=/usr/local/lib/pane-cloud/tailnet.sh
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target

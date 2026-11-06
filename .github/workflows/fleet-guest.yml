@@ -1,0 +1,75 @@
+name: fleet-guest
+
+on:
+  pull_request:
+    paths: ['fleet/guest/**', '.github/workflows/fleet-guest.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fleet/guest
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu 24.04's own Python 3.12, the one the guest image runs.
+      - name: guest agent tests
+        working-directory: fleet/guest/agent
+        run: /usr/bin/python3 -m unittest -v
+      - name: shellcheck
+        run: find . -name '*.sh' -print0 | xargs -0 shellcheck -x
+
+  # Builds the real image on a native arm64 runner and checks it. Nothing is published: only the
+  # kernel and its config go up, as a short-lived workflow artifact.
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the kernel and the root filesystem
+        run: sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh all "$RUNNER_TEMP/out"
+      - name: check the image and probe the Pane daemon inside it
+        run: |
+          # Ubuntu 24.04 runners refuse unprivileged user namespaces, which Electron's sandbox needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo bash build/check-image.sh "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-kernel
+          path: |
+            ${{ runner.temp }}/out/vmlinux-*
+            ${{ runner.temp }}/out/config-*
+          retention-days: 3
+
+  # CI only: builds the amd64 variant of the same image and boots it under Firecracker's jailer on
+  # GitHub's x86_64 runner, which has /dev/kvm. The fleet runs the arm64 image. Nothing is uploaded.
+  boot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # F1's pinned Firecracker installer, until F1 merges into main.
+      - uses: actions/checkout@v4
+        with:
+          ref: cbefe7f8c2ae1e2464e331a965c94947e2594b70
+          path: f1
+          sparse-checkout: fleet/host
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: install Firecracker and the jailer
+        run: sudo bash "$GITHUB_WORKSPACE/f1/fleet/host/install-firecracker.sh" "$RUNNER_TEMP/fc"
+      - name: build the kernel and the root filesystem
+        run: sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh all "$RUNNER_TEMP/out"
+      - name: check the image and probe the Pane daemon inside it
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo bash build/check-image.sh "$RUNNER_TEMP/out"
+      - name: boot under Firecracker and check first boot over vsock
+        run: sudo bash build/boot-check.sh "$RUNNER_TEMP/out" "$RUNNER_TEMP/fc"
