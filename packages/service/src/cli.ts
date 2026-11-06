@@ -4,10 +4,19 @@
  *   pane-cloud-service cohort add <github-login> [note]
  *   pane-cloud-service cohort remove <github-login>
  *   pane-cloud-service cohort list
+ *   pane-cloud-service billing announce <start-date-iso>   (needs STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET)
  */
+import type { StripeGateway } from '@pane-cloud/billing';
+import { createServiceBilling } from './billing';
+import { billingFromEnv } from './config';
 import { createDb, type Db, migrate } from './db';
 
-export async function runCommand(db: Db, args: string[]): Promise<string> {
+export async function runCommand(
+  db: Db,
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  overrides: { stripe?: StripeGateway; now?: () => Date } = {},
+): Promise<string> {
   const [command, action, login, ...rest] = args;
   if (command === 'migrate') {
     const ran = await migrate(db);
@@ -28,7 +37,17 @@ export async function runCommand(db: Db, args: string[]): Promise<string> {
     const { rows } = await db.query<{ github_login_lower: string; added_at: Date; note: string | null }>('SELECT * FROM cohort ORDER BY added_at');
     return rows.map((r) => `${r.github_login_lower}\t${r.added_at.toISOString()}\t${r.note ?? ''}`).join('\n') || 'The cohort is empty.';
   }
-  throw new Error('Usage: migrate | cohort add <github-login> [note] | cohort remove <github-login> | cohort list');
+  if (command === 'billing' && action === 'announce' && login) {
+    const startAt = new Date(login);
+    if (Number.isNaN(startAt.getTime())) throw new Error(`"${login}" is not a date. Use an ISO date such as 2026-11-26T17:00:00Z.`);
+    const billing = billingFromEnv(env);
+    if (!billing) throw new Error('Billing is off: set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET.');
+    const { emailed, noEmail } = await createServiceBilling(db, billing, overrides).announceCharges(startAt);
+    const lines = [`Charges start ${startAt.toISOString()}. Emailed ${emailed} team owner(s).`];
+    if (noEmail.length) lines.push(`No email on file for the owners of ${noEmail.join(', ')}: reach them another way, then run this again once they have one.`);
+    return lines.join('\n');
+  }
+  throw new Error('Usage: migrate | cohort add <github-login> [note] | cohort remove <github-login> | cohort list | billing announce <start-date-iso>');
 }
 
 if (require.main === module) {

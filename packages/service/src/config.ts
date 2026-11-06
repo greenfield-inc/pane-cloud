@@ -1,5 +1,17 @@
 import { readFileSync } from 'node:fs';
+import { assertTestModeKey } from '@pane-cloud/billing';
 import type { BetaConfig } from './beta';
+
+/** B1 billing, on when STRIPE_SECRET_KEY is set. Test mode only: live keys are refused. */
+export interface BillingConfig {
+  stripeSecretKey: string;
+  webhookSecret: string;
+  /** Where Stripe Checkout and the customer portal send the owner back to. */
+  returnUrl: string;
+  /** Billing email is written here as files until SES is set up; with neither, the notice refuses to send. */
+  outboxDir: string | null;
+  enforceIntervalMs: number;
+}
 
 export interface ServiceConfig {
   databaseUrl: string;
@@ -18,6 +30,27 @@ export interface ServiceConfig {
   /** How often the worker polls the fleet for operation status and events. */
   workerIntervalMs: number;
   beta: BetaConfig;
+  /** Null while billing is off: everyone stays on the free cohort. */
+  billing: BillingConfig | null;
+}
+
+function positiveMs(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const value = Number(env[name] ?? fallback);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`Set ${name} to a positive number of milliseconds, or leave it unset.`);
+  return value;
+}
+
+export function billingFromEnv(env: NodeJS.ProcessEnv): BillingConfig | null {
+  const stripeSecretKey = env.STRIPE_SECRET_KEY;
+  if (!stripeSecretKey) return null;
+  assertTestModeKey(stripeSecretKey);
+  return {
+    stripeSecretKey,
+    webhookSecret: required(env, 'STRIPE_WEBHOOK_SECRET'),
+    returnUrl: env.BILLING_RETURN_URL ?? 'https://runpane.com/cloud',
+    outboxDir: env.BILLING_OUTBOX_DIR ?? null,
+    enforceIntervalMs: positiveMs(env, 'BILLING_ENFORCE_INTERVAL_MS', 300_000),
+  };
 }
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -47,5 +80,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServiceConf
       announcementUrl: env.BETA_ANNOUNCEMENT_URL ?? null,
       ownAwsTemplateUrl: env.OWN_AWS_TEMPLATE_URL ?? null,
     },
+    billing: billingFromEnv(env),
   };
 }
