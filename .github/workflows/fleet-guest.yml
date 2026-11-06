@@ -1,0 +1,46 @@
+name: fleet-guest
+
+on:
+  pull_request:
+    paths: ['fleet/guest/**', '.github/workflows/fleet-guest.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fleet/guest
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu 24.04's own Python 3.12, the one the guest image runs.
+      - name: guest agent tests
+        working-directory: fleet/guest/agent
+        run: /usr/bin/python3 -m unittest -v
+      - name: shellcheck
+        run: find . -name '*.sh' -print0 | xargs -0 shellcheck -x
+
+  # Builds the real image on a native arm64 runner and checks it. Nothing is published: only the
+  # kernel and its config go up, as a short-lived workflow artifact.
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the kernel and the root filesystem
+        run: sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh all "$RUNNER_TEMP/out"
+      - name: check the image and probe the Pane daemon inside it
+        run: |
+          # Ubuntu 24.04 runners refuse unprivileged user namespaces, which Electron's sandbox needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo bash build/check-image.sh "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-kernel
+          path: |
+            ${{ runner.temp }}/out/vmlinux-*
+            ${{ runner.temp }}/out/config-*
+          retention-days: 3

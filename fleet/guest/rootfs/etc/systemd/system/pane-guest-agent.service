@@ -1,0 +1,11 @@
+[Unit]
+Description=Pane Cloud guest agent (vsock port 1024)
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/pane_guest_agent.py
+Restart=always
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target
