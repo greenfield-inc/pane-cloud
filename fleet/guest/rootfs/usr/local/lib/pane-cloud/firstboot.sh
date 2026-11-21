@@ -1,7 +1,7 @@
 #!/bin/bash
 # First boot of a Pane Cloud machine. Runs on every boot and each step is idempotent, so a boot that
 # failed half way (no network for an installer, say) finishes on the next one.
-#   1. grow the root filesystem to the disk the host gave the machine
+#   1. grow the root filesystem to the disk the host gave the machine (online, with ext4's resize ioctl)
 #   2. set the hostname from the machine id, and log the kernel's lockdown mode and entropy devices
 #   3. install the five agent CLIs with their vendors' installers, as the pane user
 # Logs to /var/log/pane-cloud/bootstrap.log. Leaves /var/lib/pane-cloud/firstboot.done or
@@ -20,8 +20,21 @@ say() { echo "$(date -u +%FT%TZ) firstboot: $*"; }
 rm -f "$STATE/firstboot.done" "$STATE/firstboot.failed"
 say "start (boot $(cut -c1-8 /proc/sys/kernel/random/boot_id))"
 
-root_dev="$(findmnt -no SOURCE /)"
-if resize2fs "$root_dev"; then say "root filesystem on $root_dev uses the whole disk"; else say "resize2fs $root_dev failed"; fi
+# Online resize through ext4's own ioctl on /: the guest kernel refuses writes to a mounted block
+# device (CONFIG_BLK_DEV_WRITE_MOUNTED is off), which resize2fs needs.
+if python3 -I - <<'PY'
+import fcntl, os, struct
+EXT4_IOC_RESIZE_FS = 0x40086610  # _IOW('f', 16, __u64)
+dev = os.stat('/').st_dev
+with open(f'/sys/dev/block/{os.major(dev)}:{os.minor(dev)}/size') as sectors:
+    disk_bytes = int(sectors.read()) * 512
+fd = os.open('/', os.O_RDONLY)
+try:
+    fcntl.ioctl(fd, EXT4_IOC_RESIZE_FS, struct.pack('Q', disk_bytes // os.statvfs('/').f_frsize))
+finally:
+    os.close(fd)
+PY
+then say "root filesystem uses the whole disk ($(df -h --output=size / | tail -1 | tr -d ' '))"; else say "growing the root filesystem failed"; fi
 
 machine_id="$(cat /etc/machine-id)"
 name="pane-${machine_id:0:8}"

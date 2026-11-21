@@ -251,6 +251,7 @@ PY
 then echo "all boot checks passed"
 else
   echo "== serial console (last 60 lines)"; tail -60 "$console"
-  [ -f "$out/bootstrap.log" ] && { echo "== bootstrap.log"; tail -80 "$out/bootstrap.log"; }
+  [ -f "$out/bootstrap.log" ] && { echo "== bootstrap.log, Pane Cloud lines"; grep -E ' (firstboot|secrets|daemon|ci): ' "$out/bootstrap.log"
+                                   echo "== bootstrap.log, last 80 lines"; tail -80 "$out/bootstrap.log"; }
   exit 1
 fi
