@@ -1,20 +1,23 @@
-# Guest image (F5)
+# Guest image (N5)
 
-The machine every Pane Cloud seat gets: Ubuntu 24.04 arm64 with git, Node, Tailscale and the stock
-Pane `.deb`, booted by Firecracker with its own guest kernel. A guest agent on vsock port 1024 runs
-the five allow-listed guest operations the host agent sends, and nothing else.
+The machine every Pane Cloud Session runs in: Ubuntu 24.04 arm64 with git, Node and the stock Pane
+`.deb`, booted by Firecracker in a Nitro Sandbox in direct mode (D-55) with its own guest kernel. The
+Pane daemon runs with relay pairing on, so clients reach it through Pane's relay with no Tailscale. A
+guest agent on vsock port 1024 runs the five allow-listed guest operations the host agent sends and
+nothing else, and reports the machine's processes and memory pressure to the host on port 1025.
 
 ## What is in it
 
 | Path | What it does |
 | --- | --- |
 | [`build/versions.env`](build/versions.env) | Every pinned input with its SHA-256 |
+| [`build/kernel-hardening.config`](build/kernel-hardening.config) | Lockdown, forced module signing, no virtio-rng: appended to Firecracker's guest config |
 | [`build/build-image.sh`](build/build-image.sh) | Builds the ext4 root filesystem and the kernel on an arm64 (or, for CI, amd64) Ubuntu builder |
 | [`build/build-in-docker.sh`](build/build-in-docker.sh) | Runs the build in `docker run --privileged --platform linux/arm64` |
 | [`build/check-image.sh`](build/check-image.sh) | Checks a built image and probes the Pane daemon inside it |
-| [`build/boot-check.sh`](build/boot-check.sh) | CI only: boots the amd64 image under Firecracker and checks first boot over vsock |
+| [`build/boot-check.sh`](build/boot-check.sh) | CI only: boots the amd64 image under Firecracker and checks it over vsock |
 | [`build/check-cli-installers.sh`](build/check-cli-installers.sh) | Runs the first-boot CLI installer in a fresh arm64 Ubuntu container |
-| [`rootfs/`](rootfs) | Files copied into the image: systemd units, first-boot scripts, user environment |
+| [`rootfs/`](rootfs) | Files copied into the image: systemd units, boot scripts, user environment |
 | [`agent/pane_guest_agent.py`](agent/pane_guest_agent.py) | The guest agent, Python 3 standard library only |
 
 ## Build
@@ -33,48 +36,67 @@ agent's `update_pane` still fetches the arm64 `.deb`, so an amd64 machine cannot
 
 - **Root filesystem.** Canonical's Ubuntu 24.04 minimal cloud image root tarball for arm64, pinned by
   release date and SHA-256. The build removes cloud-init, installs git, Python 3, Node (official
-  tarball, SHA-256 checked), Tailscale (pinned version from `pkgs.tailscale.com`, keyring SHA-256
-  checked) and Pane (the release `.deb`, SHA-256 checked). It adds the `pane` user (uid 1000), who
-  owns `/home/pane`, and enables the units below. The template is a small ext4 file; the host gives
-  each machine a 50 GiB disk and first boot grows the filesystem to fill it.
-- **Kernel.** Linux 6.1 LTS from kernel.org, built with Firecracker's own
-  `microvm-kernel-ci-aarch64-6.1.config` at the Firecracker v1.17.0 commit (the version F1 pins).
-  The build fails if `olddefconfig` drops any of virtio-vsock, virtio-balloon, virtio-rng, ext4,
-  virtio-blk, virtio-net, kernel IP autoconfig, tun or nftables. We build it rather than reuse
-  Firecracker CI's prebuilt `vmlinux-6.1`, because that file lives in Firecracker's test-artifact
-  bucket, is meant for their CI, and can't be traced to a source tree. Building from pinned sources
-  keeps the kernel reproducible and reviewable in the two-person image pipeline.
-- **Networking.** The host configures `eth0` with the kernel's `ip=` argument (F3's `kernelIpArg`),
-  so systemd-networkd and resolved are masked, and `/etc/resolv.conf` points at `/proc/net/pnp`,
-  where the kernel lists the `ip=` argument's DNS server.
+  tarball, SHA-256 checked) and Pane (the release `.deb`, SHA-256 checked). It adds the `pane` user
+  (uid 1000), who owns `/home/pane`, and enables the units below. The template is a small ext4 file;
+  the host gives each machine its Session disk and first boot grows the filesystem to fill it.
+- **Kernel.** The kernel probe P1 booted in Nitro Sandboxes: Linux 6.18.62 with Firecracker's own
+  `microvm-kernel-ci-aarch64-6.18.config` and `ci.config` at commit `6d7cfa9c6b53`, the commit that
+  built P1's `vmlinux-6.18.62`. The build compiles it from kernel.org's tarball rather than reusing
+  Firecracker CI's prebuilt file, so the kernel traces to a pinned source tree and carries
+  `kernel-hardening.config`:
+  - lockdown in integrity mode from early boot (`/sys/kernel/security/lockdown` reads `[integrity]`):
+    no unsigned code into the kernel, no `/dev/mem` writes, no kexec;
+  - forced module signing with a key made for the build and deleted after it, so no module can load;
+  - no virtio-rng: the guest takes no entropy device from the host.
+
+  The build fails if `olddefconfig` drops anything in `REQUIRED_KERNEL_CONFIG` (vsock, balloon,
+  ext4, virtio-blk, virtio-net, kernel `ip=`, tun, nftables, pressure stall information, lockdown,
+  module signing) or keeps `HW_RANDOM_VIRTIO`.
+- **Networking.** The host configures `eth0` with the kernel's `ip=` argument, so systemd-networkd
+  and resolved are masked, and `/etc/resolv.conf` points at `/proc/net/pnp`, where the kernel lists
+  the `ip=` argument's DNS server.
+
+## Drives
+
+| Drive | In the guest | What it is |
+| --- | --- | --- |
+| First (root) | `/dev/vda` at `/` | The Session disk: the image, grown to the disk's size at first boot |
+| Second | `/dev/vdb` at `/home/pane/.pane-secrets` | The secrets volume (64 MiB, D-58): Pane secrets and agent sign-ins |
+
+The secrets volume is mounted `nodev,nosuid,noexec`, owned by `pane`, mode 0700. A blank volume is
+formatted ext4 with the label `pane-secrets` on its first boot. A second drive larger than 1 GiB, or
+holding anything but that filesystem, is refused and left alone. While nothing is mounted there, the
+empty mount point is root's and immutable, so nothing meant for the secrets volume can land on the
+Session disk. The Pane daemon gets the path as `PANE_SECRETS_DIR` (K1 stores Pane's secrets there).
+Nothing in this image lists or reads the volume's files, and the process report never opens it.
 
 ## Boot
 
-Three system units, all enabled in the image:
+Four system units, all enabled in the image:
 
-1. **`pane-cloud-firstboot.service`** (`firstboot.sh`, oneshot). Grows the root filesystem, sets
-   the hostname to `pane-<first 8 of the machine id>`, and installs the agent CLIs as `pane`
-   (`install-agent-clis.sh`). It runs on every boot and every step is idempotent, so a CLI that
-   failed to install is retried on the next boot. It leaves `firstboot.done` or `firstboot.failed`
-   in `/var/lib/pane-cloud`.
-2. **`pane-cloud-tailnet.service`** (`tailnet.sh`). If the machine has not joined a tailnet, it runs
-   `tailscale up` with no auth key, as an untagged node. That waits until the user opens the login
-   link, which the guest agent's `status` reports. Once joined, it runs Pane's own remote setup
-   (`pane --remote-setup --prefer-tunnel tailscale`, as #909's `install-pane` step does) with
-   `--pane-dir /home/pane/.pane`, so Pane's logs land where the contract's `DIAGNOSTIC_FILES`
-   expects them. Then it sets `workspaces.enabled: true` in that directory's `config.json`, which a
-   daemon outside `~/.pane` otherwise leaves off, and restarts the daemon. The setup prints a
-   `pane-remote://` connection code. Only its status lines (data directory, config, channel, service)
-   reach the log; every other line is replaced before it is written, so the code and any tunnel
-   command never touch disk.
-3. **`pane-guest-agent.service`**, the guest agent.
+1. **`pane-cloud-secrets.service`** (`secrets-volume.sh`, oneshot). Mounts the secrets volume, before
+   `pane`'s user manager starts.
+2. **`pane-cloud-firstboot.service`** (`firstboot.sh`, oneshot). Grows the root filesystem, sets the
+   hostname to `pane-<first 8 of the machine id>`, logs the kernel's lockdown mode and entropy
+   devices, and installs the agent CLIs as `pane` (`install-agent-clis.sh`). It runs on every boot
+   and every step is idempotent, so a CLI that failed to install is retried on the next boot. It
+   leaves `firstboot.done` or `firstboot.failed` in `/var/lib/pane-cloud`.
+3. **`pane-cloud-daemon.service`** (`pane-daemon.sh`, oneshot). The first time, it runs Pane's own
+   remote setup (`pane --remote-setup --prefer-tunnel ssh`, which installs and starts the daemon as
+   `pane`'s user service and needs no tunnel) with `--pane-dir /home/pane/.pane`, so Pane's logs land
+   where the contract's `DIAGNOSTIC_FILES` expects them. On every boot it makes sure that
+   directory's `config.json` has `workspaces.enabled` (so `runpane workspace` and `runpane handoff`
+   reach the machine) and `remoteDaemon.relay.enabled` (relay pairing), and restarts the daemon if
+   either changed. The setup prints a `pane-remote://` connection code. Only its status lines reach
+   the log; every other line is replaced before it is written, so the code never touches disk.
+4. **`pane-guest-agent.service`**, the guest agent.
 
-The order follows #909's bootstrap (identity, hostname, Tailscale, join, Pane install, setup),
-without its upload of a Tailscale key and agent tokens: the user logs in to Tailscale, GitHub and
-each agent themselves.
+The relay key is made the first time the relay starts and kept in `~/.pane` on the Session disk, so
+the machine keeps its relay id across stops and starts. Clients pair with the id and key
+fingerprint the service vouches for (A6), which the host reads from `status`.
 
-Both scripts log to `/var/log/pane-cloud/bootstrap.log`, mode 0600 in a 0700 directory that only
-root reads.
+The scripts log to `/var/log/pane-cloud/bootstrap.log`, mode 0600 in a 0700 directory that only root
+reads.
 
 ### Update on boot
 
@@ -104,20 +126,30 @@ parity grid name `gemini --yolo`.
 
 ## Guest agent
 
-`pane_guest_agent.py` listens on `AF_VSOCK` port 1024 and speaks the protocol in
-[`../README.md`](../README.md#f5-guest-agent-protocol): one JSON object per line each way. It
-accepts only `bootstrap`, `update_pane`, `prepare_to_stop`, `collect_diagnostics` and `status`,
-each with exactly the contract's parameters. Anything else gets
-`{ok: false, error: {code, message, next}}` with `operation_not_allowed` or `invalid_request`.
-Every request is logged to `/var/log/pane-cloud/guest-agent.log`.
+`pane_guest_agent.py` runs as root. It listens on `AF_VSOCK` port 1024 for the host agent's
+operations, and connects to the host (CID 2) on port 1025 to send its reports.
+
+### Operations (port 1024)
+
+One JSON object per line each way:
+
+```json
+{"id": "op-1", "operation": "status", "parameters": {}}
+{"id": "op-1", "ok": true, "result": {}}
+{"id": "op-1", "ok": false, "error": {"code": "operation_not_allowed", "message": "…", "next": "…"}}
+```
+
+It accepts only `bootstrap`, `update_pane`, `prepare_to_stop`, `collect_diagnostics` and `status`,
+each with exactly the contract's parameters. Anything else gets `operation_not_allowed` or
+`invalid_request`. Every request is logged to `/var/log/pane-cloud/guest-agent.log`.
 
 | Operation | What it does |
 | --- | --- |
 | `bootstrap` | Installs the named release if it is not the installed one, and reports `firstBoot` (`running`, `done`, `failed`) |
 | `update_pane` | Downloads `https://github.com/greenfield-inc/Pane/releases/download/v<version>/Pane-<version>-linux-arm64.deb`, refuses it unless its SHA-256 is `debSha256` (`release_not_published`), runs `apt-get install` on it, restarts the daemon |
-| `prepare_to_stop` | `sync`. Pane keeps its state in SQLite in WAL mode, which is consistent on disk once synced, and the memory snapshot keeps the daemon running as it is |
+| `prepare_to_stop` | `sync`. Pane keeps its state in SQLite in WAL mode, which is consistent on disk once synced. A4 adds Pane's pause path |
 | `collect_diagnostics` | Reads only the contract's `DIAGNOSTIC_FILES` and returns them in the response (below) |
-| `status` | `paneVersion`, `tailnet` and `activity` (below) |
+| `status` | `paneVersion`, `relay`, `secretsVolume` and `activity` (below) |
 
 ### Diagnostics
 
@@ -139,22 +171,70 @@ one link, so the `pane` user cannot point the root-run agent at another file.
 
 ### Status
 
+```json
+{ "paneVersion": "2.4.248",
+  "relay": { "status": "ready", "id": "k7d2m4q9x3abcd5e", "address": "https://k7d2m4q9x3abcd5e.runpane.net",
+             "fingerprint": "<SHA-256 of the computer's public key, base64url>" },
+  "secretsVolume": "mounted",
+  "activity": { "agentsRunning": 0, "clientsConnected": 0, "lastActivityAt": null } }
+```
+
 - `paneVersion`: the installed `pane` package version (`dpkg-query`).
-- `tailnet`: from `tailscale status --json`. `BackendState: Running` is `joined` with
-  `Self.DNSName` as `hostname`; anything else is `awaiting_login` with `AuthURL` as `loginUrl`.
+- `relay`: from the daemon's `relay:status` and `relay:client:computer` over its control socket.
+  `status` is Pane's relay phase (`off`, `connecting`, `certificate`, `ready`, `error`), or
+  `unreachable` while the daemon does not answer. `fingerprint` is set once the relay is connected.
+  This is what the service vouches for when a client pairs.
+- `secretsVolume`: `mounted` when the secrets volume is on `/home/pane/.pane-secrets` with `noexec`,
+  else `missing`.
 - `activity`: the agent calls the local Pane daemon over its control socket, the way `runpane`
   does (`packages/runpane/src/daemonClient.ts`: `/tmp/pane-daemon-<uid>-<sha256(paneDir)[:16]>/daemon.sock`,
   newline-delimited request frames).
   - `agentsRunning`: entries of kind `agent.busy` in `runpane:workspace:state`, the snapshot behind
     `runpane workspace state` (one baseline entry per agent panel).
   - `clientsConnected`: `connectedClients` in `remote-daemon:get-host-state`, the list Settings ›
-    Remote Access shows (`main/src/daemon/httpApiServer.ts` keeps it per open event stream).
-    **Pane 2.4.215 does not serve that channel on the control socket** (it is an `ipcMain` handler
-    for the desktop window, `main/src/ipc/remoteDaemon.ts`), so `clientsConnected` is 0 until Pane
+    Remote Access shows. Pane serves that channel only to its desktop window
+    (`main/src/ipc/remoteDaemon.ts`), not on the control socket, so `clientsConnected` is 0 until Pane
     registers it as a daemon command. `check-image.sh` prints whether the baked-in Pane serves it.
   - `lastActivityAt`: now while anything is active, else the later of the last time the agent saw
     activity (kept in `/var/lib/pane-cloud/last-activity`) and the newest workspace entry. `null`
     before any activity.
+
+### Reports (port 1025)
+
+The guest connects to the host (CID 2) on vsock port 1025 and sends one JSON line per connection.
+Firecracker hands each connection to the host's `<vsock uds_path>_1025` socket. Nothing is read
+back. A process report the host misses is not resent: the next one follows on schedule. A memory
+pressure signal is tried again every 5 seconds until the host takes it. A user with root
+can stop the reports, so the host flags an awake machine whose process reports stop (D1).
+
+**Process report**, when the agent starts and every 5 minutes after:
+
+```json
+{ "type": "process_report", "at": "2026-11-21T10:00:00Z", "bootId": "…",
+  "processes": [ { "pid": 812, "ppid": 1, "uid": 1000, "name": "xmrig", "exe": "/home/pane/xmrig",
+                   "sha256": "…", "cpuSeconds": 12.5, "rssBytes": 4194304 } ] }
+```
+
+Every process that runs a program is listed; kernel threads are left out. `sha256` is the hash of
+the program the process runs, read through `/proc/<pid>/exe`, so a deleted or replaced file still
+hashes to what is running and a renamed copy of a known miner hashes the same. A program is hashed
+once while it runs unchanged, and one larger than 2 GiB has `sha256: null`. Command lines and
+environments are never read: they can hold secrets. D1 checks the names and hashes against known
+miners (xmrig and its forks).
+
+**Memory pressure**, checked every 5 seconds:
+
+```json
+{ "type": "memory_pressure", "at": "…", "bootId": "…", "reasons": ["psi"],
+  "psiSomeAvg60": 12.5, "swapUsedBytes": 0, "oomKills": 0 }
+```
+
+`reasons` lists what holds: `oom_kill` (the kernel's `oom_kill` count rose), `psi` (memory stalls
+above 10% over the last 60 seconds, `/proc/pressure/memory`), `swap` (more than 2 GiB of swap in
+use). A signal that holds is sent again at most once a minute; a new out-of-memory kill is sent at
+once. The host relaunches the Session at 16 GiB on an `oom_kill`, and after the current turn on the
+others. The image has no swap yet, so `swapUsedBytes` is 0 until encrypted swap arrives with the
+16 GiB relaunch.
 
 ## Checks
 
@@ -166,25 +246,40 @@ sudo bash build/build-image.sh all out/              # the real image, on an arm
 sudo bash build/check-image.sh out/                  # checks it and probes the Pane daemon inside it
 ```
 
-CI (`.github/workflows/fleet-guest.yml`) runs the unit tests on Ubuntu 24.04's Python 3.12 and
-shellcheck. The `image` job builds the arm64 image on GitHub's `ubuntu-24.04-arm` runner and runs
-`check-image.sh`.
-That checks the kernel config, the image size and filesystem, and the files, users and units inside
-the ext4. It then starts the Pane daemon inside the image (`--daemon-headless`, on a throwaway
-overlay) and sends the guest agent a `status` request, which must reach the daemon's workspace
-state and report the baked-in Pane version. Only the kernel and its config are kept, as a workflow
-artifact for 3 days.
+CI (`.github/workflows/fleet-guest.yml`) runs the unit tests on Ubuntu 24.04's Python 3.12 (the
+process report test reads the runner's real `/proc`) and shellcheck.
+
+The `image` job builds the arm64 image on GitHub's `ubuntu-24.04-arm` runner and runs
+`check-image.sh`. That checks the kernel config, the image size and filesystem, and the files, users
+and units inside the ext4. It then starts the Pane daemon inside the image (`--daemon-headless`, on a
+throwaway overlay, relay on), sends the guest agent a `status` request, which must reach the daemon
+and show a relay computer id, and takes a process report, which must name the daemon with the hash of
+`/opt/Pane/pane`. Only the kernel and its config are kept, as a workflow artifact for 3 days.
 
 The `boot` job builds the amd64 image on `ubuntu-24.04`, runs `check-image.sh`, then runs
-`boot-check.sh`. That boots the image under F1's pinned Firecracker and jailer with a NAT'd tap, the
-kernel `ip=` argument and a 16 GiB disk. Over vsock (`CONNECT 1024`) it waits for the guest agent's
-`status`, then for first boot to finish, reading `bootstrap.log` through `collect_diagnostics`. Each
-of the five CLIs must have installed and run `--version` inside the guest, and `status.tailnet` must
-show the login URL from `tailscale up`, which joins no tailnet.
+`boot-check.sh`. That boots the image under Firecracker 1.18's jailer with a NAT'd tap, the kernel
+`ip=` argument, a 16 GiB disk, a blank 64 MiB secrets volume and no entropy device. Over vsock it
+checks:
+
+- the guest agent answers `status`, and a process report arrives on port 1025;
+- the kernel logs lockdown `[integrity]` and no virtio-rng;
+- each of the five CLIs installed and runs `--version`;
+- the blank secrets volume is formatted and mounted no-exec, a program copied there does not run,
+  and `status` reports it `mounted`;
+- the Pane daemon reaches relay `ready` with a computer id and fingerprint (certificates from Let's
+  Encrypt's staging CA, so CI never spends the limits Pane's users share);
+- a process report names `xmrig` with the program's hash. The stand-in is a copy of `sleep` named
+  `xmrig`, because GitHub forbids mining on Actions;
+- with the repository secret `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), Claude Code
+  answers a prompt inside the guest. Without it, the check prints `skip`.
+
+The checks that need something run inside the guest use a CI-only unit that `boot-check.sh` adds to
+its own throwaway copy of the disk. The image itself never carries it.
 
 ## Not verified here
 
-- Booting the arm64 image: CI boots the amd64 variant, since GitHub's arm64 runners have no KVM.
-- Joining a tailnet, and Pane's `--remote-setup` after the join.
-- Nonzero activity counts. CI shows `runpane:workspace:state` answers and `status` reports no
-  agents and no clients.
+- Booting the arm64 image in a Nitro Sandbox: CI boots the amd64 variant under Firecracker, since
+  GitHub's arm64 runners have no KVM. P1 booted the same kernel version and config there.
+- Pairing a real client through the relay with the vouched key (A6, journey 17).
+- Nonzero activity counts, a memory pressure report from a real guest, and the host side of the
+  reports (N1, D1).

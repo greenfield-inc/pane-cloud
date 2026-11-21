@@ -540,8 +540,16 @@ class Reporter:
         self._hashes = {key: value for key, value in self._hashes.items() if key in live}
         return {'type': 'process_report', 'at': utc_now(), 'bootId': self._boot_id(), 'processes': processes}
 
-    def memory_pressure(self, now: float) -> dict[str, Any] | None:
-        """The pressure signal, when the kernel shows one and it is due to be sent."""
+    def check_memory(self, now: float) -> None:
+        """Sends the pressure signal when the kernel shows one and it is due. Until the host takes it, the
+        next check (5 seconds later) tries again."""
+        message = self._memory_pressure(now)
+        if message:
+            self.send(message)
+            self._pressure_sent_at = now
+            self._oom_kills_sent = message['oomKills']
+
+    def _memory_pressure(self, now: float) -> dict[str, Any] | None:
         psi = self._psi_some_avg60()
         swap = self._swap_used_bytes()
         oom_kills = self._oom_kills()
@@ -556,8 +564,6 @@ class Reporter:
             return None
         if 'oom_kill' not in reasons and self._pressure_sent_at is not None and now - self._pressure_sent_at < PRESSURE_REPEAT_SECONDS:
             return None
-        self._pressure_sent_at = now
-        self._oom_kills_sent = oom_kills
         return {'type': 'memory_pressure', 'at': utc_now(), 'bootId': self._boot_id(), 'reasons': reasons,
                 'psiSomeAvg60': psi, 'swapUsedBytes': swap, 'oomKills': oom_kills}
 
@@ -566,16 +572,15 @@ class Reporter:
         while True:
             now = time.monotonic()
             if now >= next_report:
-                self._send(self.process_report)
+                self._quietly(lambda: self.send(self.process_report()))
                 next_report = now + PROCESS_REPORT_SECONDS
-            self._send(lambda: self.memory_pressure(now))
+            self._quietly(lambda: self.check_memory(now))
             time.sleep(PRESSURE_CHECK_SECONDS)
 
-    def _send(self, make: Callable[[], dict[str, Any] | None]) -> None:
+    @staticmethod
+    def _quietly(step: Callable[[], None]) -> None:
         try:
-            message = make()
-            if message:
-                self.send(message)
+            step()
         except Exception:  # noqa: BLE001 - a host that is not listening misses this report, not the next
             pass
 

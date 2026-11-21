@@ -351,36 +351,48 @@ class ReporterTest(unittest.TestCase):
         self.assertEqual(seen_miner['uid'], os.getuid())
         self.assertNotIn('cmdline', seen_miner)
 
+    def reporter(self, **proc):
+        sent = []
+        reporter = Reporter(Settings(proc_root=self.fake_proc(**proc)), send=sent.append)
+        return reporter, sent
+
     def test_memory_pressure_is_sent_when_stalls_pass_10_percent_and_repeats_at_most_once_a_minute(self):
-        settings = Settings(proc_root=self.fake_proc(psi_avg60='3.10'))
-        reporter = Reporter(settings, send=lambda message: None)
-        self.assertIsNone(reporter.memory_pressure(now=1000))
+        reporter, sent = self.reporter(psi_avg60='3.10')
+        reporter.check_memory(now=1000)
+        self.assertEqual(sent, [])
 
         self.fake_proc(psi_avg60='12.50')
-        signal = reporter.memory_pressure(now=1005)
-        self.assertEqual({k: signal[k] for k in ('type', 'reasons', 'psiSomeAvg60', 'swapUsedBytes', 'oomKills')},
-                         {'type': 'memory_pressure', 'reasons': ['psi'], 'psiSomeAvg60': 12.5, 'swapUsedBytes': 0, 'oomKills': 0})
-        self.assertIsNone(reporter.memory_pressure(now=1035))
-        self.assertEqual(reporter.memory_pressure(now=1066)['reasons'], ['psi'])
+        for now in (1005, 1035, 1066):
+            reporter.check_memory(now=now)
 
-    def test_an_out_of_memory_kill_is_sent_at_once(self):
-        reporter = Reporter(Settings(proc_root=self.fake_proc(psi_avg60='12.50')), send=lambda message: None)
-        reporter.memory_pressure(now=1000)
+        self.assertEqual([{k: m[k] for k in ('type', 'reasons', 'psiSomeAvg60', 'swapUsedBytes', 'oomKills')} for m in sent],
+                         [{'type': 'memory_pressure', 'reasons': ['psi'], 'psiSomeAvg60': 12.5, 'swapUsedBytes': 0, 'oomKills': 0}] * 2)
 
+    def test_an_out_of_memory_kill_is_sent_at_once_and_retried_until_the_host_takes_it(self):
+        reporter, sent = self.reporter(psi_avg60='12.50')
+        reporter.check_memory(now=1000)
         self.fake_proc(psi_avg60='12.50', oom_kills=1)
-        self.assertEqual(reporter.memory_pressure(now=1002)['reasons'], ['oom_kill', 'psi'])
-        self.assertIsNone(reporter.memory_pressure(now=1004))
+
+        def host_not_listening(message):
+            raise ConnectionRefusedError
+        reporter.send = host_not_listening
+        with self.assertRaises(ConnectionRefusedError):
+            reporter.check_memory(now=1002)
+        reporter.send = sent.append
+        reporter.check_memory(now=1007)
+        reporter.check_memory(now=1012)
+
+        self.assertEqual([m['reasons'] for m in sent], [['psi'], ['oom_kill', 'psi']])
 
     def test_more_than_2_gib_of_swap_in_use_is_pressure(self):
         gib_kb = 1024 * 1024
-        reporter = Reporter(Settings(proc_root=self.fake_proc(swap_total_kb=4 * gib_kb, swap_free_kb=2 * gib_kb + 1)),
-                            send=lambda message: None)
-        self.assertIsNone(reporter.memory_pressure(now=0))
+        reporter, sent = self.reporter(swap_total_kb=4 * gib_kb, swap_free_kb=2 * gib_kb + 1)
+        reporter.check_memory(now=0)
+        self.assertEqual(sent, [])
 
         self.fake_proc(swap_total_kb=4 * gib_kb, swap_free_kb=gib_kb)
-        signal = reporter.memory_pressure(now=5)
-        self.assertEqual((signal['reasons'], signal['swapUsedBytes']), (['swap'], 3 * 1024 ** 3))
-
+        reporter.check_memory(now=5)
+        self.assertEqual([(m['reasons'], m['swapUsedBytes']) for m in sent], [(['swap'], 3 * 1024 ** 3)])
 
 if __name__ == '__main__':
     unittest.main()
