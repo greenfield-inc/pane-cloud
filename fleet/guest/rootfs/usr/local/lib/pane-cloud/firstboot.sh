@@ -33,7 +33,7 @@ hostname "$name"
 say "hostname $name"
 # The kernel's own word on the hardening the image promises: lockdown on, no host entropy device.
 say "kernel $(uname -r) lockdown $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable)" \
-  "hwrng $(cat /sys/class/misc/hw_random/rng_available 2>/dev/null | tr -s ' ' || echo none)"
+  "hwrng $(tr -s ' ' 2>/dev/null </sys/class/misc/hw_random/rng_available || echo none)"
 
 if runuser -u pane -- env HOME=/home/pane bash /usr/local/lib/pane-cloud/install-agent-clis.sh; then
   say "agent CLIs installed"
