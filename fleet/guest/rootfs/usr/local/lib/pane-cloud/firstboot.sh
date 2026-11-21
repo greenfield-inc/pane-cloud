@@ -2,7 +2,7 @@
 # First boot of a Pane Cloud machine. Runs on every boot and each step is idempotent, so a boot that
 # failed half way (no network for an installer, say) finishes on the next one.
 #   1. grow the root filesystem to the disk the host gave the machine
-#   2. set the hostname from the machine id
+#   2. set the hostname from the machine id, and log the kernel's lockdown mode and entropy devices
 #   3. install the five agent CLIs with their vendors' installers, as the pane user
 # Logs to /var/log/pane-cloud/bootstrap.log. Leaves /var/lib/pane-cloud/firstboot.done or
 # firstboot.failed, which the guest agent's bootstrap reports.
@@ -31,6 +31,9 @@ if [ "$(cat /etc/hostname 2>/dev/null)" != "$name" ]; then
 fi
 hostname "$name"
 say "hostname $name"
+# The kernel's own word on the hardening the image promises: lockdown on, no host entropy device.
+say "kernel $(uname -r) lockdown $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable)" \
+  "hwrng $(cat /sys/class/misc/hw_random/rng_available 2>/dev/null | tr -s ' ' || echo none)"
 
 if runuser -u pane -- env HOME=/home/pane bash /usr/local/lib/pane-cloud/install-agent-clis.sh; then
   say "agent CLIs installed"

@@ -6,28 +6,37 @@ import json
 import os
 import shutil
 import socket
+import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
 import unittest
 
-from pane_guest_agent import Agent, Settings, System, serve
+from pane_guest_agent import Agent, Reporter, Settings, System, serve
 
 SHA256_OF_ABC = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
 RELEASE = {'version': '2.4.215', 'arch': 'arm64', 'debSha256': SHA256_OF_ABC}
+RELAY_READY = {'enabled': True, 'phase': 'ready', 'id': 'k7d2m4q9x3abcd5e', 'domain': 'runpane.net',
+               'address': 'https://k7d2m4q9x3abcd5e.runpane.net', 'relay': 'us.relay.runpane.net', 'region': 'us',
+               'localAddresses': [], 'certificate': None, 'lastError': None, 'certificateLimit': None}
+RELAY_COMPUTER = {'id': 'k7d2m4q9x3abcd5e', 'name': 'pane-1a2b3c4d', 'domain': 'runpane.net',
+                  'address': 'https://k7d2m4q9x3abcd5e.runpane.net', 'local': [],
+                  'fingerprint': 'q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c'}
 
 
 class FakeSystem(System):
-    """The machine: a release server that serves b'abc', apt, tailscale and the Pane daemon."""
+    """The machine: a release server that serves b'abc', apt and the Pane daemon."""
 
     def __init__(self):
         self.version = '2.4.214'
         self.downloads = []
         self.commands = []
         self.restarts = 0
-        self.tailscale = {'BackendState': 'NeedsLogin', 'AuthURL': 'https://login.tailscale.com/a/1a2b3c'}
         self.workspace_state = None
         self.host_state = None
+        self.relay_status = None
+        self.relay_computer = None
 
     def download(self, url, dest, max_bytes):
         self.downloads.append(url)
@@ -44,11 +53,9 @@ class FakeSystem(System):
     def installed_pane_version(self):
         return self.version
 
-    def tailscale_status(self):
-        return self.tailscale
-
     def pane_daemon_call(self, pane_dir, channel, args):
-        answer = {'runpane:workspace:state': self.workspace_state, 'remote-daemon:get-host-state': self.host_state}[channel]
+        answer = {'runpane:workspace:state': self.workspace_state, 'remote-daemon:get-host-state': self.host_state,
+                  'relay:status': self.relay_status, 'relay:client:computer': self.relay_computer}[channel]
         if answer is None:
             raise ConnectionRefusedError('no daemon')
         return answer
@@ -79,6 +86,8 @@ class GuestAgentTest(unittest.TestCase):
                 self.path('home/pane/.pane/logs/pane-*.log'),
             ),
             user_owned_roots=(self.path('home') + '/',),
+            mounts_path=self.path('proc/self/mounts'),
+            secrets_mount='/home/pane/.pane-secrets',
         )
         sock_path = self.path('agent.sock')
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -182,17 +191,44 @@ class GuestAgentTest(unittest.TestCase):
 
     # ------------------------------------------------------------ status
 
-    def test_status_before_the_user_logs_in_to_tailscale(self):
+    def test_status_before_the_daemon_answers(self):
         reply = self.send('status', {})
 
         self.assertEqual(reply['result'], {
             'paneVersion': '2.4.214',
-            'tailnet': {'status': 'awaiting_login', 'loginUrl': 'https://login.tailscale.com/a/1a2b3c', 'hostname': None},
+            'relay': {'status': 'unreachable', 'id': None, 'address': None, 'fingerprint': None},
+            'secretsVolume': 'missing',
             'activity': {'agentsRunning': 0, 'clientsConnected': 0, 'lastActivityAt': None},
         })
 
+    def test_status_reports_the_relay_identity_clients_pin(self):
+        self.system.relay_status = RELAY_READY
+        self.system.relay_computer = RELAY_COMPUTER
+
+        relay = self.send('status', {})['result']['relay']
+
+        self.assertEqual(relay, {'status': 'ready', 'id': 'k7d2m4q9x3abcd5e', 'address': 'https://k7d2m4q9x3abcd5e.runpane.net',
+                                 'fingerprint': 'q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c'})
+
+    def test_status_reports_no_fingerprint_until_the_relay_connects(self):
+        self.system.relay_status = {**RELAY_READY, 'phase': 'connecting', 'address': None}
+
+        relay = self.send('status', {})['result']['relay']
+
+        self.assertEqual(relay, {'status': 'connecting', 'id': 'k7d2m4q9x3abcd5e', 'address': None, 'fingerprint': None})
+
+    def test_status_reports_the_secrets_volume_only_when_it_is_mounted_noexec(self):
+        cases = {
+            'mounted': ('/dev/vdb /home/pane/.pane-secrets ext4 rw,nosuid,nodev,noexec,noatime 0 0\n', 'mounted'),
+            'mounted with exec': ('/dev/vdb /home/pane/.pane-secrets ext4 rw,nosuid,nodev,noatime 0 0\n', 'missing'),
+            'not mounted': ('/dev/vda / ext4 rw,noatime 0 0\n', 'missing'),
+        }
+        for name, (mounts, expected) in cases.items():
+            with self.subTest(name):
+                self.write('proc/self/mounts', mounts)
+                self.assertEqual(self.send('status', {})['result']['secretsVolume'], expected)
+
     def test_status_counts_working_agents_and_connected_clients(self):
-        self.system.tailscale = {'BackendState': 'Running', 'Self': {'DNSName': 'pane-m1.tail1234.ts.net.'}}
         self.system.workspace_state = {'ok': True, 'epoch': 'e', 'generation': 3, 'entries': [
             {'kind': 'agent.busy', 'at': '2026-11-06T05:58:00Z', 'paneId': 'p1', 'paneName': 'a', 'source': 'agent'},
             {'kind': 'agent.busy', 'at': '2026-11-06T05:59:00Z', 'paneId': 'p2', 'paneName': 'b', 'source': 'agent'},
@@ -202,7 +238,6 @@ class GuestAgentTest(unittest.TestCase):
 
         result = self.send('status', {})['result']
 
-        self.assertEqual(result['tailnet'], {'status': 'joined', 'loginUrl': None, 'hostname': 'pane-m1.tail1234.ts.net'})
         self.assertEqual(result['activity']['agentsRunning'], 2)
         self.assertEqual(result['activity']['clientsConnected'], 1)
         self.assertRegex(result['activity']['lastActivityAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
@@ -274,6 +309,77 @@ class GuestAgentTest(unittest.TestCase):
         self.assertEqual(self.system.commands, [['sync']])
         self.assertEqual([(e['id'], e['operation'], e['ok']) for e in entries],
                          [('s-1', 'prepare_to_stop', True), ('s-2', 'run_command', False)])
+
+
+
+class ReporterTest(unittest.TestCase):
+    def setUp(self):
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix='pgr-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, self.root)
+
+    def fake_proc(self, psi_avg60='0.00', swap_total_kb=0, swap_free_kb=0, oom_kills=0):
+        proc = os.path.join(self.root, 'proc')
+        os.makedirs(os.path.join(proc, 'pressure'), exist_ok=True)
+        with open(os.path.join(proc, 'pressure', 'memory'), 'w') as out:
+            out.write(f'some avg10=0.00 avg60={psi_avg60} avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+        with open(os.path.join(proc, 'meminfo'), 'w') as out:
+            out.write(f'MemTotal:        8135000 kB\nSwapTotal:       {swap_total_kb} kB\nSwapFree:        {swap_free_kb} kB\n')
+        with open(os.path.join(proc, 'vmstat'), 'w') as out:
+            out.write(f'pgfault 1234\noom_kill {oom_kills}\n')
+        return proc
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'reads the real /proc')
+    def test_process_report_names_a_miner_and_catches_a_renamed_copy_by_its_hash(self):
+        program = shutil.which('sleep')
+        miner = os.path.join(self.root, 'xmrig')
+        renamed = os.path.join(self.root, 'build-cache')
+        for copy in (miner, renamed):
+            shutil.copy(program, copy)
+        expected_sha = subprocess.run(['sha256sum', program], capture_output=True, text=True, check=True).stdout.split()[0]
+        running = [subprocess.Popen([copy, '30']) for copy in (miner, renamed)]
+        for process in running:
+            self.addCleanup(process.wait)
+            self.addCleanup(process.kill)
+
+        report = Reporter(Settings(), send=lambda message: None).process_report()
+
+        by_pid = {p['pid']: p for p in report['processes']}
+        seen_miner, seen_renamed = by_pid[running[0].pid], by_pid[running[1].pid]
+        self.assertEqual(report['type'], 'process_report')
+        self.assertEqual((seen_miner['name'], seen_miner['exe'], seen_miner['sha256']), ('xmrig', miner, expected_sha))
+        self.assertEqual((seen_renamed['name'], seen_renamed['sha256']), ('build-cache', expected_sha))
+        self.assertEqual(seen_miner['uid'], os.getuid())
+        self.assertNotIn('cmdline', seen_miner)
+
+    def test_memory_pressure_is_sent_when_stalls_pass_10_percent_and_repeats_at_most_once_a_minute(self):
+        settings = Settings(proc_root=self.fake_proc(psi_avg60='3.10'))
+        reporter = Reporter(settings, send=lambda message: None)
+        self.assertIsNone(reporter.memory_pressure(now=1000))
+
+        self.fake_proc(psi_avg60='12.50')
+        signal = reporter.memory_pressure(now=1005)
+        self.assertEqual({k: signal[k] for k in ('type', 'reasons', 'psiSomeAvg60', 'swapUsedBytes', 'oomKills')},
+                         {'type': 'memory_pressure', 'reasons': ['psi'], 'psiSomeAvg60': 12.5, 'swapUsedBytes': 0, 'oomKills': 0})
+        self.assertIsNone(reporter.memory_pressure(now=1035))
+        self.assertEqual(reporter.memory_pressure(now=1066)['reasons'], ['psi'])
+
+    def test_an_out_of_memory_kill_is_sent_at_once(self):
+        reporter = Reporter(Settings(proc_root=self.fake_proc(psi_avg60='12.50')), send=lambda message: None)
+        reporter.memory_pressure(now=1000)
+
+        self.fake_proc(psi_avg60='12.50', oom_kills=1)
+        self.assertEqual(reporter.memory_pressure(now=1002)['reasons'], ['oom_kill', 'psi'])
+        self.assertIsNone(reporter.memory_pressure(now=1004))
+
+    def test_more_than_2_gib_of_swap_in_use_is_pressure(self):
+        gib_kb = 1024 * 1024
+        reporter = Reporter(Settings(proc_root=self.fake_proc(swap_total_kb=4 * gib_kb, swap_free_kb=2 * gib_kb + 1)),
+                            send=lambda message: None)
+        self.assertIsNone(reporter.memory_pressure(now=0))
+
+        self.fake_proc(swap_total_kb=4 * gib_kb, swap_free_kb=gib_kb)
+        signal = reporter.memory_pressure(now=5)
+        self.assertEqual((signal['reasons'], signal['swapUsedBytes']), (['swap'], 3 * 1024 ** 3))
 
 
 if __name__ == '__main__':

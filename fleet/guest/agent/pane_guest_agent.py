@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Pane Cloud guest agent: runs the allow-listed guest operations the host agent sends over vsock.
+"""Pane Cloud guest agent: runs the allow-listed guest operations the host agent sends over vsock, and
+reports the machine's processes and memory pressure to the host.
 
-Protocol (fleet/README.md, "F5 guest agent protocol"): one JSON object per line in, one per line out.
+Operations, on vsock port 1024 (fleet/guest/README.md): one JSON object per line in, one per line out.
   {"id": "...", "operation": "status", "parameters": {}}
   {"id": "...", "ok": true, "result": {...}}  or  {"id": "...", "ok": false, "error": {code, message, next}}
-
 Only bootstrap, update_pane, prepare_to_stop, collect_diagnostics and status run, each with exactly the
-parameters the contract allows. There is no shell command and no file write from outside. Python 3
-standard library only.
+parameters the contract allows. There is no shell command and no file write from outside.
+
+Reports, to the host (CID 2) on vsock port 1025: one JSON line per connection, nothing read back.
+  {"type": "process_report", ...}   at start, then every 5 minutes
+  {"type": "memory_pressure", ...}  when the kernel shows memory pressure, checked every 5 seconds
+Python 3 standard library only.
 """
 
 from __future__ import annotations
@@ -33,6 +37,16 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 VSOCK_PORT = 1024
+REPORT_PORT = 1025
+PROCESS_REPORT_SECONDS = 300
+PRESSURE_CHECK_SECONDS = 5
+# Memory pressure (cover sheet, growing memory): stalls above 10% over 60 s, more than 2 GiB of swap
+# in use, or an out-of-memory kill. A signal that holds is sent again at most once a minute.
+PRESSURE_PSI_AVG60 = 10.0
+PRESSURE_SWAP_BYTES = 2 * 1024 ** 3
+PRESSURE_REPEAT_SECONDS = 60
+# A program larger than this is reported without a hash.
+MAX_HASH_BYTES = 2 * 1024 ** 3
 MAX_REQUEST_BYTES = 64 * 1024
 PANE_USER = 'pane'
 PANE_DAEMON_UNIT = 'pane-remote-daemon.service'
@@ -113,6 +127,9 @@ class Settings:
     log_path: str = '/var/log/pane-cloud/guest-agent.log'
     state_dir: str = '/var/lib/pane-cloud'
     pane_dir: str = '/home/pane/.pane'
+    proc_root: str = '/proc'
+    mounts_path: str = '/proc/self/mounts'
+    secrets_mount: str = '/home/pane/.pane-secrets'
     diagnostic_files: tuple[str, ...] = DIAGNOSTIC_FILES
     # Files under these directories must have one link, so a user cannot hard-link another file in.
     user_owned_roots: tuple[str, ...] = ('/home/',)
@@ -152,17 +169,6 @@ class System:
         if code != 0 or not out.startswith('install ok installed '):
             return None
         return out.rsplit(' ', 1)[-1].strip() or None
-
-    def tailscale_status(self) -> dict[str, Any] | None:
-        try:
-            code, out = self.run(['tailscale', 'status', '--json'], timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        try:
-            status = json.loads(out)
-        except ValueError:
-            return None
-        return status if isinstance(status, dict) else None
 
     def pane_daemon_call(self, pane_dir: str, channel: str, args: list[Any]) -> Any:
         """Calls the local Pane daemon over its control socket, as runpane does (daemonClient.ts)."""
@@ -284,7 +290,8 @@ class Agent:
 
     def status(self) -> dict[str, Any]:
         return {'paneVersion': self.system.installed_pane_version(),
-                'tailnet': self._tailnet(),
+                'relay': self._relay(),
+                'secretsVolume': self._secrets_volume(),
                 'activity': self._activity()}
 
     def collect_diagnostics(self) -> dict[str, Any]:
@@ -352,15 +359,41 @@ class Agent:
             return 'failed'
         return 'running'
 
-    def _tailnet(self) -> dict[str, Any]:
-        status = self.system.tailscale_status() or {}
-        if status.get('BackendState') == 'Running':
-            dns_name = ((status.get('Self') or {}).get('DNSName') or '').rstrip('.')
-            return {'status': 'joined', 'loginUrl': None, 'hostname': dns_name or None}
-        login_url = status.get('AuthURL')
-        if not isinstance(login_url, str) or not login_url.startswith('https://'):
-            login_url = None
-        return {'status': 'awaiting_login', 'loginUrl': login_url, 'hostname': None}
+    def _relay(self) -> dict[str, Any]:
+        """The daemon's relay identity, which the service vouches for when a client pairs (A6).
+
+        status is Pane's relay phase (off, connecting, certificate, ready, error), or unreachable while
+        the daemon does not answer. fingerprint is the SHA-256 of the computer's public key, base64url.
+        """
+        relay: dict[str, Any] = {'status': 'unreachable', 'id': None, 'address': None, 'fingerprint': None}
+        try:
+            status = self.system.pane_daemon_call(self.settings.pane_dir, 'relay:status', [])
+        except Exception:  # noqa: BLE001 - no daemon yet
+            return relay
+        if not isinstance(status, dict):
+            return relay
+        relay.update(status=status.get('phase') if isinstance(status.get('phase'), str) else 'error',
+                     id=status.get('id') if isinstance(status.get('id'), str) else None,
+                     address=status.get('address') if isinstance(status.get('address'), str) else None)
+        try:
+            computer = self.system.pane_daemon_call(self.settings.pane_dir, 'relay:client:computer', [])
+            if isinstance(computer, dict) and computer.get('id') == relay['id'] and isinstance(computer.get('fingerprint'), str):
+                relay['fingerprint'] = computer['fingerprint']
+        except Exception:  # noqa: BLE001 - not connected to the relay yet
+            pass
+        return relay
+
+    def _secrets_volume(self) -> str:
+        """mounted: the secrets volume is on its mount point, no-exec. missing: it is not."""
+        try:
+            with open(self.settings.mounts_path, encoding='utf-8') as mounts:
+                for line in mounts:
+                    fields = line.split()
+                    if len(fields) >= 4 and fields[1] == self.settings.secrets_mount and 'noexec' in fields[3].split(','):
+                        return 'mounted'
+        except OSError:
+            pass
+        return 'missing'
 
     def _activity(self) -> dict[str, Any]:
         """Agents working (Pane's workspace state) and clients attached (Pane's remote host state)."""
@@ -473,6 +506,173 @@ class Agent:
             os.close(fd)
 
 
+# ---------------------------------------------------------------- reports to the host
+
+
+class Reporter:
+    """Reads the machine's processes and memory pressure from /proc and sends them to the host.
+
+    A user with root can stop these reports; the host flags an awake machine whose reports stop.
+    """
+
+    def __init__(self, settings: Settings, send: Callable[[dict[str, Any]], None]):
+        self.settings = settings
+        self.send = send
+        self._hashes: dict[tuple[int, int, int, int], str | None] = {}
+        self._pressure_sent_at: float | None = None
+        self._oom_kills_sent = 0
+
+    def process_report(self) -> dict[str, Any]:
+        """Every process that runs a program, with that program's SHA-256 (D1 checks it against known miners).
+
+        Kernel threads, which run no program, are left out. Command lines and environments are never read:
+        they can hold secrets.
+        """
+        processes = []
+        for name in os.listdir(self.settings.proc_root):
+            if name.isdigit():
+                process = self._process(int(name))
+                if process:
+                    processes.append(process)
+        processes.sort(key=lambda p: p['pid'])
+        # Forget programs nothing runs any more, so the cache stays as small as the process list.
+        live = {process.pop('_key') for process in processes}
+        self._hashes = {key: value for key, value in self._hashes.items() if key in live}
+        return {'type': 'process_report', 'at': utc_now(), 'bootId': self._boot_id(), 'processes': processes}
+
+    def memory_pressure(self, now: float) -> dict[str, Any] | None:
+        """The pressure signal, when the kernel shows one and it is due to be sent."""
+        psi = self._psi_some_avg60()
+        swap = self._swap_used_bytes()
+        oom_kills = self._oom_kills()
+        reasons = []
+        if oom_kills > self._oom_kills_sent:
+            reasons.append('oom_kill')
+        if psi > PRESSURE_PSI_AVG60:
+            reasons.append('psi')
+        if swap > PRESSURE_SWAP_BYTES:
+            reasons.append('swap')
+        if not reasons:
+            return None
+        if 'oom_kill' not in reasons and self._pressure_sent_at is not None and now - self._pressure_sent_at < PRESSURE_REPEAT_SECONDS:
+            return None
+        self._pressure_sent_at = now
+        self._oom_kills_sent = oom_kills
+        return {'type': 'memory_pressure', 'at': utc_now(), 'bootId': self._boot_id(), 'reasons': reasons,
+                'psiSomeAvg60': psi, 'swapUsedBytes': swap, 'oomKills': oom_kills}
+
+    def run(self) -> None:
+        next_report = 0.0
+        while True:
+            now = time.monotonic()
+            if now >= next_report:
+                self._send(self.process_report)
+                next_report = now + PROCESS_REPORT_SECONDS
+            self._send(lambda: self.memory_pressure(now))
+            time.sleep(PRESSURE_CHECK_SECONDS)
+
+    def _send(self, make: Callable[[], dict[str, Any] | None]) -> None:
+        try:
+            message = make()
+            if message:
+                self.send(message)
+        except Exception:  # noqa: BLE001 - a host that is not listening misses this report, not the next
+            pass
+
+    # ------------------------------------------------------------ /proc
+
+    def _read(self, *parts: str) -> str:
+        with open(os.path.join(self.settings.proc_root, *parts), encoding='utf-8', errors='replace') as source:
+            return source.read()
+
+    def _boot_id(self) -> str | None:
+        try:
+            return self._read('sys', 'kernel', 'random', 'boot_id').strip() or None
+        except OSError:
+            return None
+
+    def _process(self, pid: int) -> dict[str, Any] | None:
+        base = os.path.join(self.settings.proc_root, str(pid))
+        try:
+            exe = os.readlink(os.path.join(base, 'exe'))
+            stat_line = self._read(str(pid), 'stat')
+            status = self._read(str(pid), 'status')
+        except OSError:
+            return None  # a kernel thread, or a process that just exited
+        name = stat_line[stat_line.index('(') + 1:stat_line.rindex(')')]
+        fields = stat_line[stat_line.rindex(')') + 2:].split()
+        uid = rss = None
+        for line in status.splitlines():
+            if line.startswith('Uid:'):
+                uid = int(line.split()[1])
+            elif line.startswith('VmRSS:'):
+                rss = int(line.split()[1]) * 1024
+        sha, key = self._program_sha256(os.path.join(base, 'exe'))
+        return {'pid': pid, 'ppid': int(fields[1]), 'uid': uid, 'name': name, 'exe': exe, 'sha256': sha,
+                'cpuSeconds': round((int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK'), 2),
+                'rssBytes': rss, '_key': key}
+
+    def _program_sha256(self, exe_link: str) -> tuple[str | None, tuple[int, int, int, int] | None]:
+        """Hashes the program through /proc/<pid>/exe, which opens the file the process runs even if it was
+        deleted or replaced. A program is hashed once while any process runs it unchanged."""
+        try:
+            fd = os.open(exe_link, os.O_RDONLY)
+        except OSError:
+            return None, None
+        try:
+            info = os.fstat(fd)
+            key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            if key not in self._hashes:
+                digest: str | None = None
+                if stat.S_ISREG(info.st_mode) and info.st_size <= MAX_HASH_BYTES:
+                    hasher = hashlib.sha256()
+                    while chunk := os.read(fd, 1024 * 1024):
+                        hasher.update(chunk)
+                    digest = hasher.hexdigest()
+                self._hashes[key] = digest
+            return self._hashes[key], key
+        finally:
+            os.close(fd)
+
+    def _psi_some_avg60(self) -> float:
+        try:
+            for line in self._read('pressure', 'memory').splitlines():
+                if line.startswith('some '):
+                    return float(dict(field.split('=') for field in line.split()[1:])['avg60'])
+        except (OSError, KeyError, ValueError):
+            pass
+        return 0.0
+
+    def _swap_used_bytes(self) -> int:
+        values = {}
+        try:
+            for line in self._read('meminfo').splitlines():
+                key, _, rest = line.partition(':')
+                if key in ('SwapTotal', 'SwapFree'):
+                    values[key] = int(rest.split()[0]) * 1024
+        except (OSError, ValueError, IndexError):
+            return 0
+        return max(0, values.get('SwapTotal', 0) - values.get('SwapFree', 0))
+
+    def _oom_kills(self) -> int:
+        try:
+            for line in self._read('vmstat').splitlines():
+                key, _, value = line.partition(' ')
+                if key == 'oom_kill':
+                    return int(value)
+        except (OSError, ValueError):
+            pass
+        return 0
+
+
+def send_to_host(message: dict[str, Any], port: int = REPORT_PORT) -> None:
+    """One report, one connection, to the host agent's vsock listener."""
+    with socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM) as conn:
+        conn.settimeout(10)
+        conn.connect((socket.VMADDR_CID_HOST, port))
+        conn.sendall((json.dumps(message) + '\n').encode())
+
+
 # ---------------------------------------------------------------- transport
 
 
@@ -510,7 +710,9 @@ def vsock_listener(port: int = VSOCK_PORT) -> socket.socket:
 
 
 def main() -> None:
-    serve(vsock_listener(), Agent())
+    settings = Settings()
+    threading.Thread(target=Reporter(settings, send_to_host).run, daemon=True).start()
+    serve(vsock_listener(), Agent(settings))
 
 
 if __name__ == '__main__':

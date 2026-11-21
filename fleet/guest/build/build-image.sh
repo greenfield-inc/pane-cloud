@@ -43,20 +43,26 @@ build_deps() {
 }
 
 build_kernel() {
-  local src="$work/linux-$KERNEL_VERSION" config="$work/microvm-kernel-ci-$fc_arch-6.1.config"
-  say "kernel $KERNEL_VERSION with Firecracker $FIRECRACKER_COMMIT's $fc_arch 6.1 guest config"
+  local src="$work/linux-$KERNEL_VERSION" fc="https://raw.githubusercontent.com/firecracker-microvm/firecracker/$FIRECRACKER_COMMIT/resources/guest_configs"
+  local base="$work/microvm-kernel-ci-$fc_arch-6.18.config" ci="$work/ci.config"
+  say "kernel $KERNEL_VERSION with Firecracker ${FIRECRACKER_COMMIT:0:12}'s $fc_arch 6.18 guest config, ci.config and kernel-hardening.config"
   [ -f "$work/linux.tar.xz" ] || fetch "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz" "$KERNEL_SHA256" "$work/linux.tar.xz"
-  fetch "https://raw.githubusercontent.com/firecracker-microvm/firecracker/$FIRECRACKER_COMMIT/resources/guest_configs/microvm-kernel-ci-$fc_arch-6.1.config" \
-    "$(pin KERNEL_CONFIG_SHA256)" "$config"
+  fetch "$fc/microvm-kernel-ci-$fc_arch-6.18.config" "$(pin KERNEL_CONFIG_SHA256)" "$base"
+  fetch "$fc/ci.config" "$KERNEL_CI_CONFIG_SHA256" "$ci"
   rm -rf "$src" && tar -xJf "$work/linux.tar.xz" -C "$work"
-  cp "$config" "$src/.config"
+  # As Firecracker's resources/rebuild.sh does: concatenate the fragments, later ones win.
+  awk 1 "$base" "$ci" "$here/kernel-hardening.config" >"$src/.config"
   make -C "$src" ARCH="$kernel_arch" olddefconfig >/dev/null
-  # The devices the fleet relies on must survive olddefconfig, built in (the config has no modules).
   local option
   for option in $REQUIRED_KERNEL_CONFIG; do
     grep -qx "CONFIG_$option=y" "$src/.config" || { echo "kernel config lacks CONFIG_$option=y" >&2; exit 1; }
   done
+  for option in $FORBIDDEN_KERNEL_CONFIG; do
+    if grep -q "^CONFIG_$option=" "$src/.config"; then echo "kernel config sets CONFIG_$option" >&2; exit 1; fi
+  done
   make -C "$src" ARCH="$kernel_arch" -j"$(nproc)" "$kernel_target" >/dev/null
+  # The module signing key is made for this build only and never kept: no module can be signed later.
+  rm -f "$src/certs/signing_key.pem" "$src/certs/signing_key.x509"
   cp "$src/$kernel_file" "$out/vmlinux-$KERNEL_VERSION"
   cp "$src/.config" "$out/config-$KERNEL_VERSION"
 }
@@ -89,13 +95,6 @@ build_rootfs() {
   fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-${kernel_arch/x86_64/x64}.tar.xz" "$(pin NODE_SHA256)" "$work/node.tar.xz"
   tar -xJf "$work/node.tar.xz" -C "$root/usr/local" --strip-components=1 --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md
 
-  say "Tailscale $TAILSCALE_VERSION from pkgs.tailscale.com"
-  fetch https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg "$TAILSCALE_KEYRING_SHA256" "$root/usr/share/keyrings/tailscale-archive-keyring.gpg"
-  echo 'deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main' \
-    >"$root/etc/apt/sources.list.d/tailscale.list"
-  in_root apt-get update -qq
-  in_root apt-get install -y -qq "tailscale=$TAILSCALE_VERSION" >/dev/null
-
   say "Pane $PANE_VERSION"
   fetch "https://github.com/greenfield-inc/Pane/releases/download/v$PANE_VERSION/Pane-$PANE_VERSION-linux-$arch.deb" \
     "$(pin PANE_DEB_SHA256)" "$root/tmp/pane.deb"
@@ -113,7 +112,9 @@ build_rootfs() {
   in_root chown -R pane:pane /home/pane
   # The Pane daemon is a user unit; linger starts pane's user manager at boot without a login.
   mkdir -p "$root/var/lib/systemd/linger" && touch "$root/var/lib/systemd/linger/pane"
-  in_root systemctl enable tailscaled.service pane-guest-agent.service pane-cloud-firstboot.service pane-cloud-tailnet.service
+  in_root systemctl enable pane-guest-agent.service pane-cloud-secrets.service pane-cloud-firstboot.service pane-cloud-daemon.service
+  # The secrets volume's mount point; pane-cloud-secrets.service makes it immutable until the volume is on it.
+  install -d -m 700 "$root/home/pane/.pane-secrets"
 
   say "Firecracker boot settings"
   # The host configures eth0 with the kernel's ip= argument; nothing in the guest manages it.

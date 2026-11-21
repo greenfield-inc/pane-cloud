@@ -1,9 +1,11 @@
 #!/bin/bash
-# Joins the machine to its user's tailnet, then sets up the Pane daemon. Runs on every boot.
-#   - Not joined: `tailscale up` with no auth key, as an untagged node. It waits until the user opens
-#     the login link, which the guest agent's status reports from `tailscale status --json` (AuthURL).
-#   - Joined, daemon not set up: Pane's own remote setup (#909's install-pane step), with
-#     workspaces.enabled so `runpane workspace` and `runpane handoff` reach this machine.
+# Runs the Pane daemon with phone access (relay pairing) on. Runs on every boot.
+#   - Daemon not set up: Pane's own remote setup with --prefer-tunnel ssh, which installs and starts
+#     the daemon as pane's user service and needs no tunnel (no Tailscale).
+#   - Then config.json gets workspaces.enabled (so `runpane workspace` and `runpane handoff` reach
+#     this machine) and remoteDaemon.relay.enabled (Pane's relay: QR codes and one-time links pair
+#     clients through runpane.net). The relay key is made on first use and stays in ~/.pane on the
+#     Session disk, so the machine keeps its relay id across stops and starts.
 # Logs to /var/log/pane-cloud/bootstrap.log (root only). The setup output carries a pane-remote://
 # connection code and may carry tunnel commands with secrets, so only its known status lines reach
 # the log and every other line is replaced before it is written anywhere.
@@ -16,18 +18,7 @@ umask 077
 install -d -m 700 /var/log/pane-cloud
 exec >>/var/log/pane-cloud/bootstrap.log 2>&1
 chmod 600 /var/log/pane-cloud/bootstrap.log
-say() { echo "$(date -u +%FT%TZ) tailnet: $*"; }
-
-backend_state() {
-  tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState") or "")' || true
-}
-
-if [ "$(backend_state)" != Running ]; then
-  say "waiting for the user to open the Tailscale login link"
-  # Blocks until the login completes. --operator lets Pane's setup run `tailscale serve` as pane.
-  tailscale up --hostname="$(hostname)" --ssh=false --operator=pane --qr=false
-fi
-say "joined as $(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"])')"
+say() { echo "$(date -u +%FT%TZ) daemon: $*"; }
 
 as_pane() {
   runuser -u pane -- env HOME=/home/pane XDG_RUNTIME_DIR="/run/user/$PANE_UID" \
@@ -41,18 +32,23 @@ if [ ! -f "$UNIT" ]; then
   keep='^(Pane remote (setup:|daemon setup)|Data directory:|Config:|Channel:|Service:|Config written:|Connection note:)'
   rc=0
   as_pane env ELECTRON_OZONE_PLATFORM_HINT=headless /opt/Pane/pane --ozone-platform=headless --disable-gpu \
-    --remote-setup --pane-dir "$PANE_DIR" --prefer-tunnel tailscale --auto-listen-port --label "$(hostname)" 2>&1 \
+    --remote-setup --pane-dir "$PANE_DIR" --prefer-tunnel ssh --auto-listen-port --label "$(hostname)" 2>&1 \
     | sed -E "/$keep/!{/^$/!s/.*/  [setup output line withheld]/;}" || rc=$?
   [ "$rc" -eq 0 ] || { say "Pane remote setup exited $rc"; exit 1; }
 fi
 
-# Workspaces are off by default for a daemon whose data dir is not the desktop's (bootstrap.ts).
+# Workspaces are off by default for a daemon whose data dir is not the desktop's (bootstrap.ts), and
+# phone access is off until something turns it on (relayService.ts).
 changed="$(as_pane python3 - "$PANE_DIR/config.json" <<'PY'
 import json, os, sys
 path = sys.argv[1]
 config = json.load(open(path)) if os.path.exists(path) else {}
-if (config.get("workspaces") or {}).get("enabled") is not True:
-    config["workspaces"] = {**(config.get("workspaces") or {}), "enabled": True}
+before = json.dumps(config, sort_keys=True)
+config["workspaces"] = {**(config.get("workspaces") or {}), "enabled": True}
+remote = config.get("remoteDaemon") or {}
+remote["relay"] = {**(remote.get("relay") or {}), "enabled": True}
+config["remoteDaemon"] = remote
+if json.dumps(config, sort_keys=True) != before:
     with open(path + ".tmp", "w") as out:
         json.dump(config, out, indent=2)
     os.replace(path + ".tmp", path)
@@ -60,4 +56,4 @@ if (config.get("workspaces") or {}).get("enabled") is not True:
 PY
 )"
 if [ "$changed" = changed ]; then as_pane systemctl --user restart pane-remote-daemon.service; fi
-say "Pane daemon running with workspaces enabled"
+say "Pane daemon running with workspaces and relay pairing on"
