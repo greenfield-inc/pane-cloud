@@ -2,7 +2,8 @@
 # CI only: boots the amd64 guest image under Firecracker's jailer on an x86_64 KVM host with a NAT'd
 # tap, a blank 64 MiB secrets volume and no entropy device, then talks to the guest agent over vsock
 # (CONNECT 1024) and listens for its reports (port 1025). It checks that
-#   - the guest agent answers `status` and the kernel runs with lockdown on and no virtio-rng,
+#   - the guest agent answers `status`, the kernel runs with lockdown on and measures memory stalls,
+#     and the root filesystem grows to the disk,
 #   - first boot installs the five agent CLIs (read from bootstrap.log via collect_diagnostics),
 #   - the secrets volume is formatted and mounted no-exec,
 #   - the Pane daemon answers with relay pairing ready: a computer id, a certificate and a fingerprint,
@@ -210,10 +211,12 @@ if log:
     stamps = {kind: at for at, kind in re.findall(r'^(\S+) firstboot: (start|done)', log, re.M)}
     to_s = lambda at: calendar.timegm(time.strptime(at, '%Y-%m-%dT%H:%M:%SZ'))
     print(f'     first boot took {to_s(stamps["done"]) - to_s(stamps["start"]):.0f}s ({stamps["start"]} to {stamps["done"]})', flush=True)
-    kernel = re.search(r'firstboot: (kernel .*)$', log, re.M)
+    kernel = re.search(r'identity: (kernel .*)$', log, re.M)
     print(f'     {kernel.group(1) if kernel else "no kernel line"}', flush=True)
     check('the kernel runs with lockdown in integrity mode', bool(kernel) and '[integrity]' in kernel.group(1))
-    check('the kernel has no virtio-rng', bool(kernel) and 'virtio' not in kernel.group(1))
+    check('the kernel measures memory stalls (/proc/pressure/memory)', bool(kernel) and ' psi on ' in kernel.group(1))
+    grown = re.search(r'identity: root filesystem uses the whole disk \((\S+)\)', log)
+    check(f'the root filesystem grew to the 16 GiB disk ({grown.group(1) if grown else "no line"})', bool(grown) and grown.group(1).startswith(('15G', '16G')))
     check('first boot finished with every agent CLI', 'agent CLIs installed' in log)
     results = dict(re.findall(r'^cli=(\S+) result=(\S+ version=.*)$', log, re.M))
     for cli in ('claude', 'codex', 'cursor', 'opencode', 'gemini'):
@@ -251,7 +254,7 @@ PY
 then echo "all boot checks passed"
 else
   echo "== serial console (last 60 lines)"; tail -60 "$console"
-  [ -f "$out/bootstrap.log" ] && { echo "== bootstrap.log, Pane Cloud lines"; grep -E ' (firstboot|secrets|daemon|ci): ' "$out/bootstrap.log"
+  [ -f "$out/bootstrap.log" ] && { echo "== bootstrap.log, Pane Cloud lines"; grep -E ' (identity|firstboot|secrets|daemon|ci): ' "$out/bootstrap.log"
                                    echo "== bootstrap.log, last 80 lines"; tail -80 "$out/bootstrap.log"; }
   exit 1
 fi

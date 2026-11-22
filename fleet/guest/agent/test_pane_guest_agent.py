@@ -285,6 +285,15 @@ class GuestAgentTest(unittest.TestCase):
         self.assertEqual(contents[self.path('var/log/pane-cloud/bootstrap.log').lstrip('/')], b'grew the disk\n')
         self.assertNotIn(b'SECRET', b''.join(contents.values()))
 
+    def test_collect_diagnostics_keeps_the_archive_under_8_mib(self):
+        for day in ('03', '04', '05'):
+            self.write(f'home/pane/.pane/logs/pane-2026-11-{day}.log', 'x' * (3 * 1024 ** 2))
+
+        result = self.send('collect_diagnostics', {})['result']
+
+        self.assertEqual([os.path.basename(f['path']) for f in result['files']], ['pane-2026-11-05.log', 'pane-2026-11-04.log'])
+        self.assertIn({'path': self.path('home/pane/.pane/logs/pane-2026-11-03.log'), 'reason': 'over the 8 MiB total'}, result['skipped'])
+
     def test_collect_diagnostics_refuses_a_symlinked_log_directory(self):
         self.write('etc/shadow', 'root:SECRET\n')
         os.makedirs(self.path('home/pane/.pane'))

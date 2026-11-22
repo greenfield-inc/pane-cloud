@@ -112,7 +112,8 @@ build_rootfs() {
   in_root chown -R pane:pane /home/pane
   # The Pane daemon is a user unit; linger starts pane's user manager at boot without a login.
   mkdir -p "$root/var/lib/systemd/linger" && touch "$root/var/lib/systemd/linger/pane"
-  in_root systemctl enable pane-guest-agent.service pane-cloud-secrets.service pane-cloud-firstboot.service pane-cloud-daemon.service
+  in_root systemctl enable pane-guest-agent.service pane-cloud-secrets.service pane-cloud-identity.service \
+    pane-cloud-firstboot.service pane-cloud-daemon.service
   # The secrets volume's mount point; pane-cloud-secrets.service makes it immutable until the volume is on it.
   install -d -m 700 "$root/home/pane/.pane-secrets"
 

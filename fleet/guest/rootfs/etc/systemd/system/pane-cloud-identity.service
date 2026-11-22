@@ -1,0 +1,11 @@
+[Unit]
+Description=Pane Cloud: grow the disk, set the hostname, log the kernel's hardening
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/pane-cloud/identity.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -55,6 +55,7 @@ MAX_DEB_BYTES = 1024 ** 3
 # A diagnostics archive carries at most the last 4 MiB of each file, so the response line stays bounded.
 MAX_DIAGNOSTIC_FILE_BYTES = 4 * 1024 ** 2
 MAX_DIAGNOSTIC_FILES = 16
+MAX_DIAGNOSTIC_TOTAL_BYTES = 8 * 1024 ** 2
 
 # The contract's DIAGNOSTIC_FILES (pane-cloud-contract src/fleet.ts). Globs match file names only.
 DIAGNOSTIC_FILES = (
@@ -308,6 +309,9 @@ class Agent:
                 except OperationError as refusal:
                     skipped.append({'path': path, 'reason': refusal.message})
                     continue
+                if sum(f['bytes'] for f in files) + len(data) > MAX_DIAGNOSTIC_TOTAL_BYTES:
+                    skipped.append({'path': path, 'reason': 'over the 8 MiB total'})
+                    continue
                 info = tarfile.TarInfo(path.lstrip('/'))
                 info.size = len(data)
                 info.mtime = int(time.time())
@@ -536,7 +540,7 @@ class Reporter:
                     processes.append(process)
         processes.sort(key=lambda p: p['pid'])
         # Forget programs nothing runs any more, so the cache stays as small as the process list.
-        live = {process.pop('_key') for process in processes}
+        live = {process.pop('_key') for process in processes} - {None}
         self._hashes = {key: value for key, value in self._hashes.items() if key in live}
         return {'type': 'process_report', 'at': utc_now(), 'bootId': self._boot_id(), 'processes': processes}
 
@@ -612,7 +616,10 @@ class Reporter:
                 uid = int(line.split()[1])
             elif line.startswith('VmRSS:'):
                 rss = int(line.split()[1]) * 1024
-        sha, key = self._program_sha256(os.path.join(base, 'exe'))
+        try:
+            sha, key = self._program_sha256(os.path.join(base, 'exe'))
+        except OSError:
+            sha, key = None, None  # one unreadable program leaves the rest of the report intact
         return {'pid': pid, 'ppid': int(fields[1]), 'uid': uid, 'name': name, 'exe': exe, 'sha256': sha,
                 'cpuSeconds': round((int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK'), 2),
                 'rssBytes': rss, '_key': key}
@@ -685,9 +692,12 @@ def serve(listener: socket.socket, agent: Agent) -> None:
     """Answers every connection on an already listening socket (AF_VSOCK in production, AF_UNIX in tests)."""
     while True:
         try:
-            conn, _ = listener.accept()
+            conn, peer = listener.accept()
         except OSError:
             return
+        if listener.family == getattr(socket, 'AF_VSOCK', None) and peer[0] != socket.VMADDR_CID_HOST:
+            conn.close()  # only the host may send operations, never a process inside the guest
+            continue
         threading.Thread(target=_serve_connection, args=(conn, agent), daemon=True).start()
 
 

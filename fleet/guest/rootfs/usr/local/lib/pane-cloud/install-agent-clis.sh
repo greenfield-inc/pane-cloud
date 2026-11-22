@@ -25,7 +25,9 @@ for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gem
   name="${entry%%:*}" cmd="${entry#*:}" result=present
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "cli=$name installing"
-    if "install_$name" </dev/null && command -v "$cmd" >/dev/null 2>&1; then result=installed; else result=failed; fi
+    # Each installer gets 5 minutes, so one stalled vendor download can't hold first boot past its limit.
+    if timeout 300 bash -c "$(declare -p CURL); $(declare -f "install_$name"); install_$name" </dev/null \
+      && command -v "$cmd" >/dev/null 2>&1; then result=installed; else result=failed; fi
   fi
   version="$(timeout 60 "$cmd" --version 2>/dev/null </dev/null | head -1 || true)"
   [ "$result" = failed ] && missing=1

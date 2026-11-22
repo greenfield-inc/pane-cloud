@@ -38,7 +38,7 @@ agent's `update_pane` still fetches the arm64 `.deb`, so an amd64 machine cannot
   release date and SHA-256. The build removes cloud-init, installs git, Python 3, Node (official
   tarball, SHA-256 checked) and Pane (the release `.deb`, SHA-256 checked). It adds the `pane` user
   (uid 1000), who owns `/home/pane`, and enables the units below. The template is a small ext4 file;
-  the host gives each machine its Session disk and first boot grows the filesystem to fill it.
+  the host gives each machine its Session disk and every boot grows the filesystem to fill it.
 - **Kernel.** The kernel probe P1 booted in Nitro Sandboxes: Linux 6.18.62 with Firecracker's own
   `microvm-kernel-ci-aarch64-6.18.config` and `ci.config` at commit `6d7cfa9c6b53`, the commit that
   built P1's `vmlinux-6.18.62`. The build compiles it from kernel.org's tarball rather than reusing
@@ -51,7 +51,8 @@ agent's `update_pane` still fetches the arm64 `.deb`, so an amd64 machine cannot
 
   The build fails if `olddefconfig` drops anything in `REQUIRED_KERNEL_CONFIG` (vsock, balloon,
   ext4, virtio-blk, virtio-net, kernel `ip=`, tun, nftables, pressure stall information, lockdown,
-  module signing) or keeps `HW_RANDOM_VIRTIO`.
+  module signing) or keeps `HW_RANDOM_VIRTIO`, `VSOCKETS_LOOPBACK` or `PSI_DEFAULT_DISABLED`
+  (Firecracker's config leaves memory stall measurement off unless booted with `psi=1`).
 - **Networking.** The host configures `eth0` with the kernel's `ip=` argument, so systemd-networkd
   and resolved are masked, and `/etc/resolv.conf` points at `/proc/net/pnp`, where the kernel lists
   the `ip=` argument's DNS server.
@@ -61,27 +62,33 @@ agent's `update_pane` still fetches the arm64 `.deb`, so an amd64 machine cannot
 | Drive | In the guest | What it is |
 | --- | --- | --- |
 | First (root) | `/dev/vda` at `/` | The Session disk: the image, grown to the disk's size at first boot |
-| Second | `/dev/vdb` at `/home/pane/.pane-secrets` | The secrets volume (64 MiB, D-58): Pane secrets and agent sign-ins |
+| Second | `/dev/vdb` at `/home/pane/.pane-secrets` | The secrets volume (64 MiB, D-58): Pane's secrets |
 
-The secrets volume is mounted `nodev,nosuid,noexec`, owned by `pane`, mode 0700. A blank volume is
-formatted ext4 with the label `pane-secrets` on its first boot. A second drive larger than 1 GiB, or
-holding anything but that filesystem, is refused and left alone. While nothing is mounted there, the
+The secrets volume is mounted `nodev,nosuid,noexec`, owned by `pane`, mode 0700. A volume of all
+zeros is formatted ext4 with the label `pane-secrets` on its first boot. A second drive larger than
+1 GiB, or holding anything but that filesystem (a damaged one included), is refused and left alone. While nothing is mounted there, the
 empty mount point is root's and immutable, so nothing meant for the secrets volume can land on the
-Session disk. The Pane daemon gets the path as `PANE_SECRETS_DIR` (K1 stores Pane's secrets there).
+Session disk. The Pane daemon gets the path as `PANE_SECRETS_DIR` (K1 stores Pane's secrets there,
+including the Claude Code token and the GitHub token it carries). Sign-in files that agent CLIs
+write themselves, such as Codex's `~/.codex/auth.json` after a ChatGPT sign-in or `gh auth login`'s
+`~/.config/gh/hosts.yml`, still land on the Session disk: nothing points them at the volume yet.
 Nothing in this image lists or reads the volume's files, and the process report never opens it.
 
 ## Boot
 
-Four system units, all enabled in the image:
+Five system units, all enabled in the image:
 
 1. **`pane-cloud-secrets.service`** (`secrets-volume.sh`, oneshot). Mounts the secrets volume, before
    `pane`'s user manager starts.
-2. **`pane-cloud-firstboot.service`** (`firstboot.sh`, oneshot). Grows the root filesystem, sets the
-   hostname to `pane-<first 8 of the machine id>`, logs the kernel's lockdown mode and entropy
-   devices, and installs the agent CLIs as `pane` (`install-agent-clis.sh`). It runs on every boot
-   and every step is idempotent, so a CLI that failed to install is retried on the next boot. It
-   leaves `firstboot.done` or `firstboot.failed` in `/var/lib/pane-cloud`.
-3. **`pane-cloud-daemon.service`** (`pane-daemon.sh`, oneshot). The first time, it runs Pane's own
+2. **`pane-cloud-identity.service`** (`identity.sh`, oneshot, quick). Grows the root filesystem with
+   ext4's online-resize ioctl (the kernel refuses `resize2fs`'s writes to a mounted disk), sets the
+   hostname to `pane-<first 8 of the machine id>`, and logs the kernel's lockdown mode, whether it
+   measures memory stalls, and its entropy devices.
+3. **`pane-cloud-firstboot.service`** (`firstboot.sh`, oneshot). Installs the agent CLIs as `pane`
+   (`install-agent-clis.sh`), giving each vendor installer 5 minutes. It runs on every boot and is
+   idempotent, so a CLI that failed to install is retried on the next boot. It leaves
+   `firstboot.done` or `firstboot.failed` in `/var/lib/pane-cloud`. Nothing waits for it.
+4. **`pane-cloud-daemon.service`** (`pane-daemon.sh`, oneshot). The first time, it runs Pane's own
    remote setup (`pane --remote-setup --prefer-tunnel ssh`, which installs and starts the daemon as
    `pane`'s user service and needs no tunnel) with `--pane-dir /home/pane/.pane`, so Pane's logs land
    where the contract's `DIAGNOSTIC_FILES` expects them. On every boot it makes sure that
@@ -89,7 +96,7 @@ Four system units, all enabled in the image:
    reach the machine) and `remoteDaemon.relay.enabled` (relay pairing), and restarts the daemon if
    either changed. The setup prints a `pane-remote://` connection code. Only its status lines reach
    the log; every other line is replaced before it is written, so the code never touches disk.
-4. **`pane-guest-agent.service`**, the guest agent.
+5. **`pane-guest-agent.service`**, the guest agent. It restarts however often it crashes.
 
 The relay key is made the first time the relay starts and kept in `~/.pane` on the Session disk, so
 the machine keeps its relay id across stops and starts. Clients pair with the id and key
@@ -127,7 +134,9 @@ parity grid name `gemini --yolo`.
 ## Guest agent
 
 `pane_guest_agent.py` runs as root. It listens on `AF_VSOCK` port 1024 for the host agent's
-operations, and connects to the host (CID 2) on port 1025 to send its reports.
+operations and closes any connection that does not come from the host (CID 2). The kernel has no
+vsock loopback either, so no process inside the guest can reach it. It connects to the host (CID 2)
+on port 1025 to send its reports.
 
 ### Operations (port 1024)
 
@@ -164,7 +173,7 @@ guest needs no way to write anywhere the host reads:
 
 The host agent checks `sha256`, uploads the archive to the diagnostics bucket, and answers the
 service with the contract's `{ files, archiveKey }`. Each file contributes at most its last 4 MiB,
-and at most 16 files are read. The `pane-*.log` glob matches names inside
+at most 16 files are read, and a file that would take the total past 8 MiB is skipped. The `pane-*.log` glob matches names inside
 `/home/pane/.pane/logs` only. Every directory on the way is opened without following symlinks,
 each file is opened with `O_NOFOLLOW` and must be a regular file, and a file under `/home` must have
 one link, so the `pane` user cannot point the root-run agent at another file.
@@ -262,7 +271,7 @@ The `boot` job builds the amd64 image on `ubuntu-24.04`, runs `check-image.sh`, 
 checks:
 
 - the guest agent answers `status`, and a process report arrives on port 1025;
-- the kernel logs lockdown `[integrity]` and no virtio-rng;
+- the kernel logs lockdown `[integrity]` and memory stall measurement on, and the root filesystem grew to the disk;
 - each of the five CLIs installed and runs `--version`;
 - the blank secrets volume is formatted and mounted no-exec, a program copied there does not run,
   and `status` reports it `mounted`;

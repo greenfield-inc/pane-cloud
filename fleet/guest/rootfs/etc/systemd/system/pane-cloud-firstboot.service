@@ -1,7 +1,7 @@
 [Unit]
-Description=Pane Cloud first boot: grow the disk, set the hostname, install the agent CLIs
+Description=Pane Cloud first boot: install the agent CLIs
 Wants=network-online.target
-After=network-online.target
+After=network-online.target pane-cloud-identity.service
 
 [Service]
 Type=oneshot

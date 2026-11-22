@@ -54,10 +54,10 @@ mount -o loop,ro "$image" "$lower"
 mount -t overlay overlay -o "lowerdir=$lower,upperdir=$work/upper,workdir=$work/work" "$root"
 
 lib=/usr/local/lib/pane-cloud
-for file in $lib/firstboot.sh $lib/secrets-volume.sh $lib/pane-daemon.sh $lib/install-agent-clis.sh $lib/pane_guest_agent.py; do
+for file in $lib/identity.sh $lib/firstboot.sh $lib/secrets-volume.sh $lib/pane-daemon.sh $lib/install-agent-clis.sh $lib/pane_guest_agent.py; do
   check "$file is executable" test -x "$lower$file"
 done
-for unit in pane-cloud-firstboot pane-cloud-secrets pane-cloud-daemon pane-guest-agent; do
+for unit in pane-cloud-identity pane-cloud-firstboot pane-cloud-secrets pane-cloud-daemon pane-guest-agent; do
   check "$unit.service is enabled" test -L "$lower/etc/systemd/system/multi-user.target.wants/$unit.service"
 done
 for unit in systemd-networkd systemd-networkd-wait-online systemd-resolved; do
