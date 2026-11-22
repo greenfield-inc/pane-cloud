@@ -8,7 +8,7 @@
 #   - the secrets volume is formatted and mounted no-exec,
 #   - the Pane daemon answers with relay pairing ready: a computer id, a certificate and a fingerprint,
 #   - the process report names a program called xmrig, with its hash,
-#   - the running Pane daemon has PANE_CLOUD_VM=1, and the pane user can't remove or change the
+#   - the Pane daemon's unit runs it with PANE_CLOUD_VM=1, and the pane user can't remove or change the
 #     cloud VM marker /etc/pane-cloud/cloud-vm,
 #   - Claude Code answers a prompt, when CLAUDE_CODE_OAUTH_TOKEN is set.
 # The last three need something run inside the guest, which the guest agent never does: this script
@@ -80,19 +80,13 @@ else
 fi
 unit=/home/pane/.config/systemd/user/pane-remote-daemon.service
 for _ in $(seq 1 120); do [ -f "$unit" ] && break; sleep 1; done
-pid=0
-for _ in $(seq 1 60); do
-  pid="$(systemctl --machine=pane@ --user show -p MainPID --value pane-remote-daemon.service 2>/dev/null || echo 0)"
-  [ "${pid:-0}" -gt 0 ] && break; sleep 1
-done
-if [ "${pid:-0}" -gt 0 ] && tr '\0' '\n' <"/proc/$pid/environ" | grep -qx 'PANE_CLOUD_VM=1'; then
+# systemd's view of the unit: Electron overwrites its own /proc/<pid>/environ, so the process can't be read.
+environment="$(systemctl --machine=pane@ --user show -p Environment --value pane-remote-daemon.service 2>/dev/null)"
+if systemctl --machine=pane@ --user is-active --quiet pane-remote-daemon.service \
+  && tr ' ' '\n' <<<"$environment" | grep -qx 'PANE_CLOUD_VM=1'; then
   say "daemon PANE_CLOUD_VM=1 yes"
 else
-  say "daemon PANE_CLOUD_VM=1 no (pid ${pid:-none})"
-  # Names only, never values: what the unit loaded and what the process got.
-  say "daemon unit: $(systemctl --machine=pane@ --user show -p DropInPaths -p FragmentPath pane-remote-daemon.service 2>&1 | tr '\n' ' ')"
-  say "daemon env names: $(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | cut -d= -f1 | tr '\n' ' ')"
-  say "daemon cmd: $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-120)"
+  say "daemon PANE_CLOUD_VM=1 no: $(systemctl --machine=pane@ --user show -p DropInPaths pane-remote-daemon.service 2>&1)"
 fi
 
 if [ -s /var/lib/pane-ci/claude-token ]; then
@@ -254,7 +248,7 @@ if log:
           'secrets: formatted the blank secrets volume' in log and 'secrets: mounted at /home/pane/.pane-secrets (nodev,nosuid,noexec)' in log)
     check('a program on the secrets volume does not run', 'secrets volume noexec=yes' in log)
     check('the pane user cannot remove or change /etc/pane-cloud/cloud-vm', 'cloud vm marker held=yes' in log)
-    check('the running Pane daemon has PANE_CLOUD_VM=1', 'daemon PANE_CLOUD_VM=1 yes' in log)
+    check("the Pane daemon's unit runs it with PANE_CLOUD_VM=1", 'daemon PANE_CLOUD_VM=1 yes' in log)
     claude = re.search(r' ci: claude (.*)$', log, re.M).group(1)
     if have_token:
         check(f'Claude Code answers a prompt in the guest ({claude[:120]})', 'pane-cloud-ok' in claude)

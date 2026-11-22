@@ -282,7 +282,7 @@ checks:
   and `status` reports it `mounted`;
 - the Pane daemon reaches relay `ready` with a computer id and fingerprint (certificates from Let's
   Encrypt's staging CA, so CI never spends the limits Pane's users share);
-- the running Pane daemon has `PANE_CLOUD_VM=1`, and the `pane` user cannot remove, rewrite, move
+- the Pane daemon's unit, as systemd loaded it, runs the daemon with `PANE_CLOUD_VM=1`, and the `pane` user cannot remove, rewrite, move
   or re-mode `/etc/pane-cloud/cloud-vm`;
 - a process report names `xmrig` with the program's hash. The stand-in is a copy of `sleep` named
   `xmrig`, because GitHub forbids mining on Actions;
