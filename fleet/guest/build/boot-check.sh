@@ -89,6 +89,10 @@ if [ "${pid:-0}" -gt 0 ] && tr '\0' '\n' <"/proc/$pid/environ" | grep -qx 'PANE_
   say "daemon PANE_CLOUD_VM=1 yes"
 else
   say "daemon PANE_CLOUD_VM=1 no (pid ${pid:-none})"
+  # Names only, never values: what the unit loaded and what the process got.
+  say "daemon unit: $(systemctl --machine=pane@ --user show -p DropInPaths -p FragmentPath pane-remote-daemon.service 2>&1 | tr '\n' ' ')"
+  say "daemon env names: $(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | cut -d= -f1 | tr '\n' ' ')"
+  say "daemon cmd: $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-120)"
 fi
 
 if [ -s /var/lib/pane-ci/claude-token ]; then
