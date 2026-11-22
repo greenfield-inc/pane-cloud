@@ -1,0 +1,2 @@
+# This machine is a Pane Cloud VM. The Pane daemon reads this file (Pane main/src/daemon/relay/cloudVm.ts)
+# and refuses to store tokens for the person's other computers. Owned by root so the pane user cannot remove it.
