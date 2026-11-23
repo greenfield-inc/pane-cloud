@@ -1,0 +1,20 @@
+# The one first-boot unit (D-115), the guest agent's code, as root. overlay-init has already mounted the
+# root, the Pane drive and the secrets volume and made the machine's ids, so this needs only local
+# filesystems and the secrets volume: it unseals the GitHub token when the host sealed one (a few
+# milliseconds; never logged), then starts the Pane daemon and the clone together. Nothing on this path
+# waits for the network (the kernel's ip= argument brought it up before systemd; the clone waits for DNS
+# itself), for the pane user's manager, or for any other unit. It runs on every boot: the daemon is
+# started here, and the clone unit skips itself once its work is done.
+[Unit]
+Description=Pane Cloud: first boot, then the Pane daemon and the clone together
+DefaultDependencies=no
+After=local-fs.target
+ConditionPathIsMountPoint=/home/pane/.pane-secrets
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/pane_guest_agent.py first-boot
+
+[Install]
+WantedBy=multi-user.target

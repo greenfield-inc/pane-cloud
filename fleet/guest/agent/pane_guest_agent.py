@@ -14,8 +14,8 @@ Reports, to the host (CID 2) on vsock port 1025: one JSON line per connection, n
   {"type": "process_report", ...}   at start, then every 5 minutes
   {"type": "memory_pressure", ...}  when the kernel shows memory pressure, checked every 5 seconds
   {"type": "clone", "status": <CloneStatus>, "history": ...}  each change in the Session's first clone
-Run as `pane_guest_agent.py unseal-github-token`, it unseals the GitHub token once at first boot
-(pane-cloud-unseal.service; see unseal_github_token).
+Run as `pane_guest_agent.py first-boot`, it is the one first-boot unit (pane-cloud-boot.service): it
+unseals the GitHub token and starts the Pane daemon and the clone together (see first_boot).
 Python 3 standard library only.
 """
 
@@ -850,6 +850,18 @@ def unseal_github_token(settings: Settings) -> None:
         store_github_token(settings, sealed.read(), key.read())
 
 
+def first_boot(settings: Settings, system: System) -> None:
+    """The one first-boot unit's work (D-115), as root, once overlay-init has mounted everything and made
+    the machine's ids: unseal the GitHub token when one is sealed (milliseconds), then start the Pane
+    daemon and the clone together. A token that does not open is logged without its content and does not
+    stop either: the clone then reports git's sign-in error, which a retry can fix."""
+    try:
+        unseal_github_token(settings)
+    except (OSError, ValueError, ImportError) as refusal:
+        print(f'first boot: the GitHub token was not unsealed: {refusal}', file=sys.stderr)
+    system.run(['systemctl', 'start', '--no-block', PANE_DAEMON_UNIT, CLONE_UNIT], timeout=30)
+
+
 def copy_clone_request(settings: Settings) -> None:
     """Hands the clone unit (run as pane) the host's root-only pane-cloud/clone.json ({url, branch}),
     as root, before each run of the clone. The host's copy stays for retry_clone."""
@@ -969,8 +981,8 @@ def vsock_listener(port: int = VSOCK_PORT) -> socket.socket:
 
 def main() -> None:
     settings = Settings()
-    if sys.argv[1:] == ['unseal-github-token']:
-        unseal_github_token(settings)
+    if sys.argv[1:] == ['first-boot']:
+        first_boot(settings, System())
         return
     if sys.argv[1:] == ['copy-clone-request']:
         copy_clone_request(settings)

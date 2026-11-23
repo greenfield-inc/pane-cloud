@@ -95,7 +95,7 @@ lib=/usr/local/lib/pane-cloud
 for file in $lib/overlay-init $lib/identity.sh $lib/pane_guest_agent.py $lib/clone.py $lib/git-credential-clone; do
   check "$file is executable" test -x "$lower$file"
 done
-for unit in pane-cloud-identity pane-daemon pane-cloud-unseal pane-cloud-clone pane-guest-agent; do
+for unit in pane-cloud-identity pane-cloud-boot pane-guest-agent; do
   check "$unit.service is enabled" test -L "$lower/etc/systemd/system/multi-user.target.wants/$unit.service"
 done
 for unit in systemd-networkd systemd-networkd-wait-online systemd-resolved; do
@@ -104,6 +104,10 @@ done
 check "Pane's config has workspaces and relay pairing on" python3 -I -c \
   'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(0 if c["workspaces"]["enabled"] and c["remoteDaemon"]["relay"]["enabled"] else 1)' \
   "$lower/home/pane/.pane/config.json"
+check "the image bakes no machine or analytics id into Pane's state (Pane makes its own on first start)" python3 -I -c \
+  'import json,sys; c=json.load(open(sys.argv[1])); a=c.get("analytics") or {}; sys.exit(1 if c.get("machineId") or a.get("installId") or a.get("distinctId") else 0)' \
+  "$lower/home/pane/.pane/config.json"
+check "no relay key or secrets baked into Pane's state" bash -c "[ ! -e '$lower/home/pane/.pane/secrets.json' ] && [ ! -e '$lower/home/pane/.pane/relay' ]"
 check "overlay-init's mount points exist" test -d "$lower/mnt/session" -a -d "$lower/mnt/root" -a -d "$lower/mnt/base"
 check "pane is uid 1000" grep -q '^pane:x:1000:1000:' "$lower/etc/passwd"
 check "pane owns /home/pane" test "$(stat -c %u:%g "$lower/home/pane")" = 1000:1000

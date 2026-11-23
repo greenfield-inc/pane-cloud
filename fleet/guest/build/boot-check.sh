@@ -135,6 +135,7 @@ as_pane "$runpane" repos list --json >/dev/null 2>&1; first_rc=$?
 first="$(up)"
 timeline="boot=$boot kernel_to_init=$(systemctl show -p UserspaceTimestampMonotonic --value | awk '{printf "%.3f", $1/1000000}')"
 timeline+=" sysinit=$(at sysinit.target ActiveEnterTimestampMonotonic)"
+timeline+=" boot_unit=$(at pane-cloud-boot.service ExecMainStartTimestampMonotonic) clone_start=$(at pane-cloud-clone.service ExecMainStartTimestampMonotonic)"
 timeline+=" daemon_start=$(at pane-daemon.service ExecMainStartTimestampMonotonic) socket=$socket first_runpane=$first first_rc=$first_rc"
 
 if [ "$boot" = 1 ]; then
@@ -474,6 +475,7 @@ timeline = dict(re.findall(r'(\w+)=(\S*)', line(log, 'timeline', int(boot)) or '
 f = lambda key: float(timeline[key]) if timeline.get(key, '').replace('.', '', 1).isdigit() else None
 print(f'     boot {boot} timeline, seconds since the guest kernel started:', flush=True)
 for key, what in (('kernel_to_init', 'kernel hands over to init (overlay-init, then systemd)'), ('sysinit', 'sysinit.target'),
+                  ('boot_unit', 'the first-boot unit started'), ('clone_start', 'the clone unit started'),
                   ('daemon_start', 'Pane daemon process started'), ('socket', "Pane daemon's control socket answers"),
                   ('first_runpane', 'first runpane call returns'), ('repo_added', 'repository registered'),
                   ('pane_created', 'Pane created with a terminal panel'), ('node_done', 'the panel ran node -v'),
@@ -481,8 +483,9 @@ for key, what in (('kernel_to_init', 'kernel hands over to init (overlay-init, t
     if key in timeline:
         print(f'       {timeline[key]:>8}  {what}', flush=True)
 if f('sysinit') is not None and f('daemon_start') is not None and f('socket') is not None:
-    print(f"     budget: kernel to sysinit {f('sysinit'):.3f} s (target 0.3); sysinit to daemon start "
-          f"{f('daemon_start') - f('sysinit'):.3f} s (target 0.1); daemon start to socket {f('socket') - f('daemon_start'):.3f} s (target 0.6 with Pane's fast start)", flush=True)
+    print(f"     budget: kernel to init {f('kernel_to_init'):.3f} s; init to the daemon's unit {f('daemon_start') - f('kernel_to_init'):.3f} s "
+          f"(target 0.1, run 1c 1.56); daemon start to socket {f('socket') - f('daemon_start'):.3f} s (run 1c 2.40; Pane's fast start); "
+          f"kernel to sysinit {f('sysinit'):.3f} s (target 0.3)", flush=True)
 for prefix in ('systemd-analyze', 'critical-chain'):
     print(f'     {prefix}: {(line(log, prefix, int(boot)) or "none")[:600]}', flush=True)
 with open(f'{out}/timeline-{boot}.json', 'w') as saved:

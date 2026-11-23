@@ -1,5 +1,5 @@
-# The Session's first clone (D-107), started as soon as systemd can, beside the Pane daemon: the
-# kernel's ip= argument brought the network up before systemd. The repository comes from the secrets
+# The Session's first clone (D-107), started by pane-cloud-boot.service together with the Pane daemon:
+# the kernel's ip= argument brought the network up before systemd, and the clone waits for DNS itself. The repository comes from the secrets
 # volume, where the host wrote it before launch (pane-cloud/clone.json, root-only); without it there is
 # nothing to clone. A private repository's token is the one-shot unseal's pane-cloud/clone-token on the
 # secrets volume. Once the clone has made its Pane, a later boot only resumes the history fetch if a sleep cut it
@@ -8,8 +8,7 @@
 Description=Pane Cloud: clone the Session's repository and create its Pane
 DefaultDependencies=no
 ConditionPathIsMountPoint=/home/pane/.pane-secrets
-Wants=pane-cloud-unseal.service
-After=local-fs.target pane-cloud-unseal.service
+After=local-fs.target pane-cloud-boot.service
 Conflicts=shutdown.target
 Before=shutdown.target
 ConditionPathExists=/home/pane/.pane-secrets/pane-cloud/clone.json
@@ -34,6 +33,3 @@ ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/clone.py
 # stays, for a history fetch resumed after a sleep. The Pane daemon's own sign-in takes over.
 ExecStopPost=+/bin/sh -c 'cd /home/pane/.pane-secrets/pane-cloud || exit 0; [ ! -e /var/lib/pane-cloud-clone/done ] || rm -f github-token.sealed seal.key; [ ! -e /var/lib/pane-cloud-clone/history-done ] || rm -f clone-token'
 TimeoutStartSec=infinity
-
-[Install]
-WantedBy=multi-user.target

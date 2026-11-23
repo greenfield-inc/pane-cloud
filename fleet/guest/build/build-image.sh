@@ -131,8 +131,8 @@ build_rootfs() {
   in_root git lfs install --system --skip-repo >/dev/null
   in_root chown -R pane:pane /home/pane
   chmod 700 "$root/home/pane/.pane"
-  in_root systemctl enable pane-guest-agent.service pane-cloud-identity.service \
-    pane-daemon.service pane-cloud-unseal.service pane-cloud-clone.service
+  # pane-cloud-boot.service starts the Pane daemon and the clone.
+  in_root systemctl enable pane-guest-agent.service pane-cloud-identity.service pane-cloud-boot.service
   # The secrets volume's mount point; overlay-init makes it immutable until the volume is on it.
   install -d -m 700 "$root/home/pane/.pane-secrets"
   # overlay-init's mount points: the Session disk, the overlay root, and the base after pivot_root.

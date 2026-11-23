@@ -15,7 +15,7 @@ import threading
 import time
 import unittest
 
-from pane_guest_agent import MACHINE_ARCH, READY_PORT, Agent, CloneReporter, Reporter, Settings, System, copy_clone_request, serve, signal_ready, unseal_github_token
+from pane_guest_agent import MACHINE_ARCH, READY_PORT, Agent, CloneReporter, Reporter, Settings, System, copy_clone_request, first_boot, serve, signal_ready, unseal_github_token
 
 SHA256_OF_ABC = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
 RELEASE = {'version': '2.4.215', 'arch': MACHINE_ARCH, 'debSha256': SHA256_OF_ABC}
@@ -573,6 +573,28 @@ class UnsealTest(unittest.TestCase):
             self.assertEqual(json.load(request), {'url': 'https://github.com/owner/repo.git', 'branch': 'main'})
         self.assertEqual(self.mode(f'{self.root}/run/pane-cloud-clone/request.json'), 0o600)
         self.assertTrue(os.path.exists(f'{self.root}/secrets/pane-cloud/clone.json'))
+
+    def test_first_boot_unseals_then_starts_the_daemon_and_the_clone_together(self):
+        system = FakeSystem()
+        self.seal(json.dumps(self.RECORD).encode()) if importlib.util.find_spec('nacl') else None
+
+        first_boot(self.settings, system)
+
+        self.assertEqual(system.commands, [['systemctl', 'start', '--no-block', 'pane-daemon.service', 'pane-cloud-clone.service']])
+        if importlib.util.find_spec('nacl'):
+            self.assertTrue(os.path.exists(self.settings.clone_token))
+
+    def test_first_boot_starts_both_even_when_the_token_does_not_open(self):
+        with open(f'{self.root}/secrets/pane-cloud/github-token.sealed', 'w') as out:
+            out.write('not-a-sealed-box')
+        with open(f'{self.root}/secrets/pane-cloud/seal.key', 'wb') as out:
+            out.write(b'\0' * 32)
+        system = FakeSystem()
+
+        first_boot(self.settings, system)
+
+        self.assertEqual(system.commands, [['systemctl', 'start', '--no-block', 'pane-daemon.service', 'pane-cloud-clone.service']])
+        self.assertFalse(os.path.exists(self.settings.clone_token))
 
     def test_a_public_repository_has_nothing_to_unseal(self):
         unseal_github_token(self.settings)

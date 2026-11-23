@@ -1,8 +1,7 @@
-# The Pane daemon, run as pane, started as early as the unit graph allows: once local filesystems are
-# there (overlay-init already mounted the root, the Pane drive and the secrets volume and set the
-# hostname). It starts only with the secrets volume mounted, where Pane keeps its secrets, and after the
-# first boot's token unseal, which is skipped when nothing is sealed. It waits for nothing else: not
-# sysinit, basic.target or the network; the relay connects when the network comes up. /opt/Pane is the Pane drive when the host attaches one. update_pane points
+# The Pane daemon, run as pane, started by pane-cloud-boot.service together with the clone, as early as
+# boot allows: overlay-init already mounted the root, the Pane drive and the secrets volume and set the
+# hostname. It runs only with the secrets volume mounted, where Pane keeps its secrets. It waits for
+# nothing else: not sysinit, basic.target or the network; the relay connects when the network is up. /opt/Pane is the Pane drive when the host attaches one. update_pane points
 # a running machine at a newer Pane with a drop-in in /run, gone at the next boot.
 # Agent panels inherit this environment: the agent CLIs on PATH, resuming after a stop, and Pane's
 # secrets on the secrets volume (K1). Sign-in files the agent CLIs write themselves
@@ -11,8 +10,7 @@
 Description=Pane daemon
 DefaultDependencies=no
 ConditionPathIsMountPoint=/home/pane/.pane-secrets
-Wants=pane-cloud-unseal.service
-After=local-fs.target pane-cloud-unseal.service
+After=local-fs.target pane-cloud-boot.service
 Conflicts=shutdown.target
 Before=shutdown.target
 
@@ -34,6 +32,3 @@ Environment=PANE_SECRETS_DIR=/home/pane/.pane-secrets
 ExecStart=/opt/Pane/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane
 Restart=always
 RestartSec=1
-
-[Install]
-WantedBy=multi-user.target

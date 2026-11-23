@@ -140,8 +140,22 @@ def git(argv: list[str], state: State | None = None, low_priority: bool = False)
     return '\n'.join(errors)[-2000:] or f'git {argv[0]} exited {child.returncode}'
 
 
+def wait_for_dns(url: str, seconds: float = 120) -> None:
+    """Waits until the repo's host resolves: the clone starts beside the daemon, without waiting for the
+    network to be declared online, so the first lookups may come before DNS answers."""
+    host = re.sub(r'^[a-z]+://|[/:].*$', '', re.sub(r'^[^@/]+@', '', url.split('://', 1)[-1]))
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            socket.getaddrinfo(host, 443)
+            return
+        except OSError:
+            time.sleep(0.05)
+
+
 def clone(url: str, branch: str | None, dest: str, state: State) -> str | None:
     """The shallow clone: the newest commit of the branch and its files, submodules alike."""
+    wait_for_dns(url)
     argv = ['clone', '--progress', '--depth=1', '--recurse-submodules', '--shallow-submodules']
     return git(argv + (['--branch', branch] if branch else []) + ['--', url, dest], state)
 
