@@ -1,16 +1,20 @@
 #!/bin/sh
-# PID 1 before systemd (kernel argument init=/usr/local/lib/pane-cloud/overlay-init): makes the root
-# an overlay of the read-only base (/dev/vda, booted with root=/dev/vda ro) and the Session disk
-# (/dev/vdb, ext4 labelled pane-session, made by the host), mounts the newest Pane drive over
-# /opt/Pane, then hands over to systemd.
-#   /                 the overlay: the base below, the Session disk's upper/ above
-#   /mnt/base         the base, read-only
-#   /mnt/session      the Session disk (upper/ and work/ live here)
-#   /opt/Pane         the Pane drive (/dev/vdd, ext4 labelled pane-app, read-only) when the host
-#                     attaches one; otherwise the base's own Pane from its .deb
+# PID 1 before systemd (kernel argument init=/usr/local/lib/pane-cloud/overlay-init): the whole of a
+# machine's own setup in one short pass, so systemd can start the Pane daemon, the clone and the guest
+# agent at once with nothing left to wait for:
+#   /                      an overlay of the read-only base (/dev/vda, booted with root=/dev/vda ro) below
+#                          and the Session disk (/dev/vdb, ext4 labelled pane-session, made by the host)
+#                          above; the base stays at /mnt/base, the Session disk at /mnt/session
+#   /opt/Pane              the Pane drive (/dev/vdd, ext4 labelled pane-app, read-only) when the host
+#                          attaches one; otherwise the base's own Pane from its .deb
+#   /home/pane/.pane-secrets  the secrets volume (/dev/vdc, ext4 labelled pane-secrets, made by the host),
+#                          nodev,nosuid,noexec, pane's, 0700. Anything else is refused and never
+#                          formatted; the empty mount point stays root's and immutable, and the Pane
+#                          daemon, which requires the volume, does not start.
+#   /etc/machine-id, the hostname   made on a Session's first boot (pane-<first 8 of the machine id>)
 # A Pane that update_pane unpacked into /var/lib/pane-cloud/hot during the last boot is deleted: this
-# boot runs the Pane drive. The kernel has already mounted devtmpfs on /dev. Nothing here writes to
-# the base.
+# boot runs the Pane drive. Logs to /var/log/pane-cloud/bootstrap.log. The kernel has already mounted
+# devtmpfs on /dev. Nothing here writes to the base.
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 fail() {
@@ -25,14 +29,52 @@ mount -t ext4 -o noatime,noinit_itable /dev/vdb /mnt/session || fail "cannot mou
 mkdir -p /mnt/session/upper /mnt/session/work
 mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/session/upper,workdir=/mnt/session/work /mnt/root \
   || fail "cannot mount the overlay root"
-rm -rf /mnt/root/var/lib/pane-cloud/hot
+root=/mnt/root
+mkdir -p "$root/var/log/pane-cloud" && chmod 700 "$root/var/log/pane-cloud"
+log="$root/var/log/pane-cloud/bootstrap.log"
+say() { echo "$(date -u +%FT%TZ) $*" >>"$log"; }
+chmod 600 "$log" 2>/dev/null || : >"$log"
+
+rm -rf "$root/var/lib/pane-cloud/hot"
 if [ -b /dev/vdd ] && [ "$(blkid -s LABEL -o value /dev/vdd 2>/dev/null)" = pane-app ]; then
-  mount -t ext4 -o ro,nodev,noatime /dev/vdd /mnt/root/opt/Pane || fail "cannot mount the Pane drive /dev/vdd"
+  mount -t ext4 -o ro,nodev,noatime /dev/vdd "$root/opt/Pane" || fail "cannot mount the Pane drive /dev/vdd"
 fi
-mount --move /mnt/session /mnt/root/mnt/session
-mount --move /dev /mnt/root/dev
+
+# The secrets volume, never formatted here (N3 formats it when it creates the Session).
+secrets="$root/home/pane/.pane-secrets"
+chattr +i "$secrets" 2>/dev/null
+label="$(blkid -p -o value -s LABEL /dev/vdc 2>/dev/null)" type="$(blkid -p -o value -s TYPE /dev/vdc 2>/dev/null)"
+if [ ! -b /dev/vdc ]; then
+  say "secrets: refused /dev/vdc: it is missing"
+elif [ "$(blockdev --getsize64 /dev/vdc)" -gt 1073741824 ]; then
+  say "secrets: refused /dev/vdc: larger than 1 GiB is not a secrets volume"
+elif [ "$type" != ext4 ] || [ "$label" != pane-secrets ]; then
+  say "secrets: refused /dev/vdc: it holds ${type:-nothing a probe recognises} ${label:+labelled $label}, not the pane-secrets ext4"
+else
+  rc=0; e2fsck -p /dev/vdc >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    say "secrets: refused /dev/vdc: e2fsck exited $rc"
+  elif mount -t ext4 -o nodev,nosuid,noexec,noatime /dev/vdc "$secrets"; then
+    chown 1000:1000 "$secrets" && chmod 700 "$secrets"
+    say "secrets: mounted at /home/pane/.pane-secrets (nodev,nosuid,noexec)"
+  else
+    say "secrets: refused /dev/vdc: it does not mount"
+  fi
+fi
+
+# The machine's own identity, made once on the Session disk: systemd keeps this machine id.
+if [ ! -s "$root/etc/machine-id" ]; then
+  tr -d '-' </proc/sys/kernel/random/uuid >"$root/etc/machine-id"
+  name="pane-$(cut -c1-8 "$root/etc/machine-id")"
+  echo "$name" >"$root/etc/hostname"
+  sed -i "/^127\.0\.1\.1 /d" "$root/etc/hosts" && echo "127.0.1.1 $name" >>"$root/etc/hosts"
+fi
+say "identity: hostname $(cat "$root/etc/hostname") machine id $(cat "$root/etc/machine-id")"
+
+mount --move /mnt/session "$root/mnt/session"
+mount --move /dev "$root/dev"
 umount /proc
-cd /mnt/root || fail "cannot enter the overlay root"
+cd "$root" || fail "cannot enter the overlay root"
 pivot_root . mnt/base || fail "pivot_root failed"
 # shellcheck disable=SC2094 # the console is both, as for any init
 exec chroot . /sbin/init "$@" <dev/console >dev/console 2>&1

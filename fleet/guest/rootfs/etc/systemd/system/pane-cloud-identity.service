@@ -1,8 +1,7 @@
 [Unit]
-Description=Pane Cloud: set the hostname, log the kernel's hardening
+Description=Pane Cloud: log the kernel's hardening
 DefaultDependencies=no
 After=local-fs.target
-Before=pane-daemon.service
 
 [Service]
 Type=oneshot

@@ -126,18 +126,17 @@ def check_release_parameters(parameters: Any) -> dict[str, Any]:
 
 
 def check_retry_parameters(parameters: Any) -> dict[str, Any]:
-    """retry_clone: nothing, or a fresh sealed GitHub token with the VM's own sealing key (both base64url),
-    for a clone that failed to sign in."""
-    next_step = 'Send {} or exactly {"sealedGitHubToken": "<base64url>", "sealingKey": "<base64url>"}.'
+    """retry_clone: nothing, or a fresh GitHub token record sealed to the slot's key (base64url), for a
+    clone that failed to sign in (D-114)."""
+    next_step = 'Send {} or exactly {"sealedToken": "<base64url sealed record>"}.'
     if parameters == {}:
         return {}
-    if not isinstance(parameters, dict) or set(parameters) != {'sealedGitHubToken', 'sealingKey'}:
-        raise OperationError('invalid_request', 'retry_clone takes nothing, or a sealed token with its key.', next_step)
-    sealed, key = parameters['sealedGitHubToken'], parameters['sealingKey']
-    if not (isinstance(sealed, str) and 66 <= len(sealed) <= 8192 and BASE64URL.fullmatch(sealed)) or \
-            not (isinstance(key, str) and len(key) == 43 and BASE64URL.fullmatch(key)):
-        raise OperationError('invalid_request', 'The sealed token and key must be base64url without padding.', next_step)
-    return {'sealed': sealed, 'key': key}
+    if not isinstance(parameters, dict) or set(parameters) != {'sealedToken'}:
+        raise OperationError('invalid_request', 'retry_clone takes nothing, or a sealed token.', next_step)
+    sealed = parameters['sealedToken']
+    if not (isinstance(sealed, str) and 66 <= len(sealed) <= 8192 and BASE64URL.fullmatch(sealed)):
+        raise OperationError('invalid_request', 'The sealed token must be base64url without padding.', next_step)
+    return {'sealed': sealed}
 
 
 PARAMETER_CHECKS: dict[str, Callable[[Any], dict[str, Any]]] = {
@@ -340,7 +339,7 @@ class Agent:
     def update_pane(self, release: dict[str, str]) -> dict[str, Any]:
         return self._install_release(release)
 
-    def retry_clone(self, sealed: str | None = None, key: str | None = None) -> dict[str, Any]:
+    def retry_clone(self, sealed: str | None = None) -> dict[str, Any]:
         """Runs the Session's first clone again after it failed (the app's Retry), with a fresh GitHub
         token when the host sends one."""
         status = (read_json(os.path.join(self.settings.clone_run_dir, 'state.json')) or {}).get('status') or {}
@@ -348,9 +347,11 @@ class Agent:
             raise OperationError('invalid_state', 'Only a failed clone can be retried.', 'Read the clone in status.')
         if sealed is not None:
             try:
-                store_github_token(self.settings, sealed.encode(), key.encode())
-            except ValueError as refusal:
-                raise OperationError('invalid_request', str(refusal), 'Seal the token to this VM\'s own sealing key.')
+                with open(os.path.join(self.settings.secrets_mount, 'pane-cloud', 'seal.key'), 'rb') as key:
+                    store_github_token(self.settings, sealed.encode(), key.read())
+            except (OSError, ValueError) as refusal:
+                message = str(refusal) if isinstance(refusal, ValueError) else 'This slot has no sealing key left.'
+                raise OperationError('invalid_request', message, 'Seal the token to this slot\'s sealing key.')
         code, out = self.system.run(['systemctl', 'start', '--no-block', CLONE_UNIT], timeout=30)
         if code != 0:
             raise OperationError('internal', f'The clone could not start: {out.strip()[-300:]}', 'Run collect_diagnostics.')
@@ -834,10 +835,11 @@ def unseal_github_token(settings: Settings) -> None:
     """The one-shot unseal at first boot (D-107), as root, before the Pane daemon and the clone start.
 
     The host wrote pane-cloud/github-token.sealed (the app's sealed record) and the slot's private key
-    pane-cloud/seal.key, root-only, on the secrets volume. This stores the token (store_github_token) and
-    deletes both inputs. pane-cloud/ becomes root:pane 0710, so pane reaches its token file and nothing
-    else there (the host's clone.json stays root's). Nothing sealed (a public repository, a later boot):
-    nothing to do.
+    pane-cloud/seal.key, root-only, on the secrets volume. This stores the token (store_github_token).
+    Both inputs stay until the clone made its Pane, when the clone unit deletes them (D-114: a retry may
+    bring a fresh token sealed to the same key). pane-cloud/ becomes root:pane 0710, so pane reaches its
+    token file and nothing else there (the host's clone.json stays root's). Nothing sealed (a public
+    repository, or once the clone succeeded): nothing to do.
     """
     sealed_dir = os.path.join(settings.secrets_mount, 'pane-cloud')
     sealed_path = os.path.join(sealed_dir, 'github-token.sealed')
@@ -846,8 +848,6 @@ def unseal_github_token(settings: Settings) -> None:
         return
     with open(key_path, 'rb') as key, open(sealed_path, 'rb') as sealed:
         store_github_token(settings, sealed.read(), key.read())
-    os.remove(sealed_path)
-    os.remove(key_path)
 
 
 def copy_clone_request(settings: Settings) -> None:

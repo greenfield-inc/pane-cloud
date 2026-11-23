@@ -176,6 +176,28 @@ def wait_for_daemon(seconds: float = 300) -> bool:
     return False
 
 
+def daemon_calls(*calls: tuple[str, dict]) -> list:
+    """Requests to the Pane daemon on one control-socket connection, as runpane sends them (Pane's
+    daemonClient.ts), without starting a runpane process for each."""
+    results = []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(300)
+        conn.connect(daemon_socket())
+        reader = conn.makefile('r', encoding='utf-8')
+        for number, (channel, request) in enumerate(calls, 1):
+            conn.sendall((json.dumps({'type': 'request', 'id': number, 'channel': channel, 'args': [request]}) + '\n').encode())
+            for line in reader:
+                frame = json.loads(line)
+                if frame.get('type') == 'response' and frame.get('id') == number:
+                    if not frame.get('ok'):
+                        raise RuntimeError((frame.get('error') or {}).get('message') or f'{channel} was refused')
+                    results.append(frame.get('result'))
+                    break
+            else:
+                raise RuntimeError('The Pane daemon closed its socket without answering.')
+    return results
+
+
 def runpane(*args: str) -> tuple[int, str]:
     done = subprocess.run([RUNPANE, *args, '--yes', '--json'], capture_output=True, text=True, timeout=300,
                           stdin=subprocess.DEVNULL)
@@ -183,7 +205,19 @@ def runpane(*args: str) -> tuple[int, str]:
 
 
 def create_pane(dest: str, name: str) -> tuple[str | None, str | None]:
-    """Registers the repo and creates its Pane; returns (paneId, error)."""
+    """Registers the repo and creates its Pane, straight on the daemon's socket in one connection; falls
+    back to the runpane CLI if the daemon refuses that. Returns (paneId, error)."""
+    try:
+        _, created = daemon_calls(('runpane:repos:add', {'path': dest, 'name': name}),
+                                  ('runpane:panes:create', {'repo': name, 'panes': [{'name': name, 'pinned': True}],
+                                                            'noFocus': True, 'source': 'user'}))
+        pane_id = created['items'][0].get('paneId')
+        if pane_id:
+            print('created the Pane on the daemon socket', file=sys.stderr)
+            return pane_id, None
+    except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError):
+        pass
+    # The CLI, for a daemon that answers the direct calls differently.
     code, out = runpane('repos', 'add', '--path', dest, '--name', name)
     if code != 0 and 'already' not in out.lower():
         return None, f'runpane repos add: {out.strip()[-1000:]}'

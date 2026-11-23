@@ -135,8 +135,6 @@ as_pane "$runpane" repos list --json >/dev/null 2>&1; first_rc=$?
 first="$(up)"
 timeline="boot=$boot kernel_to_init=$(systemctl show -p UserspaceTimestampMonotonic --value | awk '{printf "%.3f", $1/1000000}')"
 timeline+=" sysinit=$(at sysinit.target ActiveEnterTimestampMonotonic)"
-timeline+=" identity_done=$(at pane-cloud-identity.service ActiveEnterTimestampMonotonic)"
-timeline+=" secrets_done=$(at pane-cloud-secrets.service ActiveEnterTimestampMonotonic)"
 timeline+=" daemon_start=$(at pane-daemon.service ExecMainStartTimestampMonotonic) socket=$socket first_runpane=$first first_rc=$first_rc"
 
 if [ "$boot" = 1 ]; then
@@ -176,7 +174,7 @@ print(" ".join(f"{k}={str(v).replace(chr(32), chr(95))[:200]}" for k, v in field
     "token_in_journal=$(journalctl -b --no-pager 2>/dev/null | grep -cF "$token")" \
     "token_in_progress=$(grep -cF "$token" /run/pane-cloud-clone/state.json)" \
     "token_in_logs=$(cat /var/log/pane-cloud/*.log | grep -cF "$token")" \
-    "sealed_gone=$([ -e /home/pane/.pane-secrets/pane-cloud/github-token.sealed ] || [ -e /home/pane/.pane-secrets/pane-cloud/seal.key ] && echo no || echo yes)" \
+    "sealed_gone=$(for _ in $(seq 1 50); do [ -e /home/pane/.pane-secrets/pane-cloud/seal.key ] || { echo yes; break; }; sleep 0.1; done)" \
     "drop=$(stat -c %U:%a "$drop" 2>/dev/null)/$(stat -c %a "$(dirname "$drop")" 2>/dev/null)" \
     "drop_matches=$(grep -cF "$token" "$drop" 2>/dev/null)" \
     "clone_token_gone=$([ -e /home/pane/.pane-secrets/pane-cloud/clone-token ] && echo no || echo yes)"
@@ -456,7 +454,7 @@ if phase == 'clone-fail':
     check('the token appears in no report the host received', bad_token not in reports_text and public_token not in reports_text)
     scan('after the failed clone and its retry')
     log = bootstrap_log()
-    ids = lambda text: (re.search(r'identity: hostname (\S+)', text), re.search(r'identity: pane machine id (\S+)', text))
+    ids = lambda text: (re.search(r'identity: hostname (\S+)', text), re.search(r'identity: hostname \S+ machine id (\S+)', text))
     first_ids, these_ids = ids(open(f'{out}/bootstrap-1.log').read()), ids(log)
     if all(first_ids) and all(these_ids):
         check(f'two machines from one image have different ids ({first_ids[0].group(1)} {first_ids[1].group(1)[:8]} '
@@ -476,7 +474,6 @@ timeline = dict(re.findall(r'(\w+)=(\S*)', line(log, 'timeline', int(boot)) or '
 f = lambda key: float(timeline[key]) if timeline.get(key, '').replace('.', '', 1).isdigit() else None
 print(f'     boot {boot} timeline, seconds since the guest kernel started:', flush=True)
 for key, what in (('kernel_to_init', 'kernel hands over to init (overlay-init, then systemd)'), ('sysinit', 'sysinit.target'),
-                  ('identity_done', 'hostname set'), ('secrets_done', 'secrets volume mounted'),
                   ('daemon_start', 'Pane daemon process started'), ('socket', "Pane daemon's control socket answers"),
                   ('first_runpane', 'first runpane call returns'), ('repo_added', 'repository registered'),
                   ('pane_created', 'Pane created with a terminal panel'), ('node_done', 'the panel ran node -v'),
@@ -509,7 +506,7 @@ if phase == 'first':
     check('the token is in no file of the repository, the journal, the progress file or the logs',
           all(clone.get(k) == '0' for k in ('token_in_repo', 'token_in_journal', 'token_in_progress', 'token_in_logs')),
           json.dumps({k: clone.get(k) for k in clone if k.startswith('token_in')}))
-    check(f"the unseal wrote the drop file (pane, 0600, in a 0700 folder: {clone.get('drop')}) and deleted its sealed inputs",
+    check(f"the unseal wrote the drop file (pane, 0600, in a 0700 folder: {clone.get('drop')}); the sealed token and key went once the Pane existed (D-114)",
           clone.get('drop') == 'pane:600/700' and clone.get('drop_matches') == '1' and clone.get('sealed_gone') == 'yes')
     check('the clone token file is gone once the history fetch ended', clone.get('clone_token_gone') == 'yes')
     check('no report the host received carries the token', public_token not in open(f'{out}/reports-{boot}.jsonl').read())

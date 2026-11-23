@@ -1,12 +1,12 @@
-# The one-shot GitHub token unseal at first boot (D-107), the guest agent's code, as root: the host
-# sealed the app's token to this slot's key (pane-cloud/ on the secrets volume). It writes K1's drop file
-# for the Pane daemon and the clone's token file in /run, then deletes the sealed inputs, before either
-# starts. Skipped when nothing is sealed: a public repository, or any later boot.
+# The GitHub token unseal (D-107), the guest agent's code, as root: the host sealed the app's token to
+# this slot's key (pane-cloud/ on the secrets volume). Before the Pane daemon or the clone starts, it
+# writes K1's drop file for the daemon and the clone's token file. Skipped when nothing is sealed (a
+# public repository) and once the clone made its Pane, which deletes the sealed inputs (D-114).
 [Unit]
 Description=Pane Cloud: unseal the GitHub token from the create request
 DefaultDependencies=no
-Requires=pane-cloud-secrets.service
-After=pane-cloud-secrets.service
+ConditionPathIsMountPoint=/home/pane/.pane-secrets
+After=local-fs.target
 Before=pane-daemon.service pane-cloud-clone.service
 ConditionPathExists=/home/pane/.pane-secrets/pane-cloud/github-token.sealed
 

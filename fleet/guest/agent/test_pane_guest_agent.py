@@ -225,16 +225,18 @@ class GuestAgentTest(unittest.TestCase):
         self.assertEqual(self.send('status', {})['result']['clone']['error'], {'message': 'remote: Invalid username or token.'})
 
     @unittest.skipUnless(importlib.util.find_spec('nacl'), 'PyNaCl is not installed')
-    def test_retry_clone_takes_a_fresh_token_sealed_to_the_vms_own_key(self):
+    def test_retry_clone_takes_a_fresh_token_sealed_to_the_slots_key(self):
         from nacl.public import PrivateKey, SealedBox
         self.failed_clone()
         self.settings.secrets_mount = self.path('home/pane/.pane-secrets')
         key = PrivateKey.generate()
+        self.write('home/pane/.pane-secrets/pane-cloud/seal.key', '')
+        with open(self.path('home/pane/.pane-secrets/pane-cloud/seal.key'), 'wb') as out:
+            out.write(bytes(key))
         record = {'token': 'ghp_FRESHtoken0123456789abcdefghijklmn', 'source': 'mac', 'updatedAt': '2026-11-23T06:00:00Z'}
         sealed = base64.urlsafe_b64encode(SealedBox(key.public_key).encrypt(json.dumps(record).encode())).decode().rstrip('=')
 
-        reply = self.send('retry_clone', {'sealedGitHubToken': sealed,
-                                          'sealingKey': base64.urlsafe_b64encode(bytes(key)).decode().rstrip('=')})
+        reply = self.send('retry_clone', {'sealedToken': sealed})
 
         self.assertEqual(reply.get('result'), {'started': True}, reply)
         with open(self.settings.clone_token) as token:
@@ -544,7 +546,8 @@ class UnsealTest(unittest.TestCase):
         with open(self.settings.clone_token) as source:
             self.assertEqual(source.read(), self.RECORD['token'])
         self.assertEqual(self.mode(self.settings.clone_token), 0o600)
-        self.assertEqual(os.listdir(f'{self.root}/secrets/pane-cloud'), ['clone-token'])
+        # D-114: the sealed token and the slot's key stay until the clone made its Pane (the clone unit deletes them).
+        self.assertEqual(sorted(os.listdir(f'{self.root}/secrets/pane-cloud')), ['clone-token', 'github-token.sealed', 'seal.key'])
         self.assertEqual(self.mode(f'{self.root}/secrets/pane-cloud'), 0o710)
         self.assertEqual(sorted(os.listdir(f'{self.root}/secrets/incoming')), ['github-token.json'])
 

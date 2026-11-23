@@ -7,9 +7,9 @@
 [Unit]
 Description=Pane Cloud: clone the Session's repository and create its Pane
 DefaultDependencies=no
-Requires=pane-cloud-secrets.service
+ConditionPathIsMountPoint=/home/pane/.pane-secrets
 Wants=pane-cloud-unseal.service
-After=sysinit.target pane-cloud-secrets.service pane-cloud-identity.service pane-cloud-unseal.service
+After=local-fs.target pane-cloud-unseal.service
 Conflicts=shutdown.target
 Before=shutdown.target
 ConditionPathExists=/home/pane/.pane-secrets/pane-cloud/clone.json
@@ -29,9 +29,10 @@ Environment=PATH=/home/pane/.local/bin:/usr/local/bin:/usr/bin:/bin
 # As root, the guest agent's code: hand pane the request from the host's root-only folder.
 ExecStartPre=+/usr/bin/python3 -I /usr/local/lib/pane-cloud/pane_guest_agent.py copy-clone-request
 ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/clone.py
-# The token file goes once the history fetch is done; the Pane daemon's own sign-in takes over. Until then
-# it stays, for retry_clone after a network error and for a history fetch resumed after a sleep.
-ExecStopPost=+/bin/sh -c '[ ! -e /var/lib/pane-cloud-clone/history-done ] || rm -f /home/pane/.pane-secrets/pane-cloud/clone-token'
+# Once the clone made its Pane, the sealed token and the slot's key go (D-114: until then a retry may
+# bring a token sealed to that key). The clone token goes once the history fetch is done; until then it
+# stays, for a history fetch resumed after a sleep. The Pane daemon's own sign-in takes over.
+ExecStopPost=+/bin/sh -c 'cd /home/pane/.pane-secrets/pane-cloud || exit 0; [ ! -e /var/lib/pane-cloud-clone/done ] || rm -f github-token.sealed seal.key; [ ! -e /var/lib/pane-cloud-clone/history-done ] || rm -f clone-token'
 TimeoutStartSec=infinity
 
 [Install]
