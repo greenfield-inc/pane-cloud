@@ -44,7 +44,7 @@ lower="$work/lower" root="$work/root"
 mkdir -p "$lower" "$root" "$work/upper" "$work/work"
 cleanup() {
   # Stops the daemon and everything else still running inside the image: every process whose root is
-  # the image. The daemon runs as uid 1000, which on a CI runner is the runner's own user.
+  # the image, the AppImage's extracted copy included.
   local proc left
   for _ in 1 2 3; do
     left=""
