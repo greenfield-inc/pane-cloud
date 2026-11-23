@@ -79,7 +79,7 @@ check "machine-id is empty" test ! -s "$lower/etc/machine-id"
 check "root is locked" grep -q '^root:!' "$lower/etc/shadow"
 check "no cloud-init" test ! -e "$lower/usr/bin/cloud-init"
 check "Pane is the $PANE_VERSION AppImage, pane's own" \
-  test "$(sha256sum <"$lower/home/pane/Applications/Pane.AppImage" | cut -d' ' -f1) $(stat -c %U:%a "$lower/home/pane/Applications/Pane.AppImage")" = "${!appimage_sha} pane:755"
+  test "$(sha256sum <"$lower/home/pane/Applications/Pane.AppImage" | cut -d' ' -f1) $(stat -c %u:%a "$lower/home/pane/Applications/Pane.AppImage")" = "${!appimage_sha} 1000:755"
 check "/home/pane/.local/bin/pane is the AppImage" test "$(readlink "$lower/home/pane/.local/bin/pane")" = ../../Applications/Pane.AppImage
 check "no FUSE: pane cannot mount a filesystem root can't read" bash -c "! compgen -G '$lower/usr/bin/fusermount*'"
 check "no /opt/Pane" test ! -e "$lower/opt/Pane"
@@ -100,6 +100,9 @@ chroot "$root" runuser -u pane -- env -i HOME=/home/pane PATH=/usr/local/bin:/us
 for _ in $(seq 1 90); do compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null && break; sleep 1; done
 if ! compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null; then
   fail "the Pane daemon opened its control socket"; tail -40 "$work/daemon.log"
+  echo "     libraries the extracted AppImage cannot find:"
+  # shellcheck disable=SC2016 # expanded inside the chroot
+  chroot "$root" sh -c 'for f in $(find /tmp/appimage_extracted_* -type f -perm -u+x 2>/dev/null); do ldd "$f" 2>/dev/null | grep "not found" | sed "s|^|$f: |"; done' | head -20
 else
   pass "the Pane daemon opened its control socket"
   # The agent's own daemon calls, then a status request over the agent's protocol.

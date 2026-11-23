@@ -10,7 +10,7 @@
 #   - the process report names a program called xmrig, with its hash,
 #   - Claude Code answers a prompt, when CLAUDE_CODE_OAUTH_TOKEN is set,
 #   - Pane's own update (`runpane update`, what Update Pane runs) moves the machine from the image's
-#     Pane to the latest release, and the daemon comes back on it with relay pairing ready.
+#     Pane to the latest release, and the daemon comes back on it with its Sessions and relay pairing.
 # The last four need something run inside the guest, which the guest agent never does: this script
 # adds a CI-only check unit to its own throwaway copy of the disk before booting it. The image is
 # never changed. Relay certificates come from Let's Encrypt's staging CA, so CI never spends the
@@ -80,10 +80,17 @@ else
   say "claude skipped: no token"
 fi
 
-# Update Pane, as a person or agent on the machine runs it: Pane's own update, from Pane's runpane.
-for _ in $(seq 1 60); do [ -x /home/pane/.pane/bin/runpane ] && break; sleep 5; done
+# Update Pane, as a person or agent on the machine runs it: Pane's own update, from Pane's runpane. A
+# Session made before it must still be there after it.
+runpane=/home/pane/.pane/bin/runpane
+for _ in $(seq 1 60); do [ -x "$runpane" ] && break; sleep 5; done
+made="$(as_pane "$runpane" sessions create --from-json - --json <<<'{"name":"ci-update-check"}' 2>&1 | tr -s ' \n' ' ')"
+say "session before update: ${made:0:300}"
 rc=0
-result="$(as_pane timeout 900 /home/pane/.pane/bin/runpane update --wait --json 2>&1)" || rc=$?
+result="$(as_pane timeout 900 "$runpane" update --wait --json 2>&1)" || rc=$?
+kept=no
+as_pane "$runpane" sessions get --session ci-update-check --json >/dev/null 2>&1 && kept=yes
+say "session after update kept=$kept"
 say "update exit=$rc $(tr -s ' \n' ' ' <<<"$result" | tail -c 900)"
 CHECK
 chmod 755 "$disk/var/lib/pane-ci/check.sh"
@@ -255,6 +262,8 @@ if update:
     else:
         moved = wait_for(f'the daemon answers on Pane {latest}', 300, lambda: call('status')['result']['paneVersion'] == latest, every=5)
         check(f'Update Pane moved the machine from Pane {pane_version} to {latest} (runpane update, exit {update.group(1).split()[0]})', bool(moved))
+    check('the updated daemon still has the Session made before the update',
+          ' ci: session after update kept=yes' in bootstrap_log(), re.search(r' ci: session before update: (.*)$', bootstrap_log(), re.M))
 
 relay = wait_for('the Pane daemon has relay pairing ready', 300,
                  lambda: (r := call('status')['result']['relay'])['status'] == 'ready' and r['fingerprint'] and r, every=5)

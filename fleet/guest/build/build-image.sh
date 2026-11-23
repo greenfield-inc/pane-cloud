@@ -87,13 +87,16 @@ build_rootfs() {
 
   say "packages"
   in_root apt-get update -qq
-  in_root apt-get purge -y -qq cloud-init snapd >/dev/null 2>&1 || true
+  # fuse3 too: pane could mount a FUSE filesystem with it, and root cannot read what pane mounts, so a
+  # program run from one would have no hash in the process report.
+  in_root apt-get purge -y -qq cloud-init snapd fuse3 >/dev/null 2>&1 || true
   in_root apt-get install -y -qq --no-install-recommends git ca-certificates curl python3 xz-utils unzip \
     e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg >/dev/null
   # What Pane's .deb depends on (Pane package.json build.deb.depends), plus libgbm and libasound, which its
-  # Electron binary links too. The AppImage carries Pane, not these. No FUSE: the AppImage runs extracted.
+  # Electron binary links too, and zlib's unversioned libz.so, which the AppImage's bundled code loads.
+  # The AppImage carries Pane, not these. No FUSE: the AppImage runs extracted.
   in_root apt-get install -y -qq --no-install-recommends libgtk-3-0t64 libnotify4 libnss3 libxss1 libxtst6 \
-    xdg-utils libatspi2.0-0t64 libuuid1 libgbm1 libasound2t64 >/dev/null
+    xdg-utils libatspi2.0-0t64 libuuid1 libgbm1 libasound2t64 zlib1g-dev >/dev/null
 
   say "Node $NODE_VERSION"
   fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-${kernel_arch/x86_64/x64}.tar.xz" "$(pin NODE_SHA256)" "$work/node.tar.xz"
