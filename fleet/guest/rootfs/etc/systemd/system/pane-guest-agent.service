@@ -1,0 +1,18 @@
+[Unit]
+Description=Pane Cloud guest agent (vsock port 1024)
+# Up as soon as local filesystems are, beside the Pane daemon, so the host reaches it early and its ready
+# signal goes out the moment the daemon listens.
+DefaultDependencies=no
+After=local-fs.target
+Conflicts=shutdown.target
+Before=shutdown.target
+# Keep restarting however often it crashes: the host needs the agent.
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/pane_guest_agent.py
+Restart=always
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

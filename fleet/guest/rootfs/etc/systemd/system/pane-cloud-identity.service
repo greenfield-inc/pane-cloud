@@ -1,0 +1,12 @@
+[Unit]
+Description=Pane Cloud: log the kernel's hardening
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/pane-cloud/identity.sh
+
+[Install]
+WantedBy=multi-user.target

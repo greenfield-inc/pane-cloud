@@ -1,0 +1,35 @@
+# The Session's first clone (D-107), started by pane-cloud-boot.service together with the Pane daemon:
+# the kernel's ip= argument brought the network up before systemd, and the clone waits for DNS itself. The repository comes from the secrets
+# volume, where the host wrote it before launch (pane-cloud/clone.json, root-only); without it there is
+# nothing to clone. A private repository's token is the one-shot unseal's pane-cloud/clone-token on the
+# secrets volume. Once the clone has made its Pane, a later boot only resumes the history fetch if a sleep cut it
+# short, and skips the unit once that is done. retry_clone starts it again after a failed clone.
+[Unit]
+Description=Pane Cloud: clone the Session's repository and create its Pane
+DefaultDependencies=no
+ConditionPathIsMountPoint=/home/pane/.pane-secrets
+After=local-fs.target pane-cloud-boot.service
+Conflicts=shutdown.target
+Before=shutdown.target
+ConditionPathExists=/home/pane/.pane-secrets/pane-cloud/clone.json
+ConditionPathExists=!/var/lib/pane-cloud-clone/history-done
+
+[Service]
+Type=oneshot
+User=pane
+Group=pane
+WorkingDirectory=/home/pane
+RuntimeDirectory=pane-cloud-clone
+RuntimeDirectoryPreserve=yes
+StateDirectory=pane-cloud-clone
+Environment=HOME=/home/pane
+Environment=PANE_DIR=/home/pane/.pane
+Environment=PATH=/home/pane/.local/bin:/usr/local/bin:/usr/bin:/bin
+# As root, the guest agent's code: hand pane the request from the host's root-only folder.
+ExecStartPre=+/usr/bin/python3 -I /usr/local/lib/pane-cloud/pane_guest_agent.py copy-clone-request
+ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/clone.py
+# Once the clone made its Pane, the sealed token and the slot's key go (D-114: until then a retry may
+# bring a token sealed to that key). The clone token goes once the history fetch is done; until then it
+# stays, for a history fetch resumed after a sleep. The Pane daemon's own sign-in takes over.
+ExecStopPost=+/bin/sh -c 'cd /home/pane/.pane-secrets/pane-cloud || exit 0; [ ! -e /var/lib/pane-cloud-clone/done ] || rm -f github-token.sealed seal.key; [ ! -e /var/lib/pane-cloud-clone/history-done ] || rm -f clone-token'
+TimeoutStartSec=infinity

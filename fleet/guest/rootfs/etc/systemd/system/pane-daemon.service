@@ -1,0 +1,34 @@
+# The Pane daemon, run as pane, started by pane-cloud-boot.service together with the clone, as early as
+# boot allows: overlay-init already mounted the root, the Pane drive and the secrets volume and set the
+# hostname. It runs only with the secrets volume mounted, where Pane keeps its secrets. It waits for
+# nothing else: not sysinit, basic.target or the network; the relay connects when the network is up. /opt/Pane is the Pane drive when the host attaches one. update_pane points
+# a running machine at a newer Pane with a drop-in in /run, gone at the next boot.
+# Agent panels inherit this environment: the agent CLIs on PATH, resuming after a stop, and Pane's
+# secrets on the secrets volume (K1). Sign-in files the agent CLIs write themselves
+# (~/.codex/auth.json, ~/.config/gh/hosts.yml) stay on the Session disk.
+[Unit]
+Description=Pane daemon
+DefaultDependencies=no
+ConditionPathIsMountPoint=/home/pane/.pane-secrets
+After=local-fs.target pane-cloud-boot.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+User=pane
+Group=pane
+WorkingDirectory=/home/pane
+RuntimeDirectory=user/1000
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Environment=HOME=/home/pane
+Environment=SHELL=/bin/bash
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PANE_DIR=/home/pane/.pane
+Environment=ELECTRON_OZONE_PLATFORM_HINT=headless
+Environment=PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PANE_RESUME_AGENTS_ON_START=1
+Environment=PANE_SECRETS_DIR=/home/pane/.pane-secrets
+ExecStart=/opt/Pane/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane
+Restart=always
+RestartSec=1

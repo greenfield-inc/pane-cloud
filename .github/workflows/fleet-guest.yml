@@ -1,0 +1,88 @@
+name: fleet-guest
+
+on:
+  pull_request:
+    paths: ['fleet/guest/**', '.github/workflows/fleet-guest.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fleet/guest
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu 24.04's own Python 3.12, the one the guest image runs.
+      - name: guest agent tests
+        working-directory: fleet/guest/agent
+        run: sudo apt-get install -y -qq python3-nacl >/dev/null && /usr/bin/python3 -m unittest -v
+      - name: shellcheck
+        run: find . -name '*.sh' -print0 | xargs -0 shellcheck -x && shellcheck rootfs/usr/local/lib/pane-cloud/overlay-init rootfs/usr/local/lib/pane-cloud/git-credential-clone && python3 -m py_compile rootfs/usr/local/lib/pane-cloud/clone.py
+
+  # Builds the real image on a native arm64 runner and checks it. Nothing is published: only the
+  # kernel and its config go up, as a short-lived workflow artifact.
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the kernel and the root filesystem
+        run: sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh all "$RUNNER_TEMP/out"
+      - name: check the image and probe the Pane daemon inside it
+        run: |
+          # Ubuntu 24.04 runners refuse unprivileged user namespaces, which Electron's sandbox needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo bash build/check-image.sh "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-kernel
+          path: |
+            ${{ runner.temp }}/out/vmlinux-*
+            ${{ runner.temp }}/out/config-*
+          retention-days: 3
+
+  # CI only: builds the amd64 variant of the same image and boots it under Firecracker's jailer on
+  # GitHub's x86_64 runner, which has /dev/kvm. The fleet runs the arm64 image. Nothing is uploaded.
+  boot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      # The Firecracker release N1 runs, checked against versions.env.
+      - name: install Firecracker and the jailer
+        run: |
+          source build/versions.env
+          tgz="firecracker-$FIRECRACKER_VERSION-x86_64.tgz"
+          curl -fsSL --proto =https -o "$RUNNER_TEMP/$tgz" "https://github.com/firecracker-microvm/firecracker/releases/download/$FIRECRACKER_VERSION/$tgz"
+          echo "$FIRECRACKER_SHA256_amd64  $RUNNER_TEMP/$tgz" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/fc" && tar -xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP"
+          release="$RUNNER_TEMP/release-$FIRECRACKER_VERSION-x86_64"
+          install -m 755 "$release/firecracker-$FIRECRACKER_VERSION-x86_64" "$RUNNER_TEMP/fc/firecracker"
+          install -m 755 "$release/jailer-$FIRECRACKER_VERSION-x86_64" "$RUNNER_TEMP/fc/jailer"
+      - name: build the kernel and the root filesystem
+        run: sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh all "$RUNNER_TEMP/out"
+      - name: check the image and probe the Pane daemon inside it
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo bash build/check-image.sh "$RUNNER_TEMP/out"
+      - name: build a newer Pane drive than the base's Pane
+        run: |
+          source build/versions.env
+          sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh pane-drive "$RUNNER_TEMP/out" \
+            "$CI_PANE_DRIVE_VERSION" "$CI_PANE_DRIVE_DEB_SHA256_amd64"
+      - name: PyNaCl, to seal the test token as the app does
+        run: sudo apt-get install -y -qq python3-nacl >/dev/null
+      - name: boot under Firecracker and check first boot over vsock
+        # Optional: with it, the check also has Claude Code answer a prompt inside the guest.
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: sudo --preserve-env=CLAUDE_CODE_OAUTH_TOKEN bash build/boot-check.sh "$RUNNER_TEMP/out" "$RUNNER_TEMP/fc"
