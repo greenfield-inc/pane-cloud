@@ -21,7 +21,7 @@ jobs:
         working-directory: fleet/guest/agent
         run: /usr/bin/python3 -m unittest -v
       - name: shellcheck
-        run: find . -name '*.sh' -print0 | xargs -0 shellcheck -x && shellcheck fleet/guest/rootfs/usr/local/lib/pane-cloud/overlay-init
+        run: find . -name '*.sh' -print0 | xargs -0 shellcheck -x && shellcheck rootfs/usr/local/lib/pane-cloud/overlay-init
 
   # Builds the real image on a native arm64 runner and checks it. Nothing is published: only the
   # kernel and its config go up, as a short-lived workflow artifact.

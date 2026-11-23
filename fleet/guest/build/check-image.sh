@@ -100,11 +100,6 @@ check "root is locked" grep -q '^root:!' "$lower/etc/shadow"
 check "no cloud-init" test ! -e "$lower/usr/bin/cloud-init"
 check "Pane is at /opt/Pane/pane" test -x "$lower/opt/Pane/pane"
 check "Node $NODE_VERSION" test "$(chroot "$root" /usr/local/bin/node --version)" = "$NODE_VERSION"
-for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gemini:gemini; do
-  version="$(chroot "$root" runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \
-    timeout 60 "${entry#*:}" --version </dev/null 2>/dev/null | head -1 || true)"
-  check "${entry%%:*} is in the image: ${version:-missing}" test -n "$version"
-done
 
 echo "== Pane daemon and guest agent status"
 mount -t proc proc "$root/proc"
@@ -112,6 +107,12 @@ mount -t sysfs sys "$root/sys"
 mount --bind /dev "$root/dev"
 mount --bind /dev/pts "$root/dev/pts"
 mount -t tmpfs shm "$root/dev/shm"
+# The agent CLIs the build installed (OpenCode, built on Bun, needs /proc).
+for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gemini:gemini; do
+  version="$(chroot "$root" runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \
+    timeout 60 "${entry#*:}" --version </dev/null 2>/dev/null | head -1 || true)"
+  check "${entry%%:*} is in the image: ${version:-missing}" test -n "$version"
+done
 # As pane-daemon.service runs it, with the image's own config.json. The relay certificate comes from
 # Let's Encrypt's staging CA, so checks never spend the limits Pane's users share.
 chroot "$root" runuser -u pane -- env -i HOME=/home/pane PATH=/usr/local/bin:/usr/bin:/bin ELECTRON_OZONE_PLATFORM_HINT=headless \
