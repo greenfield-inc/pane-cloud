@@ -1,19 +1,30 @@
-# The Pane daemon, run as pane, started as early as the unit graph allows: after the secrets volume
-# (Pane keeps its secrets there) and the hostname (Pane names the machine after it). It does not wait
-# for the network; the relay connects when the network comes up. Workspaces and relay pairing are on
-# in the image's /home/pane/.pane/config.json. Agent panels inherit this environment: the agent CLIs
-# on PATH, resuming after a stop, and Pane's secrets on the secrets volume (K1). Sign-in files the
-# agent CLIs write themselves (~/.codex/auth.json, ~/.config/gh/hosts.yml) stay on the Session disk.
+# The Pane daemon, run as pane, started as early as the unit graph allows: right after sysinit, the
+# secrets volume (Pane keeps its secrets there and must not start without it) and the hostname (Pane
+# names the machine after it). It does not wait for basic.target or the network; the relay connects
+# when the network comes up. /opt/Pane is the Pane drive when the host attaches one. update_pane points
+# a running machine at a newer Pane with a drop-in in /run, gone at the next boot.
+# Agent panels inherit this environment: the agent CLIs on PATH, resuming after a stop, and Pane's
+# secrets on the secrets volume (K1). Sign-in files the agent CLIs write themselves
+# (~/.codex/auth.json, ~/.config/gh/hosts.yml) stay on the Session disk.
 [Unit]
 Description=Pane daemon
-After=pane-cloud-secrets.service pane-cloud-identity.service
-Wants=pane-cloud-secrets.service pane-cloud-identity.service
+DefaultDependencies=no
+Requires=pane-cloud-secrets.service
+Wants=pane-cloud-identity.service
+After=sysinit.target pane-cloud-secrets.service pane-cloud-identity.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 User=pane
 Group=pane
 WorkingDirectory=/home/pane
+RuntimeDirectory=user/1000
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 Environment=HOME=/home/pane
+Environment=SHELL=/bin/bash
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PANE_DIR=/home/pane/.pane
 Environment=ELECTRON_OZONE_PLATFORM_HINT=headless
 Environment=PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin

@@ -8,6 +8,8 @@ Operations, on vsock port 1024 (fleet/guest/README.md): one JSON object per line
 Only bootstrap, update_pane, prepare_to_stop, collect_diagnostics and status run, each with exactly the
 parameters the contract allows. There is no shell command and no file write from outside.
 
+Ready, to the host (CID 2) on vsock port 5000, once per boot when the Pane daemon's socket listens:
+  {"type": "ready", "uptimeSeconds": 2.1}
 Reports, to the host (CID 2) on vsock port 1025: one JSON line per connection, nothing read back.
   {"type": "process_report", ...}   at start, then every 5 minutes
   {"type": "memory_pressure", ...}  when the kernel shows memory pressure, checked every 5 seconds
@@ -22,7 +24,9 @@ import hashlib
 import io
 import json
 import os
+import platform
 import pwd
+import shutil
 import re
 import socket
 import stat
@@ -38,6 +42,8 @@ from typing import Any, Callable
 
 VSOCK_PORT = 1024
 REPORT_PORT = 1025
+# N1's readyPort: one connection once the Pane daemon's control socket listens.
+READY_PORT = 5000
 PROCESS_REPORT_SECONDS = 300
 PRESSURE_CHECK_SECONDS = 5
 # Memory pressure (cover sheet, growing memory): stalls above 10% over 60 s, more than 2 GiB of swap
@@ -50,7 +56,11 @@ MAX_HASH_BYTES = 2 * 1024 ** 3
 MAX_REQUEST_BYTES = 64 * 1024
 PANE_USER = 'pane'
 PANE_DAEMON_UNIT = 'pane-daemon.service'
-RELEASE_URL = 'https://github.com/greenfield-inc/Pane/releases/download/v{version}/Pane-{version}-linux-arm64.deb'
+# pane-daemon.service's arguments after the executable, for update_pane's drop-in.
+DAEMON_ARGUMENTS = '--ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane'
+RELEASE_URL = 'https://github.com/greenfield-inc/Pane/releases/download/v{version}/Pane-{version}-linux-{arch}.deb'
+# The machine's Debian architecture: arm64 on the fleet, amd64 only in CI's boot check.
+MACHINE_ARCH = {'aarch64': 'arm64', 'x86_64': 'amd64'}.get(platform.machine(), platform.machine())
 MAX_DEB_BYTES = 1024 ** 3
 # A diagnostics archive carries at most the last 4 MiB of each file, so the response line stays bounded.
 MAX_DIAGNOSTIC_FILE_BYTES = 4 * 1024 ** 2
@@ -93,7 +103,7 @@ def check_no_parameters(parameters: Any) -> dict[str, Any]:
 
 
 def check_release_parameters(parameters: Any) -> dict[str, Any]:
-    next_step = 'Send exactly {"release": {"version": "X.Y.Z", "arch": "arm64", "debSha256": "<64 lowercase hex>"}}.'
+    next_step = f'Send exactly {{"release": {{"version": "X.Y.Z", "arch": "{MACHINE_ARCH}", "debSha256": "<64 lowercase hex>"}}}}.'
     if not isinstance(parameters, dict) or set(parameters) != {'release'}:
         raise OperationError('invalid_request', 'The parameters must be exactly {"release": {...}}.', next_step)
     release = parameters['release']
@@ -102,8 +112,8 @@ def check_release_parameters(parameters: Any) -> dict[str, Any]:
     version, arch, sha = release['version'], release['arch'], release['debSha256']
     if not isinstance(version, str) or not VERSION.fullmatch(version):
         raise OperationError('invalid_request', 'release.version must look like 1.4.0.', next_step)
-    if arch != 'arm64':
-        raise OperationError('invalid_request', 'release.arch must be "arm64".', next_step)
+    if arch != MACHINE_ARCH:
+        raise OperationError('invalid_request', f'release.arch must be this machine\'s, "{MACHINE_ARCH}".', next_step)
     if not isinstance(sha, str) or not SHA256.fullmatch(sha):
         raise OperationError('invalid_request', 'release.debSha256 must be 64 lowercase hex characters.', next_step)
     return {'release': {'version': version, 'arch': arch, 'debSha256': sha}}
@@ -135,6 +145,13 @@ class Settings:
     # Files under these directories must have one link, so a user cannot hard-link another file in.
     user_owned_roots: tuple[str, ...] = ('/home/',)
     release_url: str = RELEASE_URL
+    ready_marker: str = '/run/pane-cloud/ready-sent'
+    # update_pane's copy of a newer Pane, on the Session disk; overlay-init deletes it at the next boot.
+    hot_dir: str = '/var/lib/pane-cloud/hot'
+    # Points the daemon at the hot copy; /run is gone at the next boot.
+    hot_dropin: str = f'/run/systemd/system/{PANE_DAEMON_UNIT}.d/hot.conf'
+    # Written into the Pane drive by the image pipeline.
+    pane_drive_version: str = '/opt/Pane/.pane-version'
 
 
 class System:
@@ -165,7 +182,20 @@ class System:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
         return done.returncode, (done.stdout + done.stderr)[-4000:]
 
+    def extract_deb(self, deb: str, dest: str) -> None:
+        """Unpacks a .deb's files into dest without touching the package database."""
+        code, out = self.run(['dpkg-deb', '-x', deb, dest], timeout=600)
+        if code != 0:
+            raise OperationError('internal', f'dpkg-deb could not unpack the release: {out.strip()[-300:]}',
+                                 'Run collect_diagnostics, then retry update_pane.')
+        # Chromium's sandbox helper must be root's and setuid, as the package's own install leaves it.
+        sandbox = os.path.join(dest, 'opt/Pane/chrome-sandbox')
+        if os.path.exists(sandbox):
+            os.chown(sandbox, 0, 0)
+            os.chmod(sandbox, 0o4755)
+
     def installed_pane_version(self) -> str | None:
+        """The base's Pane, from its .deb."""
         code, out = self.run(['dpkg-query', '-W', '-f=${Status} ${Version}', 'pane'], timeout=30)
         if code != 0 or not out.startswith('install ok installed '):
             return None
@@ -173,12 +203,9 @@ class System:
 
     def pane_daemon_call(self, pane_dir: str, channel: str, args: list[Any]) -> Any:
         """Calls the local Pane daemon over its control socket, as runpane does (daemonClient.ts)."""
-        uid = pwd.getpwnam(PANE_USER).pw_uid
-        digest = hashlib.sha256(os.path.abspath(pane_dir).encode()).hexdigest()[:16]
-        path = f'/tmp/pane-daemon-{uid}-{digest}/daemon.sock'
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.settimeout(5)
-            conn.connect(path)
+            conn.connect(daemon_socket_path(pane_dir))
             conn.sendall((json.dumps({'type': 'request', 'id': 1, 'channel': channel, 'args': args}) + '\n').encode())
             reader = conn.makefile('r', encoding='utf-8')
             for line in reader:
@@ -193,6 +220,7 @@ class System:
         return os.path.exists(f'/etc/systemd/system/{PANE_DAEMON_UNIT}')
 
     def restart_pane_daemon(self) -> None:
+        self.run(['systemctl', 'daemon-reload'], timeout=60)
         code, out = self.run(['systemctl', 'restart', PANE_DAEMON_UNIT], timeout=60)
         if code != 0:
             raise OperationError('internal', f'Pane is installed but its daemon did not restart: {out.strip()[-300:]}',
@@ -289,7 +317,7 @@ class Agent:
         return {'synced': True}
 
     def status(self) -> dict[str, Any]:
-        return {'paneVersion': self.system.installed_pane_version(),
+        return {'paneVersion': self._pane_version(),
                 'relay': self._relay(),
                 'secretsVolume': self._secrets_volume(),
                 'activity': self._activity()}
@@ -325,35 +353,54 @@ class Agent:
     # ------------------------------------------------------------ helpers
 
     def _install_release(self, release: dict[str, str]) -> dict[str, Any]:
-        version, sha = release['version'], release['debSha256']
+        """Brings the running machine to the release without touching the package database: the .deb
+        is unpacked into the hot copy and a drop-in in /run points the daemon at it. The next boot
+        deletes both and runs the Pane drive the host attaches."""
+        version, sha, arch = release['version'], release['debSha256'], release['arch']
         if not self._install_lock.acquire(blocking=False):
             raise OperationError('invalid_state', 'Another Pane install is running on this machine.', 'Retry when it finishes.')
         try:
-            before = self.system.installed_pane_version()
+            before = self._pane_version()
             if before == version:
                 return {'paneVersion': version, 'previousVersion': before, 'changed': False}
             os.makedirs(self.settings.state_dir, exist_ok=True)
-            deb = os.path.join(self.settings.state_dir, f'pane-{version}-arm64.deb')
-            url = self.settings.release_url.format(version=version)
+            deb = os.path.join(self.settings.state_dir, f'pane-{version}-{arch}.deb')
+            target = os.path.join(self.settings.hot_dir, version)
             try:
-                actual = self.system.download(url, deb, MAX_DEB_BYTES)
+                actual = self.system.download(self.settings.release_url.format(version=version, arch=arch), deb, MAX_DEB_BYTES)
                 if actual != sha:
                     raise OperationError('release_not_published',
                                          f'The .deb for Pane {version} has sha256 {actual}, not the {sha} the operation names. Nothing was installed.',
                                          'Send the debSha256 from the release\'s SHA256SUMS.txt.')
-                code, out = self.system.run(['apt-get', 'install', '-y', '-q', '-o', 'DPkg::Lock::Timeout=300', '--allow-downgrades', deb], timeout=900)
-                if code != 0:
-                    raise OperationError('internal', f'apt-get could not install Pane {version}: {out.strip()[-300:]}',
-                                         'Run collect_diagnostics, then retry update_pane.')
+                shutil.rmtree(self.settings.hot_dir, ignore_errors=True)
+                os.makedirs(self.settings.hot_dir)
+                self.system.extract_deb(deb, target + '.part')
+                os.rename(target + '.part', target)
             finally:
                 if os.path.exists(deb):
                     os.remove(deb)
-            after = self.system.installed_pane_version()
+            os.makedirs(os.path.dirname(self.settings.hot_dropin), exist_ok=True)
+            with open(self.settings.hot_dropin, 'w') as dropin:
+                dropin.write(f'# Pane {version}, unpacked by update_pane; gone at the next boot.\n[Service]\nExecStart=\n'
+                             f'ExecStart={target}/opt/Pane/pane {DAEMON_ARGUMENTS}\n')
             if self.system.pane_daemon_unit_exists():
                 self.system.restart_pane_daemon()
-            return {'paneVersion': after, 'previousVersion': before, 'changed': True}
+            return {'paneVersion': version, 'previousVersion': before, 'changed': True}
         finally:
             self._install_lock.release()
+
+    def _pane_version(self) -> str | None:
+        """The Pane the daemon runs: update_pane's hot copy, else the Pane drive, else the base's .deb."""
+        try:
+            with open(self.settings.hot_dropin) as dropin:
+                return dropin.readline().split()[2].rstrip(',')
+        except (OSError, IndexError):
+            pass
+        try:
+            with open(self.settings.pane_drive_version) as drive:
+                return drive.read().strip() or None
+        except OSError:
+            return self.system.installed_pane_version()
 
     def _relay(self) -> dict[str, Any]:
         """The daemon's relay identity, which the service vouches for when a client pairs (A6).
@@ -669,6 +716,38 @@ class Reporter:
         return 0
 
 
+def daemon_socket_path(pane_dir: str) -> str:
+    """The Pane daemon's control socket, as runpane finds it (Pane's daemonClient.ts)."""
+    uid = pwd.getpwnam(PANE_USER).pw_uid
+    return f'/tmp/pane-daemon-{uid}-{hashlib.sha256(os.path.abspath(pane_dir).encode()).hexdigest()[:16]}/daemon.sock'
+
+
+def signal_ready(settings: Settings, send: Callable[[dict[str, Any], int], None], socket_path: str) -> None:
+    """Tells the host once per boot that the Pane daemon listens: waits until its control socket
+    accepts a connection, then sends one line to N1's readyPort. The marker lives in /run, so an agent
+    restart does not signal twice and the next boot signals again."""
+    if os.path.exists(settings.ready_marker):
+        return
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.connect(socket_path)
+            break
+        except OSError:
+            time.sleep(0.01)
+    with open(os.path.join(settings.proc_root, 'uptime')) as uptime:
+        message = {'type': 'ready', 'uptimeSeconds': float(uptime.read().split()[0])}
+    for _ in range(600):  # a minute: the host's listener may not be bound yet
+        try:
+            send(message, READY_PORT)
+            break
+        except OSError:
+            time.sleep(0.1)
+    os.makedirs(os.path.dirname(settings.ready_marker), exist_ok=True)
+    with open(settings.ready_marker, 'w'):
+        pass
+
+
 def send_to_host(message: dict[str, Any], port: int = REPORT_PORT) -> None:
     """One report, one connection, to the host agent's vsock listener."""
     with socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM) as conn:
@@ -719,6 +798,7 @@ def vsock_listener(port: int = VSOCK_PORT) -> socket.socket:
 def main() -> None:
     settings = Settings()
     threading.Thread(target=Reporter(settings, send_to_host).run, daemon=True).start()
+    threading.Thread(target=signal_ready, args=(settings, send_to_host, daemon_socket_path(settings.pane_dir)), daemon=True).start()
     serve(vsock_listener(), Agent(settings))
 
 

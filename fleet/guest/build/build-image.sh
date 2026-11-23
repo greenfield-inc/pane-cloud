@@ -4,14 +4,16 @@
 # Runs as root on an Ubuntu 24.04 builder, or in `docker run --privileged --platform linux/arm64`
 # (see build-in-docker.sh). Every download is checked against build/versions.env.
 #
-# Usage: build-image.sh <rootfs|kernel|all> <output dir>
+# Usage: build-image.sh <rootfs|kernel|pane-drive|all> <output dir> [<Pane version> <.deb SHA-256>]
 # Writes the read-only base pane-base-<version>-<arch>.ext4 with its manifest pane-base-<version>-<arch>.json
 # (version = <UBUNTU_RELEASE>-pane<PANE_VERSION>-<first 12 of the image's SHA-256>), vmlinux-<KERNEL_VERSION>,
-# config-<KERNEL_VERSION>, packages.txt, SHA256SUMS.
+# config-<KERNEL_VERSION>, packages.txt, SHA256SUMS. pane-drive writes the read-only Pane drive
+# pane-app-<Pane version>-<sha12>-<arch>.ext4 and its .json from a release .deb: PANE_VERSION by default,
+# or the version and .deb SHA-256 given (the image pipeline runs it on each Pane release).
 set -euo pipefail
 
-what="${1:?usage: build-image.sh <rootfs|kernel|all> <output dir>}"
-out="$(realpath "${2:?usage: build-image.sh <rootfs|kernel|all> <output dir>}")"
+what="${1:?usage: build-image.sh <rootfs|kernel|pane-drive|all> <output dir> [<Pane version> <.deb SHA-256>]}"
+out="$(realpath "${2:?usage: build-image.sh <rootfs|kernel|pane-drive|all> <output dir>}")"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 guest="$(dirname "$here")"
 # shellcheck source-path=SCRIPTDIR source=versions.env
@@ -72,7 +74,7 @@ build_kernel() {
 in_root() { chroot "$work/rootfs" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive HOME=/root "$@"; }
 
 build_rootfs() {
-  local root="$work/rootfs" image="$work/base.ext4"
+  local root="$work/rootfs"
   say "root filesystem from Ubuntu 24.04 minimal $UBUNTU_RELEASE"
   [ -f "$work/root.tar.xz" ] || fetch "$UBUNTU_ROOT_BASE/ubuntu-24.04-minimal-cloudimg-$arch-root.tar.xz" "$(pin UBUNTU_ROOT_SHA256)" "$work/root.tar.xz"
   rm -rf "$root" && mkdir -p "$root"
@@ -129,6 +131,13 @@ build_rootfs() {
   say "Firecracker boot settings"
   # The host configures eth0 with the kernel's ip= argument; nothing in the guest manages it.
   in_root systemctl mask systemd-networkd.service systemd-networkd-wait-online.service systemd-resolved.service
+  # A slim boot (D-104): nothing a headless VM with no login and no package work needs. Time sync stays,
+  # off the Pane daemon's path.
+  in_root systemctl mask apport.service apport-autoreport.timer unattended-upgrades.service pollinate.service \
+    apt-daily.timer apt-daily-upgrade.timer motd-news.timer dpkg-db-backup.timer e2scrub_all.timer fstrim.timer \
+    ua-timer.timer ubuntu-advantage.service ua-reboot-cmds.service ssh.socket ssh.service lxd-installer.socket \
+    console-setup.service keyboard-setup.service setvtrgb.service secureboot-db.service apparmor.service \
+    getty@tty1.service systemd-pstore.service >/dev/null 2>&1
   # The kernel lists the ip= argument's DNS server in /proc/net/pnp, in resolv.conf format.
   ln -sf /proc/net/pnp "$root/etc/resolv.conf"
   # The root is overlay-init's overlay of the base and the Session disk, mounted before systemd starts.
@@ -145,29 +154,59 @@ build_rootfs() {
   trap - EXIT
 
   say "read-only base"
-  # No journal (nothing writes to it) and shrunk to its contents: the host keeps it in memory.
-  local mib sha version name
-  mib=$(( $(du -sm "$root" | cut -f1) * 12 / 10 + 256 ))
+  local name
+  name="$(pack_read_only "$root" pane-base "pane-base-$UBUNTU_RELEASE-pane$PANE_VERSION")"
+  write_manifest "$name" "$(stat -c %s "$out/$name.ext4")" >"$out/$name.json"
+}
+
+# pack_read_only <dir> <label> <name prefix>: an ext4 image of dir with no journal (nothing writes to it),
+# shrunk to its contents so the host can keep it in memory, named <prefix>-<first 12 of its SHA-256>-<arch>.ext4
+# in the output dir. Prints the name without .ext4.
+pack_read_only() {
+  local dir="$1" label="$2" prefix="$3" image="$work/$2.ext4" mib sha name
+  mib=$(( $(du -sm "$dir" | cut -f1) * 12 / 10 + 256 ))
   rm -f "$image"
   truncate -s "${mib}M" "$image"
-  mkfs.ext4 -q -L pane-base -O ^has_journal -d "$root" "$image"
+  mkfs.ext4 -q -L "$label" -O ^has_journal -d "$dir" "$image"
   e2fsck -fy "$image" >/dev/null
   resize2fs -M "$image" >/dev/null 2>&1
   e2fsck -fn "$image" >/dev/null
   truncate -s "$(dumpe2fs -h "$image" 2>/dev/null | awk -F: '/^Block count/ {n=$2} /^Block size/ {s=$2} END {print n * s}')" "$image"
   sha="$(sha256sum "$image" | cut -d' ' -f1)"
-  version="$UBUNTU_RELEASE-pane$PANE_VERSION-${sha:0:12}"
-  name="pane-base-$version-$arch"
-  rm -f "$out"/pane-base-*-"$arch".ext4 "$out"/pane-base-*-"$arch".json
+  name="$prefix-${sha:0:12}-$arch"
+  rm -f "$out/$prefix"-*-"$arch".ext4 "$out/$prefix"-*-"$arch".json
   mv "$image" "$out/$name.ext4"
-  write_manifest "$name" "$version" "$sha" >"$out/$name.json"
+  echo "$name"
+}
+
+# The Pane drive (D-105): the release .deb's /opt/Pane, which overlay-init mounts over the base's.
+build_pane_drive() {
+  local version="${1:-$PANE_VERSION}" deb_sha="${2:-$(pin PANE_DEB_SHA256)}" dir="$work/pane-drive" name
+  say "Pane drive for Pane $version"
+  fetch "https://github.com/greenfield-inc/Pane/releases/download/v$version/Pane-$version-linux-$arch.deb" "$deb_sha" "$work/pane-drive.deb"
+  rm -rf "$dir" "$work/pane-drive.root" && mkdir -p "$work/pane-drive.root"
+  dpkg-deb -x "$work/pane-drive.deb" "$work/pane-drive.root"
+  mv "$work/pane-drive.root/opt/Pane" "$dir"
+  rm -rf "$work/pane-drive.root" "$work/pane-drive.deb"
+  # Chromium's sandbox helper is root's and setuid, as the package's install leaves it.
+  chown root:root "$dir/chrome-sandbox" && chmod 4755 "$dir/chrome-sandbox"
+  echo "$version" >"$dir/.pane-version"
+  name="$(pack_read_only "$dir" pane-app "pane-app-$version")"
+  python3 - "$name" "$version" "$deb_sha" "$(sha256sum "$out/$name.ext4" | cut -d' ' -f1)" "$(stat -c %s "$out/$name.ext4")" "$arch" >"$out/$name.json" <<'PY'
+import json, sys
+name, version, deb_sha, sha, size, arch = sys.argv[1:]
+print(json.dumps({'manifestVersion': 1, 'drive': f'{name}.ext4', 'paneVersion': version, 'debSha256': deb_sha,
+                  'sha256': sha, 'bytes': int(size), 'arch': arch, 'device': 'vdd', 'label': 'pane-app', 'readOnly': True}, indent=2))
+PY
+  rm -rf "$dir"
 }
 
 # The contract N1 (host) and N3 (Session disks) build against; README "Base image" explains it.
 write_manifest() {
-  python3 - "$1" "$2" "$3" "$(stat -c %s "$out/$1.ext4")" "$arch" "$PANE_VERSION" "$UBUNTU_RELEASE" "$KERNEL_VERSION" <<'PY'
+  python3 - "$1" "$(sha256sum "$out/$1.ext4" | cut -d' ' -f1)" "$2" "$arch" "$PANE_VERSION" "$UBUNTU_RELEASE" "$KERNEL_VERSION" <<'PY'
 import json, sys
-name, version, sha, size, arch, pane, ubuntu, kernel = sys.argv[1:]
+name, sha, size, arch, pane, ubuntu, kernel = sys.argv[1:]
+version = name[len('pane-base-'):-len(f'-{arch}')]
 print(json.dumps({
     'manifestVersion': 1,
     'base': f'{name}.ext4', 'version': version, 'sha256': sha, 'bytes': int(size), 'arch': arch,
@@ -177,8 +216,10 @@ print(json.dumps({
         {'device': 'vda', 'role': 'base', 'readOnly': True, 'rootDevice': True, 'path': f'{name}.ext4'},
         {'device': 'vdb', 'role': 'session', 'readOnly': False, 'filesystem': 'ext4', 'label': 'pane-session',
          'format': 'mkfs.ext4 -q -L pane-session -E lazy_itable_init=1,lazy_journal_init=1 -J size=64 <device>'},
-        {'device': 'vdc', 'role': 'secrets', 'readOnly': False, 'maxBytes': 1024 ** 3,
-         'format': 'none: give it blank (all zeros); the guest formats it'},
+        {'device': 'vdc', 'role': 'secrets', 'readOnly': False, 'maxBytes': 1024 ** 3, 'filesystem': 'ext4',
+         'label': 'pane-secrets', 'format': 'mkfs.ext4 -q -L pane-secrets <device>'},
+        {'device': 'vdd', 'role': 'pane', 'readOnly': True, 'optional': True, 'label': 'pane-app',
+         'path': 'pane-app-<Pane version>-<sha12>-<arch>.ext4, the newest Pane drive'},
     ],
 }, indent=2))
 PY
@@ -188,7 +229,8 @@ build_deps
 case "$what" in
   rootfs) build_rootfs ;;
   kernel) build_kernel ;;
-  all) build_kernel; build_rootfs ;;
+  pane-drive) build_pane_drive "${3:-}" "${4:-}" ;;
+  all) build_kernel; build_rootfs; build_pane_drive ;;
   *) echo "unknown target $what" >&2; exit 2 ;;
 esac
 (cd "$out" && { sha256sum ./*.ext4 ./*.json ./vmlinux-* 2>/dev/null >SHA256SUMS || true; })

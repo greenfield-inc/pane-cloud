@@ -74,6 +74,11 @@ jobs:
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo bash build/check-image.sh "$RUNNER_TEMP/out"
+      - name: build a newer Pane drive than the base's Pane
+        run: |
+          source build/versions.env
+          sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh pane-drive "$RUNNER_TEMP/out" \
+            "$CI_PANE_DRIVE_VERSION" "$CI_PANE_DRIVE_DEB_SHA256_amd64"
       - name: boot under Firecracker and check first boot over vsock
         # Optional: with it, the check also has Claude Code answer a prompt inside the guest.
         env:

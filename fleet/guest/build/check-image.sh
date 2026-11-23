@@ -51,6 +51,26 @@ ok = (manifest['base'] == os.path.basename(image) and manifest['sha256'] == sha 
 sys.exit(0 if ok else 1)
 PY
 
+echo "== Pane drive"
+drives=("$out"/pane-app-*-"$arch".ext4)
+if [ "${#drives[@]}" -ne 1 ]; then
+  fail "one Pane drive pane-app-*-$arch.ext4 (found ${#drives[@]})"
+else
+  drive="${drives[0]}"
+  check "the Pane drive is labelled pane-app, with no journal" \
+    bash -c "[ \"\$(e2label '$drive')\" = pane-app ] && ! dumpe2fs -h '$drive' 2>/dev/null | grep -q has_journal"
+  check "the Pane drive holds Pane $PANE_VERSION, its version file and a setuid root chrome-sandbox" bash -c "
+    [ \"\$(debugfs -R 'cat /.pane-version' '$drive' 2>/dev/null)\" = '$PANE_VERSION' ] &&
+    debugfs -R 'stat /pane' '$drive' 2>/dev/null | grep -q 'Type: regular' &&
+    debugfs -R 'stat /chrome-sandbox' '$drive' 2>/dev/null | grep -Eq 'Mode: +04755' &&
+    debugfs -R 'stat /chrome-sandbox' '$drive' 2>/dev/null | grep -q 'User: +0 '"
+  check "the Pane drive's manifest names it and its SHA-256" python3 -I -c '
+import hashlib, json, os, sys
+m = json.load(open(sys.argv[1][:-5] + ".json"))
+sha = hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest()
+sys.exit(0 if m["drive"] == os.path.basename(sys.argv[1]) and m["sha256"] == sha and m["paneVersion"] == sys.argv[2] else 1)' "$drive" "$PANE_VERSION"
+fi
+
 work="$(mktemp -d)"
 lower="$work/lower" root="$work/root"
 mkdir -p "$lower" "$root" "$work/upper" "$work/work"
@@ -107,6 +127,9 @@ mount -t sysfs sys "$root/sys"
 mount --bind /dev "$root/dev"
 mount --bind /dev/pts "$root/dev/pts"
 mount -t tmpfs shm "$root/dev/shm"
+# DNS for the probes below, in the throwaway layer only: the base's resolv.conf is the guest kernel's
+# /proc/net/pnp, which is empty here. OpenCode reaches the network even for --version.
+rm -f "$root/etc/resolv.conf" && cp /etc/resolv.conf "$root/etc/resolv.conf"
 # The agent CLIs the build installed (OpenCode, built on Bun, needs /proc).
 for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gemini:gemini; do
   version="$(chroot "$root" runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \

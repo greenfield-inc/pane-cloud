@@ -11,12 +11,13 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 
-from pane_guest_agent import Agent, Reporter, Settings, System, serve
+from pane_guest_agent import MACHINE_ARCH, READY_PORT, Agent, Reporter, Settings, System, serve, signal_ready
 
 SHA256_OF_ABC = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
-RELEASE = {'version': '2.4.215', 'arch': 'arm64', 'debSha256': SHA256_OF_ABC}
+RELEASE = {'version': '2.4.215', 'arch': MACHINE_ARCH, 'debSha256': SHA256_OF_ABC}
 RELAY_READY = {'enabled': True, 'phase': 'ready', 'id': 'k7d2m4q9x3abcd5e', 'domain': 'runpane.net',
                'address': 'https://k7d2m4q9x3abcd5e.runpane.net', 'relay': 'us.relay.runpane.net', 'region': 'us',
                'localAddresses': [], 'certificate': None, 'lastError': None, 'certificateLimit': None}
@@ -26,13 +27,14 @@ RELAY_COMPUTER = {'id': 'k7d2m4q9x3abcd5e', 'name': 'pane-1a2b3c4d', 'domain': '
 
 
 class FakeSystem(System):
-    """The machine: a release server that serves b'abc', apt and the Pane daemon."""
+    """The machine: a release server that serves b'abc', the base's Pane package and the Pane daemon."""
 
     def __init__(self):
         self.version = '2.4.214'
         self.downloads = []
         self.commands = []
         self.restarts = 0
+        self.extracted = []
         self.workspace_state = None
         self.host_state = None
         self.relay_status = None
@@ -46,9 +48,13 @@ class FakeSystem(System):
 
     def run(self, argv, timeout=600):
         self.commands.append(argv)
-        if argv[:2] == ['apt-get', 'install']:
-            self.version = '2.4.215'
         return 0, ''
+
+    def extract_deb(self, deb, dest):
+        self.extracted.append(deb)
+        os.makedirs(f'{dest}/opt/Pane')
+        with open(f'{dest}/opt/Pane/pane', 'w') as binary:
+            binary.write('pane')
 
     def installed_pane_version(self):
         return self.version
@@ -88,6 +94,9 @@ class GuestAgentTest(unittest.TestCase):
             user_owned_roots=(self.path('home') + '/',),
             mounts_path=self.path('proc/self/mounts'),
             secrets_mount='/home/pane/.pane-secrets',
+            hot_dir=self.path('var/lib/pane-cloud/hot'),
+            hot_dropin=self.path('run/systemd/system/pane-daemon.service.d/hot.conf'),
+            pane_drive_version=self.path('opt/Pane/.pane-version'),
         )
         sock_path = self.path('agent.sock')
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -131,8 +140,8 @@ class GuestAgentTest(unittest.TestCase):
         cases = {
             'extra release field': ('update_pane', {'release': {**RELEASE, 'url': 'https://evil.example/pane.deb'}}),
             'extra parameter': ('update_pane', {'release': RELEASE, 'force': True}),
-            'missing checksum': ('bootstrap', {'release': {'version': '2.4.215', 'arch': 'arm64'}}),
-            'x86 build': ('update_pane', {'release': {**RELEASE, 'arch': 'amd64'}}),
+            'missing checksum': ('bootstrap', {'release': {'version': '2.4.215', 'arch': MACHINE_ARCH}}),
+            'another architecture\'s build': ('update_pane', {'release': {**RELEASE, 'arch': 'i386'}}),
             'version with a path': ('update_pane', {'release': {**RELEASE, 'version': '2.4.215/../../x'}}),
             'non-ascii digits': ('update_pane', {'release': {**RELEASE, 'version': '٢.4.215'}}),
             'uppercase checksum': ('update_pane', {'release': {**RELEASE, 'debSha256': SHA256_OF_ABC.upper()}}),
@@ -159,35 +168,39 @@ class GuestAgentTest(unittest.TestCase):
 
     # ------------------------------------------------------------ install
 
-    def test_update_pane_installs_the_release_deb_after_checking_its_checksum(self):
+    def test_update_pane_unpacks_the_release_beside_the_package_database_and_restarts_on_it(self):
         reply = self.send('update_pane', {'release': RELEASE})
 
         self.assertTrue(reply['ok'], reply)
         self.assertEqual(reply['result'], {'paneVersion': '2.4.215', 'previousVersion': '2.4.214', 'changed': True})
         self.assertEqual(self.system.downloads,
-                         ['https://github.com/greenfield-inc/Pane/releases/download/v2.4.215/Pane-2.4.215-linux-arm64.deb'])
-        deb = self.path('var/lib/pane-cloud/pane-2.4.215-arm64.deb')
-        self.assertEqual([c[-1] for c in self.system.commands if c[:2] == ['apt-get', 'install']], [deb])
+                         [f'https://github.com/greenfield-inc/Pane/releases/download/v2.4.215/Pane-2.4.215-linux-{MACHINE_ARCH}.deb'])
+        self.assertTrue(os.path.exists(self.path('var/lib/pane-cloud/hot/2.4.215/opt/Pane/pane')))
+        with open(self.path('run/systemd/system/pane-daemon.service.d/hot.conf')) as dropin:
+            self.assertIn(f"ExecStart={self.path('var/lib/pane-cloud/hot/2.4.215/opt/Pane/pane')} ", dropin.read())
         self.assertEqual(self.system.restarts, 1)
-        self.assertFalse(os.path.exists(deb))
+        self.assertFalse(any(c[0] in ('apt-get', 'dpkg') for c in self.system.commands))
+        self.assertEqual(sorted(os.listdir(self.path('var/lib/pane-cloud'))), ['hot'])
+        self.assertEqual(self.send('status', {})['result']['paneVersion'], '2.4.215')
 
     def test_update_pane_refuses_a_deb_whose_checksum_does_not_match(self):
         reply = self.send('update_pane', {'release': {**RELEASE, 'debSha256': '0' * 64}})
 
         self.assertFalse(reply['ok'])
         self.assertEqual(reply['error']['code'], 'release_not_published')
-        self.assertEqual(self.system.commands, [])
+        self.assertEqual(self.system.extracted, [])
         self.assertEqual(self.system.restarts, 0)
         self.assertEqual(os.listdir(self.path('var/lib/pane-cloud')), [])
 
-    def test_bootstrap_leaves_the_named_release_alone_when_it_is_installed(self):
-        self.system.version = '2.4.215'
+    def test_bootstrap_does_nothing_when_the_pane_drive_has_the_release(self):
+        self.write('opt/Pane/.pane-version', '2.4.215\n')
 
         reply = self.send('bootstrap', {'release': RELEASE})
 
         self.assertEqual(reply['result'], {'paneVersion': '2.4.215', 'previousVersion': '2.4.215', 'changed': False,
                                            'firstBoot': 'done'})
         self.assertEqual(self.system.downloads, [])
+        self.assertEqual(self.system.restarts, 0)
 
     # ------------------------------------------------------------ status
 
@@ -402,6 +415,47 @@ class ReporterTest(unittest.TestCase):
         self.fake_proc(swap_total_kb=4 * gib_kb, swap_free_kb=gib_kb)
         reporter.check_memory(now=5)
         self.assertEqual([(m['reasons'], m['swapUsedBytes']) for m in sent], [(['swap'], 3 * 1024 ** 3)])
+
+class ReadySignalTest(unittest.TestCase):
+    """The guest tells the host once the Pane daemon's control socket listens (N1's readyPort)."""
+
+    def setUp(self):
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix='pga-ready-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, self.root)
+        os.makedirs(f'{self.root}/proc')
+        with open(f'{self.root}/proc/uptime', 'w') as uptime:
+            uptime.write('1.25 0.50\n')
+        self.settings = Settings(proc_root=f'{self.root}/proc', ready_marker=f'{self.root}/run/ready-sent')
+        self.sock = f'{self.root}/daemon.sock'
+        self.sent = []
+
+    def send(self, message, port):
+        self.sent.append((port, message))
+
+    def listen_later(self, seconds):
+        def listen():
+            time.sleep(seconds)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(self.sock)
+            listener.listen()
+            self.addCleanup(listener.close)
+        threading.Thread(target=listen, daemon=True).start()
+
+    def test_signals_ready_once_the_daemon_socket_listens(self):
+        self.listen_later(0.2)
+
+        signal_ready(self.settings, self.send, self.sock)
+
+        self.assertEqual(self.sent, [(READY_PORT, {'type': 'ready', 'uptimeSeconds': 1.25})])
+
+    def test_signals_once_per_boot_even_if_the_agent_restarts(self):
+        self.listen_later(0)
+        signal_ready(self.settings, self.send, self.sock)
+
+        signal_ready(self.settings, self.send, self.sock)
+
+        self.assertEqual(len(self.sent), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

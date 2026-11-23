@@ -1,6 +1,11 @@
 [Unit]
 Description=Pane Cloud guest agent (vsock port 1024)
-After=local-fs.target
+# Up right after sysinit, so the host reaches it early and its ready signal goes out the moment the
+# Pane daemon listens.
+DefaultDependencies=no
+After=sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
 # Keep restarting however often it crashes: the host needs the agent.
 StartLimitIntervalSec=0
 

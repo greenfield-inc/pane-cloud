@@ -1,15 +1,20 @@
 #!/bin/sh
 # PID 1 before systemd (kernel argument init=/usr/local/lib/pane-cloud/overlay-init): makes the root
 # an overlay of the read-only base (/dev/vda, booted with root=/dev/vda ro) and the Session disk
-# (/dev/vdb, ext4 labelled pane-session, made by the host), then hands over to systemd.
+# (/dev/vdb, ext4 labelled pane-session, made by the host), mounts the newest Pane drive over
+# /opt/Pane, then hands over to systemd.
 #   /                 the overlay: the base below, the Session disk's upper/ above
 #   /mnt/base         the base, read-only
 #   /mnt/session      the Session disk (upper/ and work/ live here)
-# The kernel has already mounted devtmpfs on /dev. Nothing here writes to the base.
+#   /opt/Pane         the Pane drive (/dev/vdd, ext4 labelled pane-app, read-only) when the host
+#                     attaches one; otherwise the base's own Pane from its .deb
+# A Pane that update_pane unpacked into /var/lib/pane-cloud/hot during the last boot is deleted: this
+# boot runs the Pane drive. The kernel has already mounted devtmpfs on /dev. Nothing here writes to
+# the base.
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 fail() {
-  echo "overlay-init: $*; the machine cannot start without its Session disk" >/dev/console
+  echo "overlay-init: $*; the machine cannot start" >/dev/console
   exec sleep 2147483647
 }
 
@@ -20,6 +25,10 @@ mount -t ext4 -o noatime,noinit_itable /dev/vdb /mnt/session || fail "cannot mou
 mkdir -p /mnt/session/upper /mnt/session/work
 mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/session/upper,workdir=/mnt/session/work /mnt/root \
   || fail "cannot mount the overlay root"
+rm -rf /mnt/root/var/lib/pane-cloud/hot
+if [ -b /dev/vdd ] && [ "$(blkid -s LABEL -o value /dev/vdd 2>/dev/null)" = pane-app ]; then
+  mount -t ext4 -o ro,nodev,noatime /dev/vdd /mnt/root/opt/Pane || fail "cannot mount the Pane drive /dev/vdd"
+fi
 mount --move /mnt/session /mnt/root/mnt/session
 mount --move /dev /mnt/root/dev
 umount /proc
