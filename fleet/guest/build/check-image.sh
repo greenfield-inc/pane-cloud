@@ -93,16 +93,14 @@ mount --bind /dev/pts "$root/dev/pts"
 mount -t tmpfs shm "$root/dev/shm"
 # As pane-remote-daemon.service runs it, with the image's config.json (workspaces and the relay on).
 # The relay certificate comes from Let's Encrypt's staging CA, so checks never spend the limits Pane's
-# users share.
+# users share. --no-sandbox only here: Chromium's sandbox needs unprivileged user namespaces, which the
+# guest kernel allows (USER_NS, no AppArmor) and the Ubuntu 24.04 builder's AppArmor refuses.
 chroot "$root" runuser -u pane -- env -i HOME=/home/pane PATH=/usr/local/bin:/usr/bin:/bin ELECTRON_OZONE_PLATFORM_HINT=headless \
   APPIMAGE_EXTRACT_AND_RUN=1 NO_CLEANUP=1 PANE_DIR=/home/pane/.pane PANE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory \
-  /home/pane/.local/bin/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane >"$work/daemon.log" 2>&1 &
+  /home/pane/.local/bin/pane --no-sandbox --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane >"$work/daemon.log" 2>&1 &
 for _ in $(seq 1 90); do compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null && break; sleep 1; done
 if ! compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null; then
   fail "the Pane daemon opened its control socket"; tail -40 "$work/daemon.log"
-  echo "     libraries the extracted AppImage cannot find:"
-  # shellcheck disable=SC2016 # expanded inside the chroot
-  chroot "$root" sh -c 'for f in $(find /tmp/appimage_extracted_* -type f -perm -u+x 2>/dev/null); do ldd "$f" 2>/dev/null | grep "not found" | sed "s|^|$f: |"; done' | head -20
 else
   pass "the Pane daemon opened its control socket"
   # The agent's own daemon calls, then a status request over the agent's protocol.

@@ -50,7 +50,8 @@ guest agent's `update_pane` fetches the arm64 AppImage only; on amd64, Pane's ow
   - no virtio-rng: the guest takes no entropy device from the host.
 
   The build fails if `olddefconfig` drops anything in `REQUIRED_KERNEL_CONFIG` (vsock, balloon,
-  ext4, virtio-blk, virtio-net, kernel `ip=`, tun, nftables, pressure stall information, lockdown,
+  ext4, virtio-blk, virtio-net, kernel `ip=`, tun, nftables, pressure stall information, user
+  namespaces (Pane's Chromium sandbox, since the AppImage has no setuid sandbox helper), lockdown,
   module signing) or keeps `HW_RANDOM_VIRTIO`, `VSOCKETS_LOOPBACK` or `PSI_DEFAULT_DISABLED`
   (Firecracker's config leaves memory stall measurement off unless booted with `psi=1`).
 - **Pane.** The release AppImage (SHA-256 checked) at `/home/pane/Applications/Pane.AppImage`,
