@@ -1,8 +1,8 @@
 #!/bin/bash
 # The quick part of every boot, before the Pane daemon starts:
-#   1. grow the root filesystem to the disk the host gave the machine (online, with ext4's resize ioctl)
-#   2. set the hostname from the machine id (the Pane daemon names itself after it)
-#   3. log the kernel's lockdown mode, memory stall support and entropy devices
+#   1. set the hostname from the machine id (the Pane daemon names itself after it)
+#   2. log the kernel's lockdown mode, memory stall support and entropy devices
+# The root is an overlay on the Session disk, which the host formats to its full size, so nothing grows.
 # Logs to /var/log/pane-cloud/bootstrap.log.
 set -uo pipefail
 
@@ -11,22 +11,6 @@ install -d -m 700 /var/log/pane-cloud
 exec >>/var/log/pane-cloud/bootstrap.log 2>&1
 chmod 600 /var/log/pane-cloud/bootstrap.log
 say() { echo "$(date -u +%FT%TZ) identity: $*"; }
-
-# Online resize through ext4's own ioctl on /: the guest kernel refuses writes to a mounted block
-# device (CONFIG_BLK_DEV_WRITE_MOUNTED is off), which resize2fs needs.
-if python3 -I - <<'PY'
-import fcntl, os, struct
-EXT4_IOC_RESIZE_FS = 0x40086610  # _IOW('f', 16, __u64)
-dev = os.stat('/').st_dev
-with open(f'/sys/dev/block/{os.major(dev)}:{os.minor(dev)}/size') as sectors:
-    disk_bytes = int(sectors.read()) * 512
-fd = os.open('/', os.O_RDONLY)
-try:
-    fcntl.ioctl(fd, EXT4_IOC_RESIZE_FS, struct.pack('Q', disk_bytes // os.statvfs('/').f_frsize))
-finally:
-    os.close(fd)
-PY
-then say "root filesystem uses the whole disk ($(df -h --output=size / | tail -1 | tr -d ' '))"; else say "growing the root filesystem failed"; fi
 
 machine_id="$(cat /etc/machine-id)"
 name="pane-${machine_id:0:8}"

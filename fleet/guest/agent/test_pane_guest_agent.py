@@ -16,7 +16,7 @@ import unittest
 from pane_guest_agent import Agent, Reporter, Settings, System, serve
 
 SHA256_OF_ABC = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
-RELEASE = {'version': '2.4.215', 'arch': 'arm64', 'appImageSha256': SHA256_OF_ABC}
+RELEASE = {'version': '2.4.215', 'arch': 'arm64', 'debSha256': SHA256_OF_ABC}
 RELAY_READY = {'enabled': True, 'phase': 'ready', 'id': 'k7d2m4q9x3abcd5e', 'domain': 'runpane.net',
                'address': 'https://k7d2m4q9x3abcd5e.runpane.net', 'relay': 'us.relay.runpane.net', 'region': 'us',
                'localAddresses': [], 'certificate': None, 'lastError': None, 'certificateLimit': None}
@@ -26,11 +26,10 @@ RELAY_COMPUTER = {'id': 'k7d2m4q9x3abcd5e', 'name': 'pane-1a2b3c4d', 'domain': '
 
 
 class FakeSystem(System):
-    """The machine: a release server that serves b'abc' and the Pane daemon."""
+    """The machine: a release server that serves b'abc', apt and the Pane daemon."""
 
     def __init__(self):
         self.version = '2.4.214'
-        self.installs = []
         self.downloads = []
         self.commands = []
         self.restarts = 0
@@ -47,22 +46,16 @@ class FakeSystem(System):
 
     def run(self, argv, timeout=600):
         self.commands.append(argv)
+        if argv[:2] == ['apt-get', 'install']:
+            self.version = '2.4.215'
         return 0, ''
 
-    def install_appimage(self, source, dest):
-        with open(source, 'rb') as new:
-            data = new.read()
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, 'wb') as out:
-            out.write(data)
-        self.installs.append(dest)
-        self.version = '2.4.215'
+    def installed_pane_version(self):
+        return self.version
 
     def pane_daemon_call(self, pane_dir, channel, args):
-        host = {'version': self.version} if self.version else None
         answer = {'runpane:workspace:state': self.workspace_state, 'remote-daemon:get-host-state': self.host_state,
-                  'relay:status': self.relay_status, 'relay:client:computer': self.relay_computer,
-                  'runpane:update:host': host}[channel]
+                  'relay:status': self.relay_status, 'relay:client:computer': self.relay_computer}[channel]
         if answer is None:
             raise ConnectionRefusedError('no daemon')
         return answer
@@ -95,7 +88,6 @@ class GuestAgentTest(unittest.TestCase):
             user_owned_roots=(self.path('home') + '/',),
             mounts_path=self.path('proc/self/mounts'),
             secrets_mount='/home/pane/.pane-secrets',
-            pane_appimage=self.path('home/pane/Applications/Pane.AppImage'),
         )
         sock_path = self.path('agent.sock')
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -137,15 +129,14 @@ class GuestAgentTest(unittest.TestCase):
 
     def test_refuses_any_parameter_the_contract_does_not_allow(self):
         cases = {
-            'extra release field': ('update_pane', {'release': {**RELEASE, 'url': 'https://evil.example/Pane.AppImage'}}),
+            'extra release field': ('update_pane', {'release': {**RELEASE, 'url': 'https://evil.example/pane.deb'}}),
             'extra parameter': ('update_pane', {'release': RELEASE, 'force': True}),
             'missing checksum': ('bootstrap', {'release': {'version': '2.4.215', 'arch': 'arm64'}}),
             'x86 build': ('update_pane', {'release': {**RELEASE, 'arch': 'amd64'}}),
             'version with a path': ('update_pane', {'release': {**RELEASE, 'version': '2.4.215/../../x'}}),
             'non-ascii digits': ('update_pane', {'release': {**RELEASE, 'version': '٢.4.215'}}),
-            'uppercase checksum': ('update_pane', {'release': {**RELEASE, 'appImageSha256': SHA256_OF_ABC.upper()}}),
-            'short checksum': ('update_pane', {'release': {**RELEASE, 'appImageSha256': SHA256_OF_ABC[:63]}}),
-            'the old .deb checksum': ('update_pane', {'release': {'version': '2.4.215', 'arch': 'arm64', 'debSha256': SHA256_OF_ABC}}),
+            'uppercase checksum': ('update_pane', {'release': {**RELEASE, 'debSha256': SHA256_OF_ABC.upper()}}),
+            'short checksum': ('update_pane', {'release': {**RELEASE, 'debSha256': SHA256_OF_ABC[:63]}}),
             'status with parameters': ('status', {'verbose': True}),
             'diagnostics with a path': ('collect_diagnostics', {'path': '/etc/shadow'}),
             'parameters not an object': ('prepare_to_stop', []),
@@ -168,47 +159,43 @@ class GuestAgentTest(unittest.TestCase):
 
     # ------------------------------------------------------------ install
 
-    def test_update_pane_installs_the_release_appimage_after_checking_its_checksum(self):
-        self.write('home/pane/Applications/Pane.AppImage', 'the 2.4.214 AppImage')
-
+    def test_update_pane_installs_the_release_deb_after_checking_its_checksum(self):
         reply = self.send('update_pane', {'release': RELEASE})
 
         self.assertTrue(reply['ok'], reply)
         self.assertEqual(reply['result'], {'paneVersion': '2.4.215', 'previousVersion': '2.4.214', 'changed': True})
         self.assertEqual(self.system.downloads,
-                         ['https://github.com/greenfield-inc/Pane/releases/download/v2.4.215/Pane-2.4.215-linux-arm64.AppImage'])
-        with open(self.path('home/pane/Applications/Pane.AppImage'), 'rb') as installed:
-            self.assertEqual(installed.read(), b'abc')
+                         ['https://github.com/greenfield-inc/Pane/releases/download/v2.4.215/Pane-2.4.215-linux-arm64.deb'])
+        deb = self.path('var/lib/pane-cloud/pane-2.4.215-arm64.deb')
+        self.assertEqual([c[-1] for c in self.system.commands if c[:2] == ['apt-get', 'install']], [deb])
         self.assertEqual(self.system.restarts, 1)
-        self.assertEqual(os.listdir(self.path('var/lib/pane-cloud')), [])
+        self.assertFalse(os.path.exists(deb))
 
-    def test_update_pane_refuses_an_appimage_whose_checksum_does_not_match(self):
-        reply = self.send('update_pane', {'release': {**RELEASE, 'appImageSha256': '0' * 64}})
+    def test_update_pane_refuses_a_deb_whose_checksum_does_not_match(self):
+        reply = self.send('update_pane', {'release': {**RELEASE, 'debSha256': '0' * 64}})
 
         self.assertFalse(reply['ok'])
         self.assertEqual(reply['error']['code'], 'release_not_published')
-        self.assertEqual(self.system.installs, [])
+        self.assertEqual(self.system.commands, [])
         self.assertEqual(self.system.restarts, 0)
         self.assertEqual(os.listdir(self.path('var/lib/pane-cloud')), [])
 
     def test_bootstrap_leaves_the_named_release_alone_when_it_is_installed(self):
-        self.write('home/pane/Applications/Pane.AppImage', 'abc')
+        self.system.version = '2.4.215'
 
         reply = self.send('bootstrap', {'release': RELEASE})
 
         self.assertEqual(reply['result'], {'paneVersion': '2.4.215', 'previousVersion': '2.4.215', 'changed': False,
-                                           'firstBoot': 'running'})
+                                           'firstBoot': 'done'})
         self.assertEqual(self.system.downloads, [])
 
     # ------------------------------------------------------------ status
 
     def test_status_before_the_daemon_answers(self):
-        self.system.version = None
-
         reply = self.send('status', {})
 
         self.assertEqual(reply['result'], {
-            'paneVersion': None,
+            'paneVersion': '2.4.214',
             'relay': {'status': 'unreachable', 'id': None, 'address': None, 'fingerprint': None},
             'secretsVolume': 'missing',
             'activity': {'agentsRunning': 0, 'clientsConnected': 0, 'lastActivityAt': None},

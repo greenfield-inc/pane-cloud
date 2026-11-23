@@ -1,0 +1,27 @@
+# The Pane daemon, run as pane, started as early as the unit graph allows: after the secrets volume
+# (Pane keeps its secrets there) and the hostname (Pane names the machine after it). It does not wait
+# for the network; the relay connects when the network comes up. Workspaces and relay pairing are on
+# in the image's /home/pane/.pane/config.json. Agent panels inherit this environment: the agent CLIs
+# on PATH, resuming after a stop, and Pane's secrets on the secrets volume (K1). Sign-in files the
+# agent CLIs write themselves (~/.codex/auth.json, ~/.config/gh/hosts.yml) stay on the Session disk.
+[Unit]
+Description=Pane daemon
+After=pane-cloud-secrets.service pane-cloud-identity.service
+Wants=pane-cloud-secrets.service pane-cloud-identity.service
+
+[Service]
+User=pane
+Group=pane
+WorkingDirectory=/home/pane
+Environment=HOME=/home/pane
+Environment=PANE_DIR=/home/pane/.pane
+Environment=ELECTRON_OZONE_PLATFORM_HINT=headless
+Environment=PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PANE_RESUME_AGENTS_ON_START=1
+Environment=PANE_SECRETS_DIR=/home/pane/.pane-secrets
+ExecStart=/opt/Pane/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

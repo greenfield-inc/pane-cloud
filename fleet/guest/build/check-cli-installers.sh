@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs the first-boot CLI installer (install-agent-clis.sh) in a fresh Ubuntu 24.04 arm64 container,
+# Runs the image build's CLI installer (install-agent-clis.sh) in a fresh Ubuntu 24.04 arm64 container,
 # as a `pane` user with the image's pinned Node, and prints each CLI's result and version.
 # Usage: bash build/check-cli-installers.sh   (needs Docker that can run linux/arm64)
 set -euo pipefail
@@ -12,7 +12,7 @@ source "$here/versions.env"
 set +a
 
 docker run --rm --platform linux/arm64 \
-  -v "$guest/rootfs/usr/local/lib/pane-cloud:/opt/pane-cloud:ro" \
+  -v "$guest/build:/opt/pane-cloud:ro" \
   -e NODE_VERSION -e NODE_SHA256_arm64 \
   "ubuntu:24.04" bash -euo pipefail -c '
     apt-get update -qq >/dev/null

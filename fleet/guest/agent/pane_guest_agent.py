@@ -49,11 +49,9 @@ PRESSURE_REPEAT_SECONDS = 60
 MAX_HASH_BYTES = 2 * 1024 ** 3
 MAX_REQUEST_BYTES = 64 * 1024
 PANE_USER = 'pane'
-PANE_DAEMON_UNIT = 'pane-remote-daemon.service'
-RELEASE_URL = 'https://github.com/greenfield-inc/Pane/releases/download/v{version}/Pane-{version}-linux-arm64.AppImage'
-MAX_RELEASE_BYTES = 1024 ** 3
-# Pane is the release AppImage, owned by pane, as on any Linux machine, so Pane's own Update Pane works here.
-PANE_APPIMAGE = '/home/pane/Applications/Pane.AppImage'
+PANE_DAEMON_UNIT = 'pane-daemon.service'
+RELEASE_URL = 'https://github.com/greenfield-inc/Pane/releases/download/v{version}/Pane-{version}-linux-arm64.deb'
+MAX_DEB_BYTES = 1024 ** 3
 # A diagnostics archive carries at most the last 4 MiB of each file, so the response line stays bounded.
 MAX_DIAGNOSTIC_FILE_BYTES = 4 * 1024 ** 2
 MAX_DIAGNOSTIC_FILES = 16
@@ -81,13 +79,6 @@ class OperationError(Exception):
         self.next_step = next_step
 
 
-def sha256_of(read: Callable[[int], bytes]) -> str:
-    digest = hashlib.sha256()
-    while chunk := read(1024 * 1024):
-        digest.update(chunk)
-    return digest.hexdigest()
-
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -102,20 +93,20 @@ def check_no_parameters(parameters: Any) -> dict[str, Any]:
 
 
 def check_release_parameters(parameters: Any) -> dict[str, Any]:
-    next_step = 'Send exactly {"release": {"version": "X.Y.Z", "arch": "arm64", "appImageSha256": "<64 lowercase hex>"}}.'
+    next_step = 'Send exactly {"release": {"version": "X.Y.Z", "arch": "arm64", "debSha256": "<64 lowercase hex>"}}.'
     if not isinstance(parameters, dict) or set(parameters) != {'release'}:
         raise OperationError('invalid_request', 'The parameters must be exactly {"release": {...}}.', next_step)
     release = parameters['release']
-    if not isinstance(release, dict) or set(release) != {'version', 'arch', 'appImageSha256'}:
-        raise OperationError('invalid_request', 'The release must have exactly version, arch and appImageSha256.', next_step)
-    version, arch, sha = release['version'], release['arch'], release['appImageSha256']
+    if not isinstance(release, dict) or set(release) != {'version', 'arch', 'debSha256'}:
+        raise OperationError('invalid_request', 'The release must have exactly version, arch and debSha256.', next_step)
+    version, arch, sha = release['version'], release['arch'], release['debSha256']
     if not isinstance(version, str) or not VERSION.fullmatch(version):
         raise OperationError('invalid_request', 'release.version must look like 1.4.0.', next_step)
     if arch != 'arm64':
         raise OperationError('invalid_request', 'release.arch must be "arm64".', next_step)
     if not isinstance(sha, str) or not SHA256.fullmatch(sha):
-        raise OperationError('invalid_request', 'release.appImageSha256 must be 64 lowercase hex characters.', next_step)
-    return {'release': {'version': version, 'arch': arch, 'appImageSha256': sha}}
+        raise OperationError('invalid_request', 'release.debSha256 must be 64 lowercase hex characters.', next_step)
+    return {'release': {'version': version, 'arch': arch, 'debSha256': sha}}
 
 
 PARAMETER_CHECKS: dict[str, Callable[[Any], dict[str, Any]]] = {
@@ -144,7 +135,6 @@ class Settings:
     # Files under these directories must have one link, so a user cannot hard-link another file in.
     user_owned_roots: tuple[str, ...] = ('/home/',)
     release_url: str = RELEASE_URL
-    pane_appimage: str = PANE_APPIMAGE
 
 
 class System:
@@ -175,15 +165,11 @@ class System:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
         return done.returncode, (done.stdout + done.stderr)[-4000:]
 
-    def install_appimage(self, source: str, dest: str) -> None:
-        """Replaces dest with source as the pane user, so a link pane planted in its home can't aim a root write."""
-        script = 'set -e; mkdir -p "$(dirname "$1")"; t="$(mktemp "$1.XXXXXX")"; cat >"$t"; chmod 755 "$t"; mv -f "$t" "$1"'
-        with open(source, 'rb') as data:
-            done = subprocess.run(['runuser', '-u', PANE_USER, '--', 'sh', '-c', script, 'sh', dest],
-                                  stdin=data, capture_output=True, text=True, timeout=300, check=False)
-        if done.returncode != 0:
-            raise OperationError('internal', f'Pane could not be written: {(done.stdout + done.stderr).strip()[-300:]}',
-                                 'Run collect_diagnostics, then retry update_pane.')
+    def installed_pane_version(self) -> str | None:
+        code, out = self.run(['dpkg-query', '-W', '-f=${Status} ${Version}', 'pane'], timeout=30)
+        if code != 0 or not out.startswith('install ok installed '):
+            return None
+        return out.rsplit(' ', 1)[-1].strip() or None
 
     def pane_daemon_call(self, pane_dir: str, channel: str, args: list[Any]) -> Any:
         """Calls the local Pane daemon over its control socket, as runpane does (daemonClient.ts)."""
@@ -204,10 +190,10 @@ class System:
         raise RuntimeError('Pane closed the control socket without answering')
 
     def pane_daemon_unit_exists(self) -> bool:
-        return os.path.exists(f'/home/{PANE_USER}/.config/systemd/user/{PANE_DAEMON_UNIT}')
+        return os.path.exists(f'/etc/systemd/system/{PANE_DAEMON_UNIT}')
 
     def restart_pane_daemon(self) -> None:
-        code, out = self.run(['systemctl', '--user', f'--machine={PANE_USER}@', 'restart', PANE_DAEMON_UNIT], timeout=60)
+        code, out = self.run(['systemctl', 'restart', PANE_DAEMON_UNIT], timeout=60)
         if code != 0:
             raise OperationError('internal', f'Pane is installed but its daemon did not restart: {out.strip()[-300:]}',
                                  'Run collect_diagnostics and read bootstrap.log.')
@@ -289,10 +275,9 @@ class Agent:
     # ------------------------------------------------------------ operations
 
     def bootstrap(self, release: dict[str, str]) -> dict[str, Any]:
-        """Runs on every boot: brings Pane to the release the host names (update on boot)."""
-        result = self._install_release(release)
-        result['firstBoot'] = self._first_boot_state()
-        return result
+        """Runs on every boot: brings Pane to the release the host names (update on boot). The agent
+        CLIs are in the image, so first boot has nothing left to do."""
+        return {**self._install_release(release), 'firstBoot': 'done'}
 
     def update_pane(self, release: dict[str, str]) -> dict[str, Any]:
         return self._install_release(release)
@@ -304,7 +289,7 @@ class Agent:
         return {'synced': True}
 
     def status(self) -> dict[str, Any]:
-        return {'paneVersion': self._pane_version(),
+        return {'paneVersion': self.system.installed_pane_version(),
                 'relay': self._relay(),
                 'secretsVolume': self._secrets_volume(),
                 'activity': self._activity()}
@@ -340,56 +325,35 @@ class Agent:
     # ------------------------------------------------------------ helpers
 
     def _install_release(self, release: dict[str, str]) -> dict[str, Any]:
-        version, sha = release['version'], release['appImageSha256']
+        version, sha = release['version'], release['debSha256']
         if not self._install_lock.acquire(blocking=False):
             raise OperationError('invalid_state', 'Another Pane install is running on this machine.', 'Retry when it finishes.')
         try:
-            # The installed AppImage is the release exactly when its hash is the release's.
-            if self._file_sha256(self.settings.pane_appimage) == sha:
-                return {'paneVersion': version, 'previousVersion': version, 'changed': False}
-            before = self._pane_version()
+            before = self.system.installed_pane_version()
+            if before == version:
+                return {'paneVersion': version, 'previousVersion': before, 'changed': False}
             os.makedirs(self.settings.state_dir, exist_ok=True)
-            download = os.path.join(self.settings.state_dir, f'Pane-{version}-arm64.AppImage')
+            deb = os.path.join(self.settings.state_dir, f'pane-{version}-arm64.deb')
             url = self.settings.release_url.format(version=version)
             try:
-                actual = self.system.download(url, download, MAX_RELEASE_BYTES)
+                actual = self.system.download(url, deb, MAX_DEB_BYTES)
                 if actual != sha:
                     raise OperationError('release_not_published',
-                                         f'The AppImage for Pane {version} has sha256 {actual}, not the {sha} the operation names. Nothing was installed.',
-                                         'Send the appImageSha256 from the release\'s SHA256SUMS.txt.')
-                self.system.install_appimage(download, self.settings.pane_appimage)
+                                         f'The .deb for Pane {version} has sha256 {actual}, not the {sha} the operation names. Nothing was installed.',
+                                         'Send the debSha256 from the release\'s SHA256SUMS.txt.')
+                code, out = self.system.run(['apt-get', 'install', '-y', '-q', '-o', 'DPkg::Lock::Timeout=300', '--allow-downgrades', deb], timeout=900)
+                if code != 0:
+                    raise OperationError('internal', f'apt-get could not install Pane {version}: {out.strip()[-300:]}',
+                                         'Run collect_diagnostics, then retry update_pane.')
             finally:
-                if os.path.exists(download):
-                    os.remove(download)
+                if os.path.exists(deb):
+                    os.remove(deb)
+            after = self.system.installed_pane_version()
             if self.system.pane_daemon_unit_exists():
                 self.system.restart_pane_daemon()
-            return {'paneVersion': version, 'previousVersion': before, 'changed': True}
+            return {'paneVersion': after, 'previousVersion': before, 'changed': True}
         finally:
             self._install_lock.release()
-
-    def _pane_version(self) -> str | None:
-        """The running Pane's version, as runpane update reads it; None while the daemon does not answer."""
-        try:
-            host = self.system.pane_daemon_call(self.settings.pane_dir, 'runpane:update:host', [])
-        except Exception:  # noqa: BLE001 - not running yet, or restarting
-            return None
-        version = host.get('version') if isinstance(host, dict) else None
-        return version if isinstance(version, str) and VERSION.fullmatch(version) else None
-
-    @staticmethod
-    def _file_sha256(path: str) -> str | None:
-        try:
-            with open(path, 'rb') as data:
-                return sha256_of(data.read)
-        except OSError:
-            return None
-
-    def _first_boot_state(self) -> str:
-        if os.path.exists(os.path.join(self.settings.state_dir, 'firstboot.done')):
-            return 'done'
-        if os.path.exists(os.path.join(self.settings.state_dir, 'firstboot.failed')):
-            return 'failed'
-        return 'running'
 
     def _relay(self) -> dict[str, Any]:
         """The daemon's relay identity, which the service vouches for when a client pairs (A6).
@@ -665,7 +629,10 @@ class Reporter:
             if key not in self._hashes:
                 digest: str | None = None
                 if stat.S_ISREG(info.st_mode) and info.st_size <= MAX_HASH_BYTES:
-                    digest = sha256_of(lambda size: os.read(fd, size))
+                    hasher = hashlib.sha256()
+                    while chunk := os.read(fd, 1024 * 1024):
+                        hasher.update(chunk)
+                    digest = hasher.hexdigest()
                 self._hashes[key] = digest
             return self._hashes[key], key
         finally:

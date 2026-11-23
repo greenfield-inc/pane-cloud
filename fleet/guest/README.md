@@ -1,7 +1,7 @@
 # Guest image (N5)
 
 The machine every Pane Cloud Session runs in: Ubuntu 24.04 arm64 with git, Node and the stock Pane
-release AppImage, booted by Firecracker in a Nitro Sandbox in direct mode (D-55) with its own guest kernel. The
+`.deb`, booted by Firecracker in a Nitro Sandbox in direct mode (D-55) with its own guest kernel. The
 Pane daemon runs with relay pairing on, so clients reach it through Pane's relay with no Tailscale. A
 guest agent on vsock port 1024 runs the five allow-listed guest operations the host agent sends and
 nothing else, and reports the machine's processes and memory pressure to the host on port 1025.
@@ -31,13 +31,13 @@ It writes `out/pane-guest-<ubuntu release>-pane-<version>-<arch>.ext4`, `out/vml
 
 The build targets the builder's own architecture. **arm64 is the production image.** The amd64
 variant exists only so CI can boot the image on GitHub's x86_64 KVM runners: same scripts and units,
-with its own pinned Ubuntu tarball, Node, Pane AppImage and Firecracker x86_64 kernel config. The
-guest agent's `update_pane` fetches the arm64 AppImage only; on amd64, Pane's own update works.
+with its own pinned Ubuntu tarball, Node, Pane `.deb` and Firecracker x86_64 kernel config. The guest
+agent's `update_pane` still fetches the arm64 `.deb`, so an amd64 machine cannot update.
 
 - **Root filesystem.** Canonical's Ubuntu 24.04 minimal cloud image root tarball for arm64, pinned by
   release date and SHA-256. The build removes cloud-init, installs git, Python 3, Node (official
-  tarball, SHA-256 checked), the libraries Pane's `.deb` depends on, and Pane (below). It adds the
-  `pane` user (uid 1000), who owns `/home/pane`, and enables the units below. The template is a small ext4 file;
+  tarball, SHA-256 checked) and Pane (the release `.deb`, SHA-256 checked). It adds the `pane` user
+  (uid 1000), who owns `/home/pane`, and enables the units below. The template is a small ext4 file;
   the host gives each machine its Session disk and every boot grows the filesystem to fill it.
 - **Kernel.** The kernel probe P1 booted in Nitro Sandboxes: Linux 6.18.62 with Firecracker's own
   `microvm-kernel-ci-aarch64-6.18.config` and `ci.config` at commit `6d7cfa9c6b53`, the commit that
@@ -50,18 +50,9 @@ guest agent's `update_pane` fetches the arm64 AppImage only; on amd64, Pane's ow
   - no virtio-rng: the guest takes no entropy device from the host.
 
   The build fails if `olddefconfig` drops anything in `REQUIRED_KERNEL_CONFIG` (vsock, balloon,
-  ext4, virtio-blk, virtio-net, kernel `ip=`, tun, nftables, pressure stall information, user
-  namespaces (Pane's Chromium sandbox, since the AppImage has no setuid sandbox helper), lockdown,
+  ext4, virtio-blk, virtio-net, kernel `ip=`, tun, nftables, pressure stall information, lockdown,
   module signing) or keeps `HW_RANDOM_VIRTIO`, `VSOCKETS_LOOPBACK` or `PSI_DEFAULT_DISABLED`
   (Firecracker's config leaves memory stall measurement off unless booted with `psi=1`).
-- **Pane.** The release AppImage (SHA-256 checked) at `/home/pane/Applications/Pane.AppImage`,
-  owned by `pane`, with `~/.local/bin/pane` pointing at it, the first place Pane looks for itself on
-  Linux. That makes it an install Pane's own update accepts: `runpane update`, which Update Pane
-  runs, replaces only a Linux AppImage the user owns, and `pane` has no root. The image has no FUSE,
-  so `pane`'s services run every AppImage from an extracted copy in `/tmp`
-  (`APPIMAGE_EXTRACT_AND_RUN=1` in `~/.config/environment.d/50-appimage.conf`). A FUSE mount that
-  `pane` makes is unreadable to root, so programs run from one would have no hash in the process
-  report.
 - **Networking.** The host configures `eth0` with the kernel's `ip=` argument, so systemd-networkd
   and resolved are masked, and `/etc/resolv.conf` points at `/proc/net/pnp`, where the kernel lists
   the `ip=` argument's DNS server.
@@ -85,7 +76,7 @@ Nothing in this image lists or reads the volume's files, and the process report 
 
 ## Boot
 
-Four system units, all enabled in the image:
+Five system units, all enabled in the image:
 
 1. **`pane-cloud-secrets.service`** (`secrets-volume.sh`, oneshot). Mounts the secrets volume, before
    `pane`'s user manager starts.
@@ -97,17 +88,15 @@ Four system units, all enabled in the image:
    (`install-agent-clis.sh`), giving each vendor installer 5 minutes. It runs on every boot and is
    idempotent, so a CLI that failed to install is retried on the next boot. It leaves
    `firstboot.done` or `firstboot.failed` in `/var/lib/pane-cloud`. Nothing waits for it.
-4. **`pane-guest-agent.service`**, the guest agent. It restarts however often it crashes.
-
-The Pane daemon is `pane`'s user service `pane-remote-daemon.service`, which `pane`'s user manager
-starts at boot (linger), after the secrets volume, the hostname and the network
-(`user@1000.service.d/pane-cloud.conf`). The image ships the unit Pane's remote setup would write,
-running `~/.local/bin/pane --daemon-headless --pane-dir /home/pane/.pane`, because Pane's setup
-refuses to install its unit from an AppImage: it looks for the extracted copy it runs from, not the
-AppImage. `/home/pane/.pane` is where the contract's `DIAGNOSTIC_FILES` expects Pane's logs. Its
-`config.json` turns on `workspaces.enabled` (so `runpane workspace` and `runpane handoff` reach the
-machine) and `remoteDaemon.relay.enabled` (relay pairing). The unit gives agent panels `PATH` for the
-agent CLIs, `PANE_RESUME_AGENTS_ON_START=1`, and `PANE_SECRETS_DIR`.
+4. **`pane-cloud-daemon.service`** (`pane-daemon.sh`, oneshot). The first time, it runs Pane's own
+   remote setup (`pane --remote-setup --prefer-tunnel ssh`, which installs and starts the daemon as
+   `pane`'s user service and needs no tunnel) with `--pane-dir /home/pane/.pane`, so Pane's logs land
+   where the contract's `DIAGNOSTIC_FILES` expects them. On every boot it makes sure that
+   directory's `config.json` has `workspaces.enabled` (so `runpane workspace` and `runpane handoff`
+   reach the machine) and `remoteDaemon.relay.enabled` (relay pairing), and restarts the daemon if
+   either changed. The setup prints a `pane-remote://` connection code. Only its status lines reach
+   the log; every other line is replaced before it is written, so the code never touches disk.
+5. **`pane-guest-agent.service`**, the guest agent. It restarts however often it crashes.
 
 The relay key is made the first time the relay starts and kept in `~/.pane` on the Session disk, so
 the machine keeps its relay id across stops and starts. Clients pair with the id and key
@@ -116,14 +105,11 @@ fingerprint the service vouches for (A6), which the host reads from `status`.
 The scripts log to `/var/log/pane-cloud/bootstrap.log`, mode 0600 in a 0700 directory that only root
 reads.
 
-### Updating Pane
+### Update on boot
 
-The machine updates Pane the way any of the person's machines does: Update Pane runs Pane's own
-`runpane update`, which replaces the AppImage and relaunches the daemon. The host also keeps it
-current: it sends `bootstrap` with the latest published release on every boot, and the guest agent
-installs that release's AppImage when the installed file's SHA-256 is not the release's. It never
-fetches anything the host did not name with a checksum, and it writes the file as `pane`, so a link
-`pane` plants in its home cannot aim a root write elsewhere.
+The host sends `bootstrap` with the latest published release on every boot. The guest agent
+compares it with the installed Pane and installs the release `.deb` only if they differ. It never
+fetches anything the host did not name with a checksum.
 
 ## Agent CLIs
 
@@ -169,11 +155,7 @@ each with exactly the contract's parameters. Anything else gets `operation_not_a
 | Operation | What it does |
 | --- | --- |
 | `bootstrap` | Installs the named release if it is not the installed one, and reports `firstBoot` (`running`, `done`, `failed`) |
-| `update_pane` | Downloads `https://github.com/greenfield-inc/Pane/releases/download/v<version>/Pane-<version>-linux-arm64.AppImage`, refuses it unless its SHA-256 is `appImageSha256` (`release_not_published`), writes it over `~/Applications/Pane.AppImage` as `pane`, restarts the daemon |
-
-Both take `{"release": {"version": "2.4.249", "arch": "arm64", "appImageSha256": "<64 hex>"}}`, the
-SHA-256 from the release's `SHA256SUMS.txt`. The contract's `PaneRelease` still names `debSha256`;
-C0 and N1 rename it to match.
+| `update_pane` | Downloads `https://github.com/greenfield-inc/Pane/releases/download/v<version>/Pane-<version>-linux-arm64.deb`, refuses it unless its SHA-256 is `debSha256` (`release_not_published`), runs `apt-get install` on it, restarts the daemon |
 | `prepare_to_stop` | `sync`. Pane keeps its state in SQLite in WAL mode, which is consistent on disk once synced. A4 adds Pane's pause path |
 | `collect_diagnostics` | Reads only the contract's `DIAGNOSTIC_FILES` and returns them in the response (below) |
 | `status` | `paneVersion`, `relay`, `secretsVolume` and `activity` (below) |
@@ -206,8 +188,7 @@ one link, so the `pane` user cannot point the root-run agent at another file.
   "activity": { "agentsRunning": 0, "clientsConnected": 0, "lastActivityAt": null } }
 ```
 
-- `paneVersion`: the running Pane's version, from the daemon's `runpane:update:host` (what
-  `runpane update` reads), or `null` while the daemon does not answer.
+- `paneVersion`: the installed `pane` package version (`dpkg-query`).
 - `relay`: from the daemon's `relay:status` and `relay:client:computer` over its control socket.
   `status` is Pane's relay phase (`off`, `connecting`, `certificate`, `ready`, `error`), or
   `unreachable` while the daemon does not answer. `fingerprint` is set once the relay is connected.
@@ -281,8 +262,8 @@ The `image` job builds the arm64 image on GitHub's `ubuntu-24.04-arm` runner and
 `check-image.sh`. That checks the kernel config, the image size and filesystem, and the files, users
 and units inside the ext4. It then starts the Pane daemon inside the image (`--daemon-headless`, on a
 throwaway overlay, relay on), sends the guest agent a `status` request, which must reach the daemon
-and show a relay computer id. Pane must name the AppImage as its executable, which `runpane update`
-needs, and a process report must name the daemon with the hash of its extracted copy. Only the kernel and its config are kept, as a workflow artifact for 3 days.
+and show a relay computer id, and takes a process report, which must name the daemon with the hash of
+`/opt/Pane/pane`. Only the kernel and its config are kept, as a workflow artifact for 3 days.
 
 The `boot` job builds the amd64 image on `ubuntu-24.04`, runs `check-image.sh`, then runs
 `boot-check.sh`. That boots the image under Firecracker 1.18's jailer with a NAT'd tap, the kernel
@@ -294,11 +275,8 @@ checks:
 - each of the five CLIs installed and runs `--version`;
 - the blank secrets volume is formatted and mounted no-exec, a program copied there does not run,
   and `status` reports it `mounted`;
-- Pane's own update (`runpane update --wait`, run as `pane` in the guest) moves the machine from the
-  image's Pane to the latest release, the daemon answers on it, and a Session made before the update
-  is still there;
-- after that update, the Pane daemon reaches relay `ready` with a computer id and fingerprint
-  (certificates from Let's Encrypt's staging CA, so CI never spends the limits Pane's users share);
+- the Pane daemon reaches relay `ready` with a computer id and fingerprint (certificates from Let's
+  Encrypt's staging CA, so CI never spends the limits Pane's users share);
 - a process report names `xmrig` with the program's hash. The stand-in is a copy of `sleep` named
   `xmrig`, because GitHub forbids mining on Actions;
 - with the repository secret `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), Claude Code

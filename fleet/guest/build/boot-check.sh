@@ -1,20 +1,20 @@
 #!/bin/bash
-# CI only: boots the amd64 guest image under Firecracker's jailer on an x86_64 KVM host with a NAT'd
-# tap, a blank 64 MiB secrets volume and no entropy device, then talks to the guest agent over vsock
-# (CONNECT 1024) and listens for its reports (port 1025). It checks that
-#   - the guest agent answers `status`, the kernel runs with lockdown on and measures memory stalls,
-#     and the root filesystem grows to the disk,
-#   - first boot installs the five agent CLIs (read from bootstrap.log via collect_diagnostics),
+# CI only: boots the amd64 guest the way a fleet host does (D-95) under Firecracker's jailer on an
+# x86_64 KVM host: the read-only base as the root drive, a Session disk formatted as the manifest says
+# (the writable layer), a blank 64 MiB secrets volume, a NAT'd tap and no entropy device. It talks to
+# the guest agent over vsock (CONNECT 1024), listens for its reports (port 1025), and checks that
+#   - the root is overlay-init's overlay, the kernel runs with lockdown on and measures memory stalls,
 #   - the secrets volume is formatted and mounted no-exec,
-#   - the Pane daemon answers with relay pairing ready: a computer id, a certificate and a fingerprint,
+#   - the Pane daemon answers, and a terminal panel it opens runs `node -v` (probe P11's first
+#     command), with the time of every boot phase from kernel start recorded,
+#   - the Pane daemon reaches relay pairing ready: a computer id, a certificate and a fingerprint,
 #   - the process report names a program called xmrig, with its hash,
 #   - Claude Code answers a prompt, when CLAUDE_CODE_OAUTH_TOKEN is set,
-#   - Pane's own update (`runpane update`, what Update Pane runs) moves the machine from the image's
-#     Pane to the latest release, and the daemon comes back on it with its Sessions and relay pairing.
-# The last four need something run inside the guest, which the guest agent never does: this script
-# adds a CI-only check unit to its own throwaway copy of the disk before booting it. The image is
-# never changed. Relay certificates come from Let's Encrypt's staging CA, so CI never spends the
-# limits Pane's users share.
+#   - the Session disk holds under 100 MB after the boot.
+# Checks inside the guest need something run there, which the guest agent never does: this script
+# puts a CI-only check unit in the Session disk's writable layer before booting. The base is never
+# changed. Relay certificates come from Let's Encrypt's staging CA, so CI never spends the limits
+# Pane's users share.
 # Runs as root, after build-image.sh on the same host. Changes the host's tap, forwarding and NAT.
 #
 # Usage: boot-check.sh <output dir of build-image.sh> <dir with firecracker and jailer>
@@ -32,33 +32,80 @@ jail="$base/firecracker/$id/root"
 console="$out/console.log"
 mkdir -p "$jail"
 
-# The image plus room to grow: first boot's resize2fs fills the disk.
-cp --sparse=always "$out/pane-guest-$UBUNTU_RELEASE-pane-$PANE_VERSION-amd64.ext4" "$jail/disk.ext4"
-truncate -s 16G "$jail/disk.ext4"
+manifest="$(echo "$out"/pane-base-*-amd64.json)"
+manifest_get() { python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, m))' "$manifest" "$1"; }
+# The base, read-only, as the host attaches it; a hard link, so it is never copied.
+ln "$out/$(manifest_get base)" "$jail/base.ext4" 2>/dev/null || cp "$out/$(manifest_get base)" "$jail/base.ext4"
+# The Session disk: empty, formatted the way the manifest says (N3 does this on the host).
+truncate -s 16G "$jail/session.img"
+format="$(manifest_get "drives[1]['format']")"
+${format/<device>/-F $jail/session.img}
 # A blank secrets volume, as the host makes it.
 truncate -s 64M "$jail/secrets.img"
 cp "$out/vmlinux-$KERNEL_VERSION" "$jail/vmlinux"
+# The guest's own sleep, which the stand-in miner copies.
+sleep_sha="$(debugfs -R 'cat /usr/bin/sleep' "$jail/base.ext4" 2>/dev/null | sha256sum | cut -d' ' -f1)"
 
-echo "== CI check unit on the throwaway disk copy"
-disk="$base/disk"
-mkdir -p "$disk"
-mount -o loop "$jail/disk.ext4" "$disk"
-sleep_sha="$(sha256sum "$disk/usr/bin/sleep" | cut -d' ' -f1)"
-mkdir -p "$disk/var/lib/pane-ci" "$disk/home/pane/.config/systemd/user/pane-remote-daemon.service.d"
+echo "== CI check unit in the Session disk's writable layer"
+layer="$base/session"
+mkdir -p "$layer"
+mount -o loop "$jail/session.img" "$layer"
+upper="$layer/upper"
+install -d -m 755 "$upper" "$upper/etc" "$upper/etc/systemd" "$upper/etc/systemd/system" \
+  "$upper/etc/systemd/system/multi-user.target.wants" "$upper/etc/systemd/system/pane-daemon.service.d" \
+  "$upper/var" "$upper/var/lib" "$upper/usr" "$upper/usr/local" "$upper/usr/local/bin"
+install -d -m 700 "$upper/var/lib/pane-ci"
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  (umask 077 && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"$disk/var/lib/pane-ci/claude-token")
+  (umask 077 && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"$upper/var/lib/pane-ci/claude-token")
 fi
 printf '[Service]\nEnvironment=PANE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory\n' \
-  >"$disk/home/pane/.config/systemd/user/pane-remote-daemon.service.d/ci.conf"
-chown -R 1000:1000 "$disk/home/pane/.config"
-cat >"$disk/var/lib/pane-ci/check.sh" <<'CHECK'
+  >"$upper/etc/systemd/system/pane-daemon.service.d/ci.conf"
+# The first command, as probe P11 runs it in a terminal panel: node -v, its output where the check reads it.
+cat >"$upper/usr/local/bin/ci-node-v" <<'NODEV'
+#!/bin/sh
+node -v >/run/pane-ci/node.out 2>&1
+echo $? >/run/pane-ci/node.rc.tmp && mv /run/pane-ci/node.rc.tmp /run/pane-ci/node.rc
+NODEV
+chmod 755 "$upper/usr/local/bin/ci-node-v"
+cat >"$upper/var/lib/pane-ci/check.sh" <<'CHECK'
 #!/bin/bash
-# Runs once inside the guest after first boot; writes "ci: ..." lines to bootstrap.log.
+# Runs once inside the guest as soon as the Pane daemon starts; writes "ci: ..." lines to bootstrap.log.
 exec >>/var/log/pane-cloud/bootstrap.log 2>&1
 say() { echo "$(date -u +%FT%TZ) ci: $*"; }
-# pane's environment as its services get it (environment.d), plus its user manager for systemd-run --user.
-as_pane() { runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/usr/local/bin:/usr/bin:/bin \
-  APPIMAGE_EXTRACT_AND_RUN=1 NO_CLEANUP=1 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "$@"; }
+up() { cut -d' ' -f1 /proc/uptime; }
+as_pane() { runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin "$@"; }
+# Seconds since kernel start at which systemd says a unit (or the manager) reached a point.
+at() { awk '{printf "%.3f", $1 / 1000000}' <<<"$(systemctl show -p "$2" --value "$1")"; }
+runpane=/home/pane/.pane/bin/runpane
+install -d -m 777 /run/pane-ci
+
+# Timeline, probe P11's path: the daemon's control socket, a first runpane call, then a terminal panel
+# that runs node -v. Every time is seconds since the guest kernel started.
+sock="/tmp/pane-daemon-1000-$(printf %s /home/pane/.pane | sha256sum | cut -c1-16)/daemon.sock"
+while [ ! -S "$sock" ] || [ ! -x "$runpane" ]; do sleep 0.02; done
+socket="$(up)"
+as_pane "$runpane" repos list --json >/dev/null 2>&1; first_rc=$?
+first="$(up)"
+as_pane git init -q /home/pane/ci-repo && as_pane git -C /home/pane/ci-repo commit -q --allow-empty -m ci
+repo_start="$(up)"
+as_pane "$runpane" repos add --path /home/pane/ci-repo --name ci --yes --json >/tmp/ci-repo.out 2>&1; repo_rc=$?
+repo="$(up)"
+as_pane "$runpane" panes create --repo ci --name ci --tool-command /usr/local/bin/ci-node-v \
+  --no-focus --no-expect-report --yes --json >/tmp/ci-pane.out 2>&1; pane_rc=$?
+pane="$(up)"
+for _ in $(seq 1 6000); do [ -f /run/pane-ci/node.rc ] && break; sleep 0.01; done
+node_done="$(up)"
+say "timeline kernel_to_init=$(systemctl show -p UserspaceTimestampMonotonic --value | awk '{printf "%.3f", $1/1000000}')" \
+  "identity_done=$(at pane-cloud-identity.service ActiveEnterTimestampMonotonic)" \
+  "secrets_done=$(at pane-cloud-secrets.service ActiveEnterTimestampMonotonic)" \
+  "daemon_start=$(at pane-daemon.service ExecMainStartTimestampMonotonic)" \
+  "socket=$socket first_runpane=$first first_rc=$first_rc repo_start=$repo_start repo_added=$repo repo_rc=$repo_rc" \
+  "pane_created=$pane pane_rc=$pane_rc node_done=$node_done node_rc=$(cat /run/pane-ci/node.rc 2>/dev/null || echo none)" \
+  "node_out=$(cat /run/pane-ci/node.out 2>/dev/null) network_online=$(at network-online.target ActiveEnterTimestampMonotonic)" \
+  "multi_user=$(at multi-user.target ActiveEnterTimestampMonotonic)"
+[ "$repo_rc" = 0 ] || say "repos add: $(tr -s ' \n' ' ' </tmp/ci-repo.out | tail -c 400)"
+[ "$pane_rc" = 0 ] || say "panes create: $(tr -s ' \n' ' ' </tmp/ci-pane.out | tail -c 400)"
+say "root $(findmnt -n -o FSTYPE,OPTIONS /) base $(findmnt -n -o SOURCE,OPTIONS /mnt/base)"
 
 # A stand-in miner: a copy of sleep named xmrig, so no real miner runs on CI.
 install -o pane -g pane -m 755 /usr/bin/sleep /home/pane/xmrig
@@ -79,39 +126,20 @@ if [ -s /var/lib/pane-ci/claude-token ]; then
 else
   say "claude skipped: no token"
 fi
-
-# Update Pane, as a person or agent on the machine runs it: Pane's own update, from Pane's runpane. A
-# Session made before it must still be there after it.
-runpane=/home/pane/.pane/bin/runpane
-for _ in $(seq 1 60); do [ -x "$runpane" ] && break; sleep 5; done
-# The AppImage runtime lists the files it extracts; count those lines per stream and keep the rest.
-runtime_lines='^(/tmp/appimage_extracted_|File exists and file size matches)'
-quiet() { grep -Ev "$runtime_lines" "$1" | tr -s ' \n' ' ' | tail -c "$2"; }
-noise() { grep -Ec "$runtime_lines" "$1"; }
-as_pane "$runpane" sessions create --from-json - --json <<<'{"name":"ci-update-check"}' >/tmp/ci-out 2>/tmp/ci-err
-say "session before update: exit=$? stdout=$(quiet /tmp/ci-out 300) stderr=$(quiet /tmp/ci-err 300) runtime lines on stdout=$(noise /tmp/ci-out) stderr=$(noise /tmp/ci-err)"
-rc=0
-as_pane timeout 900 "$runpane" update --wait --json >/tmp/ci-out 2>/tmp/ci-err || rc=$?
-kept=no
-as_pane "$runpane" sessions get --session ci-update-check --json >/dev/null 2>&1 && kept=yes
-say "session after update kept=$kept"
-say "update exit=$rc stdout=$(quiet /tmp/ci-out 1500) stderr=$(quiet /tmp/ci-err 1500)"
-journalctl _SYSTEMD_USER_UNIT=pane-remote-daemon.service -o cat --no-pager >/tmp/ci-journal 2>&1
-say "daemon journal: $(grep -Evi "$runtime_lines|^\s*$" /tmp/ci-journal | grep -Ei 'error|fail|fatal|exit|update|start' | tail -15 | tr -s ' \n' ' ' | tail -c 1500)"
 CHECK
-chmod 755 "$disk/var/lib/pane-ci/check.sh"
-cat >"$disk/etc/systemd/system/pane-ci-check.service" <<'UNIT'
+chmod 755 "$upper/var/lib/pane-ci/check.sh"
+cat >"$upper/etc/systemd/system/pane-ci-check.service" <<'UNIT'
 [Unit]
 Description=CI only: checks run inside the guest
-After=pane-cloud-firstboot.service pane-cloud-secrets.service network-online.target
+After=pane-daemon.service pane-cloud-secrets.service
 [Service]
 Type=oneshot
 ExecStart=/var/lib/pane-ci/check.sh
-TimeoutStartSec=30min
+TimeoutStartSec=15min
 UNIT
-ln -s /etc/systemd/system/pane-ci-check.service "$disk/etc/systemd/system/multi-user.target.wants/pane-ci-check.service"
-umount "$disk"
-chown "$uid:$uid" "$jail/disk.ext4" "$jail/secrets.img" "$jail/vmlinux"
+ln -s /etc/systemd/system/pane-ci-check.service "$upper/etc/systemd/system/multi-user.target.wants/pane-ci-check.service"
+umount "$layer"
+chown "$uid:$uid" "$jail/base.ext4" "$jail/session.img" "$jail/secrets.img" "$jail/vmlinux"
 
 ip tuntap add dev "$tap" mode tap user "$uid"
 ip addr add "$host_ip/30" dev "$tap"
@@ -138,9 +166,13 @@ api() { curl -fsS --unix-socket "$jail/api.sock" -X PUT "http://localhost$1" -H 
 boot_args="console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=3 systemd.show_status=false"
 boot_args+=" i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd"
 boot_args+=" ip=$guest_ip::$host_ip:255.255.255.252::eth0:off:1.1.1.1:8.8.8.8"
+# The base's own argument: overlay-init mounts the overlay root before systemd starts.
+boot_args+=" $(manifest_get bootArgs)"
 api /machine-config '{"vcpu_count": 2, "mem_size_mib": 4096, "smt": false}'
 api /boot-source "{\"kernel_image_path\": \"/vmlinux\", \"boot_args\": \"$boot_args\"}"
-api /drives/rootfs '{"drive_id": "rootfs", "path_on_host": "/disk.ext4", "is_root_device": true, "is_read_only": false}'
+# vda the base (read-only root), vdb the Session disk, vdc the secrets volume, in the manifest's order.
+api /drives/rootfs '{"drive_id": "rootfs", "path_on_host": "/base.ext4", "is_root_device": true, "is_read_only": true}'
+api /drives/session '{"drive_id": "session", "path_on_host": "/session.img", "is_root_device": false, "is_read_only": false}'
 api /drives/secrets '{"drive_id": "secrets", "path_on_host": "/secrets.img", "is_root_device": false, "is_read_only": false}'
 api /network-interfaces/eth0 "{\"iface_id\": \"eth0\", \"host_dev_name\": \"$tap\", \"guest_mac\": \"06:00:ac:10:00:02\"}"
 api /vsock '{"guest_cid": 3, "uds_path": "/v.sock"}'
@@ -163,10 +195,10 @@ for _ in $(seq 1 50); do [ -S "$jail/v.sock_1025" ] && break; sleep 0.1; done
 api /actions '{"action_type": "InstanceStart"}'
 echo "booted at $(date -u +%FT%TZ)"
 
-if python3 -I - "$jail/v.sock" "$out" "$PANE_VERSION" "$sleep_sha" "${CLAUDE_CODE_OAUTH_TOKEN:+yes}" <<'PY'
-import base64, calendar, io, json, re, socket, sys, tarfile, time, urllib.request
+if python3 -I - "$jail/v.sock" "$out" "$PANE_VERSION" "$sleep_sha" "${CLAUDE_CODE_OAUTH_TOKEN:+yes}" "$jail/session.img" <<'PY'
+import base64, io, json, os, re, socket, sys, tarfile, time
 
-vsock, out, pane_version, sleep_sha, have_token = sys.argv[1:6]
+vsock, out, pane_version, sleep_sha, have_token, session_disk = sys.argv[1:7]
 started = time.monotonic()
 failed = False
 
@@ -222,28 +254,35 @@ if not status:
 check('the guest agent answers status', True)
 print(f'     guest agent ready {time.monotonic() - started:.1f}s after InstanceStart', flush=True)
 print('     status:', json.dumps(status['result']), flush=True)
+check(f'paneVersion is {pane_version}', status['result'].get('paneVersion') == pane_version)
 first = wait_for('a process report arrives on port 1025', 60, lambda: reports('process_report'), every=1)
 if first:
     check(f'a process report arrives on port 1025 ({len(first[0]["processes"])} processes)', True)
 
-log = wait_for('first boot and the CI check finish', 1500,
-               lambda: (text := bootstrap_log()) and 'firstboot: done' in text and re.search(r' ci: claude ', text) and text, every=10)
+log = wait_for('the CI check finishes', 900, lambda: (text := bootstrap_log()) and re.search(r' ci: claude ', text) and text, every=5)
 if log:
     open(f'{out}/bootstrap.log', 'w').write(log)
-    stamps = {kind: at for at, kind in re.findall(r'^(\S+) firstboot: (start|done)', log, re.M)}
-    to_s = lambda at: calendar.timegm(time.strptime(at, '%Y-%m-%dT%H:%M:%SZ'))
-    print(f'     first boot took {to_s(stamps["done"]) - to_s(stamps["start"]):.0f}s ({stamps["start"]} to {stamps["done"]})', flush=True)
+    line = re.search(r' ci: timeline (.*)$', log, re.M)
+    timeline = dict(re.findall(r'(\w+)=(\S*)', line.group(1))) if line else {}
+    print('     timeline, seconds since the guest kernel started:', flush=True)
+    for key, what in (('kernel_to_init', 'kernel hands over to init (overlay-init, then systemd)'),
+                      ('identity_done', 'hostname set'), ('secrets_done', 'secrets volume mounted'),
+                      ('daemon_start', 'Pane daemon process started'), ('socket', "Pane daemon's control socket answers"),
+                      ('first_runpane', 'first runpane call returns'), ('repo_added', 'repository registered'),
+                      ('pane_created', 'Pane created with a terminal panel'), ('node_done', 'the panel ran node -v'),
+                      ('network_online', 'network-online.target'), ('multi_user', 'multi-user.target')):
+        print(f'       {timeline.get(key, "?"):>8}  {what}', flush=True)
+    with open(f'{out}/timeline.json', 'w') as saved:
+        json.dump(timeline, saved)
+    check(f"a terminal panel ran node -v ({timeline.get('node_out')}, {timeline.get('node_done')} s after kernel start)",
+          timeline.get('node_rc') == '0' and timeline.get('pane_rc') == '0' and timeline.get('repo_rc') == '0')
+    root = re.search(r' ci: root (.*)$', log, re.M)
+    check(f'the root is an overlay on the read-only base ({root.group(1) if root else "no line"})',
+          bool(root) and root.group(1).startswith('overlay ') and re.search(r'base /dev/vda ro\b', root.group(1)))
     kernel = re.search(r'identity: (kernel .*)$', log, re.M)
     print(f'     {kernel.group(1) if kernel else "no kernel line"}', flush=True)
     check('the kernel runs with lockdown in integrity mode', bool(kernel) and '[integrity]' in kernel.group(1))
     check('the kernel measures memory stalls (/proc/pressure/memory)', bool(kernel) and ' psi on ' in kernel.group(1))
-    grown = re.search(r'identity: root filesystem uses the whole disk \((\S+)\)', log)
-    check(f'the root filesystem grew to the 16 GiB disk ({grown.group(1) if grown else "no line"})', bool(grown) and grown.group(1).startswith(('15G', '16G')))
-    check('first boot finished with every agent CLI', 'agent CLIs installed' in log)
-    results = dict(re.findall(r'^cli=(\S+) result=(\S+ version=.*)$', log, re.M))
-    for cli in ('claude', 'codex', 'cursor', 'opencode', 'gemini'):
-        line = results.get(cli, 'missing')
-        check(f'{cli} runs --version in the guest: {line}', line.startswith(('installed ', 'present ')) and not line.endswith('version=unknown'))
     check('the blank secrets volume was formatted and mounted no-exec',
           'secrets: formatted the blank secrets volume' in log and 'secrets: mounted at /home/pane/.pane-secrets (nodev,nosuid,noexec)' in log)
     check('a program on the secrets volume does not run', 'secrets volume noexec=yes' in log)
@@ -255,26 +294,10 @@ if log:
 
 check('status reports the secrets volume mounted', call('status')['result'].get('secretsVolume') == 'mounted')
 
-# Update Pane: the CI check ran Pane's own update after the checks above.
-with urllib.request.urlopen('https://api.github.com/repos/greenfield-inc/Pane/releases/latest', timeout=30) as answer:
-    latest = json.load(answer)['tag_name'].lstrip('v')
-update = wait_for('the CI check ran runpane update', 1200,
-                  lambda: re.search(r' ci: update (.*)$', bootstrap_log(), re.M), every=15)
-if update:
-    print(f'     runpane update: {update.group(1)[:900]}', flush=True)
-    if latest == pane_version:
-        print(f'skip Update Pane moves the machine to a newer release: the image has the latest, {latest}', flush=True)
-        check(f'the daemon answers on Pane {pane_version}', bool(wait_for('the daemon answers', 300, lambda: call('status')['result']['paneVersion'] == pane_version, every=5)))
-    else:
-        moved = wait_for(f'the daemon answers on Pane {latest}', 300, lambda: call('status')['result']['paneVersion'] == latest, every=5)
-        check(f'Update Pane moved the machine from Pane {pane_version} to {latest} (runpane update, exit {update.group(1).split()[0]})', bool(moved))
-    check('the updated daemon still has the Session made before the update',
-          ' ci: session after update kept=yes' in bootstrap_log(), re.search(r' ci: session before update: (.*)$', bootstrap_log(), re.M))
-
 relay = wait_for('the Pane daemon has relay pairing ready', 300,
                  lambda: (r := call('status')['result']['relay'])['status'] == 'ready' and r['fingerprint'] and r, every=5)
 if relay:
-    check(f'after the update, the Pane daemon has relay pairing ready ({relay["id"]}, {relay["address"]})', len(relay['id']) == 16)
+    check(f'the Pane daemon has relay pairing ready ({relay["id"]}, {relay["address"]})', len(relay['id']) == 16)
 
 def xmrig():
     for report in reports('process_report'):
@@ -287,12 +310,15 @@ miner = wait_for('the process report names xmrig', 330, xmrig, every=5)
 if miner:
     check(f'the process report names xmrig ({miner["exe"]}, uid {miner["uid"]}) with its program hash', miner['sha256'] == sleep_sha,
           f'{miner["sha256"]} is not {sleep_sha}')
+# The Session disk holds only what the Session wrote (D-95): its allocated blocks on the host.
+allocated = os.stat(session_disk).st_blocks * 512
+check(f'the Session disk holds {allocated / 1024 ** 2:.0f} MB after the boot (under 100 MB)', allocated < 100 * 1024 ** 2)
 sys.exit(1 if failed else 0)
 PY
 then echo "all boot checks passed"
 else
   echo "== serial console (last 60 lines)"; tail -60 "$console"
-  [ -f "$out/bootstrap.log" ] && { echo "== bootstrap.log, Pane Cloud lines"; grep -E ' (identity|firstboot|secrets|daemon|ci): ' "$out/bootstrap.log"
+  [ -f "$out/bootstrap.log" ] && { echo "== bootstrap.log, Pane Cloud lines"; grep -E ' (identity|secrets|ci): ' "$out/bootstrap.log"
                                    echo "== bootstrap.log, last 80 lines"; tail -80 "$out/bootstrap.log"; }
   exit 1
 fi

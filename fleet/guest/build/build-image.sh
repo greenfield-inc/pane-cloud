@@ -5,7 +5,8 @@
 # (see build-in-docker.sh). Every download is checked against build/versions.env.
 #
 # Usage: build-image.sh <rootfs|kernel|all> <output dir>
-# Writes pane-guest-<UBUNTU_RELEASE>-pane-<PANE_VERSION>-<arch>.ext4, vmlinux-<KERNEL_VERSION>,
+# Writes the read-only base pane-base-<version>-<arch>.ext4 with its manifest pane-base-<version>-<arch>.json
+# (version = <UBUNTU_RELEASE>-pane<PANE_VERSION>-<first 12 of the image's SHA-256>), vmlinux-<KERNEL_VERSION>,
 # config-<KERNEL_VERSION>, packages.txt, SHA256SUMS.
 set -euo pipefail
 
@@ -71,7 +72,7 @@ build_kernel() {
 in_root() { chroot "$work/rootfs" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive HOME=/root "$@"; }
 
 build_rootfs() {
-  local root="$work/rootfs" image="$out/pane-guest-$UBUNTU_RELEASE-pane-$PANE_VERSION-$arch.ext4"
+  local root="$work/rootfs" image="$work/base.ext4"
   say "root filesystem from Ubuntu 24.04 minimal $UBUNTU_RELEASE"
   [ -f "$work/root.tar.xz" ] || fetch "$UBUNTU_ROOT_BASE/ubuntu-24.04-minimal-cloudimg-$arch-root.tar.xz" "$(pin UBUNTU_ROOT_SHA256)" "$work/root.tar.xz"
   rm -rf "$root" && mkdir -p "$root"
@@ -92,15 +93,17 @@ build_rootfs() {
   in_root apt-get purge -y -qq cloud-init snapd fuse3 >/dev/null 2>&1 || true
   in_root apt-get install -y -qq --no-install-recommends git ca-certificates curl python3 xz-utils unzip \
     e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg >/dev/null
-  # What Pane's .deb depends on (Pane package.json build.deb.depends), plus libgbm and libasound, which its
-  # Electron binary links too, and zlib's unversioned libz.so, which the AppImage's bundled code loads.
-  # The AppImage carries Pane, not these. No FUSE: the AppImage runs extracted.
-  in_root apt-get install -y -qq --no-install-recommends libgtk-3-0t64 libnotify4 libnss3 libxss1 libxtst6 \
-    xdg-utils libatspi2.0-0t64 libuuid1 libgbm1 libasound2t64 zlib1g-dev >/dev/null
 
   say "Node $NODE_VERSION"
   fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-${kernel_arch/x86_64/x64}.tar.xz" "$(pin NODE_SHA256)" "$work/node.tar.xz"
   tar -xJf "$work/node.tar.xz" -C "$root/usr/local" --strip-components=1 --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md
+
+  say "Pane $PANE_VERSION"
+  fetch "https://github.com/greenfield-inc/Pane/releases/download/v$PANE_VERSION/Pane-$PANE_VERSION-linux-$arch.deb" \
+    "$(pin PANE_DEB_SHA256)" "$root/tmp/pane.deb"
+  # The .deb's Depends miss two libraries its Electron binary links: libgbm and libasound.
+  in_root apt-get install -y -qq /tmp/pane.deb libgbm1 libasound2t64 >/dev/null
+  rm -f "$root/tmp/pane.deb"
 
   say "pane user, Pane Cloud units and the guest agent"
   # Ubuntu's images may carry an `ubuntu` user at uid 1000; the machine has only `pane`.
@@ -108,31 +111,28 @@ build_rootfs() {
   in_root useradd --uid 1000 --create-home --shell /bin/bash pane
   cp -r "$guest/rootfs/." "$root/"
   install -m 755 "$guest/agent/pane_guest_agent.py" "$root/usr/local/lib/pane-cloud/pane_guest_agent.py"
-  chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh
-  say "Pane $PANE_VERSION"
-  # The release AppImage, owned by pane, where Pane's own update replaces it; ~/.local/bin/pane is the
-  # first place Pane looks for itself on Linux.
-  mkdir -p "$root/home/pane/Applications" "$root/home/pane/.local/bin" "$root/home/pane/.config/systemd/user/default.target.wants"
-  fetch "https://github.com/greenfield-inc/Pane/releases/download/v$PANE_VERSION/Pane-$PANE_VERSION-linux-${arch/amd64/x86_64}.AppImage" \
-    "$(pin PANE_APPIMAGE_SHA256)" "$root/home/pane/Applications/Pane.AppImage"
-  chmod 755 "$root/home/pane/Applications/Pane.AppImage"
-  ln -s ../../Applications/Pane.AppImage "$root/home/pane/.local/bin/pane"
-  ln -s ../pane-remote-daemon.service "$root/home/pane/.config/systemd/user/default.target.wants/pane-remote-daemon.service"
+  chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh "$root/usr/local/lib/pane-cloud/overlay-init"
   in_root chown -R pane:pane /home/pane
   chmod 700 "$root/home/pane/.pane"
-  # The Pane daemon is a user unit; linger starts pane's user manager at boot without a login.
-  mkdir -p "$root/var/lib/systemd/linger" && touch "$root/var/lib/systemd/linger/pane"
   in_root systemctl enable pane-guest-agent.service pane-cloud-secrets.service pane-cloud-identity.service \
-    pane-cloud-firstboot.service
+    pane-daemon.service
   # The secrets volume's mount point; pane-cloud-secrets.service makes it immutable until the volume is on it.
   install -d -m 700 "$root/home/pane/.pane-secrets"
+  # overlay-init's mount points: the Session disk, the overlay root, and the base after pivot_root.
+  mkdir -p "$root/mnt/session" "$root/mnt/root" "$root/mnt/base"
+
+  say "agent CLIs, installed now so no machine installs anything at boot"
+  install -m 755 "$here/install-agent-clis.sh" "$root/tmp/install-agent-clis.sh"
+  in_root runuser -u pane -- env HOME=/home/pane bash /tmp/install-agent-clis.sh | grep '^cli='
+  rm -f "$root/tmp/install-agent-clis.sh"
 
   say "Firecracker boot settings"
   # The host configures eth0 with the kernel's ip= argument; nothing in the guest manages it.
   in_root systemctl mask systemd-networkd.service systemd-networkd-wait-online.service systemd-resolved.service
   # The kernel lists the ip= argument's DNS server in /proc/net/pnp, in resolv.conf format.
   ln -sf /proc/net/pnp "$root/etc/resolv.conf"
-  echo '/dev/vda / ext4 defaults,noatime 0 1' >"$root/etc/fstab"
+  # The root is overlay-init's overlay of the base and the Session disk, mounted before systemd starts.
+  echo '# / is mounted by /usr/local/lib/pane-cloud/overlay-init' >"$root/etc/fstab"
   # Each machine gets its own machine id (and so hostname) on first boot.
   : >"$root/etc/machine-id" && rm -f "$root/var/lib/dbus/machine-id"
   in_root passwd --lock root >/dev/null
@@ -144,13 +144,44 @@ build_rootfs() {
   umount -l "$root/dev/pts" "$root/dev" "$root/sys" "$root/proc"
   trap - EXIT
 
-  say "ext4 template"
-  local mib
-  mib=$(( $(du -sm "$root" | cut -f1) * 12 / 10 + 512 ))
+  say "read-only base"
+  # No journal (nothing writes to it) and shrunk to its contents: the host keeps it in memory.
+  local mib sha version name
+  mib=$(( $(du -sm "$root" | cut -f1) * 12 / 10 + 256 ))
   rm -f "$image"
   truncate -s "${mib}M" "$image"
-  mkfs.ext4 -q -L pane-root -d "$root" "$image"
+  mkfs.ext4 -q -L pane-base -O ^has_journal -d "$root" "$image"
+  e2fsck -fy "$image" >/dev/null
+  resize2fs -M "$image" >/dev/null 2>&1
   e2fsck -fn "$image" >/dev/null
+  truncate -s "$(dumpe2fs -h "$image" 2>/dev/null | awk -F: '/^Block count/ {n=$2} /^Block size/ {s=$2} END {print n * s}')" "$image"
+  sha="$(sha256sum "$image" | cut -d' ' -f1)"
+  version="$UBUNTU_RELEASE-pane$PANE_VERSION-${sha:0:12}"
+  name="pane-base-$version-$arch"
+  rm -f "$out"/pane-base-*-"$arch".ext4 "$out"/pane-base-*-"$arch".json
+  mv "$image" "$out/$name.ext4"
+  write_manifest "$name" "$version" "$sha" >"$out/$name.json"
+}
+
+# The contract N1 (host) and N3 (Session disks) build against; README "Base image" explains it.
+write_manifest() {
+  python3 - "$1" "$2" "$3" "$(stat -c %s "$out/$1.ext4")" "$arch" "$PANE_VERSION" "$UBUNTU_RELEASE" "$KERNEL_VERSION" <<'PY'
+import json, sys
+name, version, sha, size, arch, pane, ubuntu, kernel = sys.argv[1:]
+print(json.dumps({
+    'manifestVersion': 1,
+    'base': f'{name}.ext4', 'version': version, 'sha256': sha, 'bytes': int(size), 'arch': arch,
+    'paneVersion': pane, 'ubuntuRelease': ubuntu, 'kernel': f'vmlinux-{kernel}',
+    'bootArgs': 'init=/usr/local/lib/pane-cloud/overlay-init',
+    'drives': [
+        {'device': 'vda', 'role': 'base', 'readOnly': True, 'rootDevice': True, 'path': f'{name}.ext4'},
+        {'device': 'vdb', 'role': 'session', 'readOnly': False, 'filesystem': 'ext4', 'label': 'pane-session',
+         'format': 'mkfs.ext4 -q -L pane-session -E lazy_itable_init=1,lazy_journal_init=1 -J size=64 <device>'},
+        {'device': 'vdc', 'role': 'secrets', 'readOnly': False, 'maxBytes': 1024 ** 3,
+         'format': 'none: give it blank (all zeros); the guest formats it'},
+    ],
+}, indent=2))
+PY
 }
 
 build_deps
@@ -160,5 +191,5 @@ case "$what" in
   all) build_kernel; build_rootfs ;;
   *) echo "unknown target $what" >&2; exit 2 ;;
 esac
-(cd "$out" && { sha256sum ./*.ext4 ./vmlinux-* 2>/dev/null >SHA256SUMS || true; })
+(cd "$out" && { sha256sum ./*.ext4 ./*.json ./vmlinux-* 2>/dev/null >SHA256SUMS || true; })
 say "done: $(ls "$out")"

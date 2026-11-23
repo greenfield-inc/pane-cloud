@@ -1,7 +1,7 @@
 #!/bin/bash
 # Mounts the Session's secrets volume at /home/pane/.pane-secrets: no-exec, no setuid, no devices,
-# owned by pane. Runs on every boot, before pane's user manager starts the Pane daemon.
-# The volume is the machine's second drive (/dev/vdb), at most 1 GiB (the host makes it 64 MiB). A
+# owned by pane. Runs on every boot, before the Pane daemon starts.
+# The volume is the machine's third drive (/dev/vdc), at most 1 GiB (the host makes it 64 MiB). A
 # volume of all zeros is formatted ext4 with the label pane-secrets. Anything else that is not that
 # filesystem (a damaged one included) is refused and left for a person to repair, never reformatted.
 # While no volume is mounted, the empty mount point is immutable, so nothing meant for the secrets
@@ -9,7 +9,7 @@
 # Logs to /var/log/pane-cloud/bootstrap.log (root only). It never lists or reads the volume's files.
 set -euo pipefail
 
-DEV=/dev/vdb
+DEV=/dev/vdc
 MNT=/home/pane/.pane-secrets
 MAX_BYTES=$((1024 ** 3))
 umask 077
