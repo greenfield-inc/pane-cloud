@@ -96,7 +96,6 @@ install -d -m 755 "$upper" "$upper/etc" "$upper/etc/systemd" "$upper/etc/systemd
   "$upper/etc/systemd/system/multi-user.target.wants" "$upper/etc/systemd/system/pane-daemon.service.d" \
   "$upper/var" "$upper/var/lib" "$upper/usr" "$upper/usr/local" "$upper/usr/local/bin"
 install -d -m 700 "$upper/var/lib/pane-ci"
-(umask 077 && printf '%s' "$public_token" >"$upper/var/lib/pane-ci/token")
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   (umask 077 && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"$upper/var/lib/pane-ci/claude-token")
 fi
@@ -161,7 +160,8 @@ clone_stage() {
 }
 if [ "$boot" = 1 ]; then
   for _ in $(seq 1 3000); do case "$(clone_stage)" in done|failed) break ;; esac; sleep 0.2; done
-  token="$(cat /var/lib/pane-ci/token)" repo=/home/pane/express
+  # The token, from the drop file on the secrets volume: nothing of it may ever be on the Session disk.
+  token="$(python3 -I -c 'import json; print(json.load(open("/home/pane/.pane-secrets/incoming/github-token.json"))["token"])')" repo=/home/pane/express
   drop=/home/pane/.pane-secrets/incoming/github-token.json
   say "clone $(python3 -I -c 'import json; s = json.load(open("/run/pane-cloud-clone/state.json")); st = s["status"]
 fields = {"state": "done" if s["history"] == "done" else st["state"], "history": s["history"], "paneId": st["paneId"],
@@ -529,8 +529,13 @@ if phase == 'first':
     else:
         print(f'skip Claude Code answers a prompt: CLAUDE_CODE_OAUTH_TOKEN is not set ({claude})', flush=True)
     check('status reports the secrets volume mounted', call('status')['result'].get('secretsVolume') == 'mounted')
-    relay = wait_for('the Pane daemon has relay pairing ready', 300,
-                     lambda: (r := call('status')['result']['relay'])['status'] == 'ready' and r['fingerprint'] and r, every=5)
+    last_relay = {}
+    def relay_ready():
+        last_relay.update(call('status')['result']['relay'])
+        return last_relay['status'] == 'ready' and last_relay['fingerprint'] and dict(last_relay)
+    relay = wait_for('the Pane daemon has relay pairing ready', 300, relay_ready, every=5)
+    if not relay:
+        print(f'     relay as the guest agent last saw it: {json.dumps(last_relay)}', flush=True)
     if relay:
         check(f'the Pane daemon has relay pairing ready ({relay["id"]}, {relay["address"]})', len(relay['id']) == 16)
 

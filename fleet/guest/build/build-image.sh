@@ -127,8 +127,11 @@ build_rootfs() {
   cp -r "$guest/rootfs/." "$root/"
   install -m 755 "$guest/agent/pane_guest_agent.py" "$root/usr/local/lib/pane-cloud/pane_guest_agent.py"
   chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh "$root"/usr/local/lib/pane-cloud/{overlay-init,clone.py,git-credential-clone}
-  # Git LFS for every repository, in /etc/gitconfig.
+  # Git LFS for every repository, in /etc/gitconfig. A placeholder author, so git and Pane can commit on a
+  # machine nobody has configured; the person's own name and email replace it.
   in_root git lfs install --system --skip-repo >/dev/null
+  in_root git config --system user.name "Pane Cloud"
+  in_root git config --system user.email pane-cloud@users.noreply.github.com
   in_root chown -R pane:pane /home/pane
   chmod 700 "$root/home/pane/.pane"
   # pane-cloud-boot.service starts the Pane daemon and the clone.
@@ -160,7 +163,7 @@ build_rootfs() {
   done
   sleep 10  # the skill bundles finish after the socket listens
   stop_image_processes "$root"
-  umount "$root/dev/shm"
+  umount -l "$root/dev/shm"
   python3 - "$root/home/pane/.pane/config.json" "$work/pane-config.json" <<'PY'
 import json, sys
 config = json.load(open(sys.argv[1]))
