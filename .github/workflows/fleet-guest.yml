@@ -19,9 +19,9 @@ jobs:
       # Ubuntu 24.04's own Python 3.12, the one the guest image runs.
       - name: guest agent tests
         working-directory: fleet/guest/agent
-        run: /usr/bin/python3 -m unittest -v
+        run: sudo apt-get install -y -qq python3-nacl >/dev/null && /usr/bin/python3 -m unittest -v
       - name: shellcheck
-        run: find . -name '*.sh' -print0 | xargs -0 shellcheck -x && shellcheck rootfs/usr/local/lib/pane-cloud/overlay-init
+        run: find . -name '*.sh' -print0 | xargs -0 shellcheck -x && shellcheck rootfs/usr/local/lib/pane-cloud/overlay-init rootfs/usr/local/lib/pane-cloud/git-credential-clone && python3 -m py_compile rootfs/usr/local/lib/pane-cloud/clone.py
 
   # Builds the real image on a native arm64 runner and checks it. Nothing is published: only the
   # kernel and its config go up, as a short-lived workflow artifact.
@@ -79,6 +79,8 @@ jobs:
           source build/versions.env
           sudo WORK_DIR="$RUNNER_TEMP/work" bash build/build-image.sh pane-drive "$RUNNER_TEMP/out" \
             "$CI_PANE_DRIVE_VERSION" "$CI_PANE_DRIVE_DEB_SHA256_amd64"
+      - name: PyNaCl, to seal the test token as the app does
+        run: sudo apt-get install -y -qq python3-nacl >/dev/null
       - name: boot under Firecracker and check first boot over vsock
         # Optional: with it, the check also has Claude Code answer a prompt inside the guest.
         env:

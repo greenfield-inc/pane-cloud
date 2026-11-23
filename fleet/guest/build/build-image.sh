@@ -70,6 +70,18 @@ build_kernel() {
   cp "$src/.config" "$out/config-$KERNEL_VERSION"
 }
 
+# stop_image_processes <root>: kills every process whose root is the image being built.
+stop_image_processes() {
+  local proc
+  for _ in 1 2 3; do
+    for proc in /proc/[0-9]*; do
+      [ "$(readlink "$proc/root" 2>/dev/null)" = "$1" ] && kill -KILL "${proc#/proc/}" 2>/dev/null
+    done
+    sleep 1
+  done
+  return 0
+}
+
 # in_root <command...>: runs a command inside the image being built.
 in_root() { chroot "$work/rootfs" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive HOME=/root "$@"; }
 
@@ -93,8 +105,22 @@ build_rootfs() {
   # fuse3 too: pane could mount a FUSE filesystem with it, and root cannot read what pane mounts, so a
   # program run from one would have no hash in the process report.
   in_root apt-get purge -y -qq cloud-init snapd fuse3 >/dev/null 2>&1 || true
-  in_root apt-get install -y -qq --no-install-recommends git ca-certificates curl python3 xz-utils unzip \
-    e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg >/dev/null
+  in_root apt-get install -y -qq --no-install-recommends git git-lfs ca-certificates curl python3 python3-nacl \
+    xz-utils unzip e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg build-essential >/dev/null
+
+  say "Git $GIT_VERSION"
+  # Into /usr/local, ahead of Ubuntu's git on PATH, reading /etc/gitconfig. The compilers stay (a
+  # development machine); the libraries' headers go.
+  fetch "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz" "$GIT_SHA256" "$root/tmp/git.tar.xz"
+  local git_dev="libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev"
+  # shellcheck disable=SC2086 # a list of packages
+  in_root apt-get install -y -qq --no-install-recommends $git_dev >/dev/null
+  in_root bash -c "cd /tmp && tar -xJf git.tar.xz && cd git-$GIT_VERSION && \
+    make -j\$(nproc) prefix=/usr/local sysconfdir=/etc NO_TCLTK=1 NO_GETTEXT=1 INSTALL_SYMLINKS=1 all install >/dev/null"
+  # shellcheck disable=SC2086 # a list of packages
+  in_root apt-get purge -y -qq $git_dev >/dev/null
+  in_root apt-get autoremove -y -qq >/dev/null
+  rm -rf "$root/tmp/git.tar.xz" "$root/tmp/git-$GIT_VERSION"
 
   say "Node $NODE_VERSION"
   fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-${kernel_arch/x86_64/x64}.tar.xz" "$(pin NODE_SHA256)" "$work/node.tar.xz"
@@ -113,11 +139,13 @@ build_rootfs() {
   in_root useradd --uid 1000 --create-home --shell /bin/bash pane
   cp -r "$guest/rootfs/." "$root/"
   install -m 755 "$guest/agent/pane_guest_agent.py" "$root/usr/local/lib/pane-cloud/pane_guest_agent.py"
-  chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh "$root/usr/local/lib/pane-cloud/overlay-init"
+  chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh "$root"/usr/local/lib/pane-cloud/{overlay-init,clone.py,git-credential-clone}
+  # Git LFS for every repository, in /etc/gitconfig.
+  in_root /usr/local/bin/git lfs install --system --skip-repo >/dev/null
   in_root chown -R pane:pane /home/pane
   chmod 700 "$root/home/pane/.pane"
   in_root systemctl enable pane-guest-agent.service pane-cloud-secrets.service pane-cloud-identity.service \
-    pane-daemon.service
+    pane-daemon.service pane-cloud-unseal.service pane-cloud-clone.service
   # The secrets volume's mount point; pane-cloud-secrets.service makes it immutable until the volume is on it.
   install -d -m 700 "$root/home/pane/.pane-secrets"
   # overlay-init's mount points: the Session disk, the overlay root, and the base after pivot_root.
@@ -127,6 +155,34 @@ build_rootfs() {
   install -m 755 "$here/install-agent-clis.sh" "$root/tmp/install-agent-clis.sh"
   in_root runuser -u pane -- env HOME=/home/pane bash /tmp/install-agent-clis.sh | grep '^cli='
   rm -f "$root/tmp/install-agent-clis.sh"
+
+  say "Pane's state directory, ready for a first start"
+  # One start of the daemon now, so no machine migrates the database or copies Pane's skills at boot.
+  # The relay stays off for it, so no relay key is made, and each machine gets its own machineId
+  # (identity.sh) and analytics ids (Pane, on demand); the image keeps no Session, repo or log.
+  cp "$root/home/pane/.pane/config.json" "$work/pane-config.json"
+  echo '{"workspaces": {"enabled": true}}' >"$root/home/pane/.pane/config.json"
+  in_root runuser -u pane -- env HOME=/home/pane PANE_DIR=/home/pane/.pane ELECTRON_OZONE_PLATFORM_HINT=headless \
+    /opt/Pane/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane >"$work/pane-first-start.log" 2>&1 &
+  local waited=0
+  until compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null; do
+    sleep 1; waited=$((waited + 1))
+    [ "$waited" -lt 180 ] || { tail -40 "$work/pane-first-start.log"; echo "Pane's first start did not open its socket" >&2; exit 1; }
+  done
+  sleep 10  # the skill bundles finish after the socket listens
+  stop_image_processes "$root"
+  python3 - "$root/home/pane/.pane/config.json" "$work/pane-config.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+for key in ('machineId',):
+    config.pop(key, None)
+for key in ('installId', 'distinctId'):
+    config.get('analytics', {}).pop(key, None)
+config.update(json.load(open(sys.argv[2])))  # workspaces and the relay on, as the image ships them
+json.dump(config, open(sys.argv[1], 'w'), indent=2)
+PY
+  rm -rf "$root/home/pane/.pane/logs" "$root/home/pane/.pane/secrets.json" "$root/home/pane/.pane/relay" "$root"/tmp/pane-daemon-*
+  in_root chown -R pane:pane /home/pane/.pane
 
   say "Firecracker boot settings"
   # The host configures eth0 with the kernel's ip= argument; nothing in the guest manages it.
@@ -190,7 +246,7 @@ build_pane_drive() {
   rm -rf "$work/pane-drive.root" "$work/pane-drive.deb"
   # Chromium's sandbox helper is root's and setuid, as the package's install leaves it.
   chown root:root "$dir/chrome-sandbox" && chmod 4755 "$dir/chrome-sandbox"
-  echo "$version" >"$dir/.pane-version"
+  printf '{"version": "%s", "arch": "%s", "debSha256": "%s"}\n' "$version" "$arch" "$deb_sha" >"$dir/release.json"
   name="$(pack_read_only "$dir" pane-app "pane-app-$version")"
   python3 - "$name" "$version" "$deb_sha" "$(sha256sum "$out/$name.ext4" | cut -d' ' -f1)" "$(stat -c %s "$out/$name.ext4")" "$arch" >"$out/$name.json" <<'PY'
 import json, sys

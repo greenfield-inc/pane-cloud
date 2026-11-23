@@ -5,14 +5,17 @@ reports the machine's processes and memory pressure to the host.
 Operations, on vsock port 1024 (fleet/guest/README.md): one JSON object per line in, one per line out.
   {"id": "...", "operation": "status", "parameters": {}}
   {"id": "...", "ok": true, "result": {...}}  or  {"id": "...", "ok": false, "error": {code, message, next}}
-Only bootstrap, update_pane, prepare_to_stop, collect_diagnostics and status run, each with exactly the
-parameters the contract allows. There is no shell command and no file write from outside.
+Only bootstrap, update_pane, retry_clone, prepare_to_stop, collect_diagnostics and status run, each
+with exactly the parameters the contract allows. There is no shell command and no file write from outside.
 
 Ready, to the host (CID 2) on vsock port 5000, once per boot when the Pane daemon's socket listens:
   {"type": "ready", "uptimeSeconds": 2.1}
 Reports, to the host (CID 2) on vsock port 1025: one JSON line per connection, nothing read back.
   {"type": "process_report", ...}   at start, then every 5 minutes
   {"type": "memory_pressure", ...}  when the kernel shows memory pressure, checked every 5 seconds
+  {"type": "clone", "state": ...}    each change in the Session's first clone (pane-cloud-clone.service)
+Run as `pane_guest_agent.py unseal-github-token`, it unseals the GitHub token once at first boot
+(pane-cloud-unseal.service; see unseal_github_token).
 Python 3 standard library only.
 """
 
@@ -31,6 +34,7 @@ import re
 import socket
 import stat
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -56,6 +60,7 @@ MAX_HASH_BYTES = 2 * 1024 ** 3
 MAX_REQUEST_BYTES = 64 * 1024
 PANE_USER = 'pane'
 PANE_DAEMON_UNIT = 'pane-daemon.service'
+CLONE_UNIT = 'pane-cloud-clone.service'
 # pane-daemon.service's arguments after the executable, for update_pane's drop-in.
 DAEMON_ARGUMENTS = '--ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane'
 RELEASE_URL = 'https://github.com/greenfield-inc/Pane/releases/download/v{version}/Pane-{version}-linux-{arch}.deb'
@@ -122,6 +127,7 @@ def check_release_parameters(parameters: Any) -> dict[str, Any]:
 PARAMETER_CHECKS: dict[str, Callable[[Any], dict[str, Any]]] = {
     'bootstrap': check_release_parameters,
     'update_pane': check_release_parameters,
+    'retry_clone': check_no_parameters,
     'prepare_to_stop': check_no_parameters,
     'collect_diagnostics': check_no_parameters,
     'status': check_no_parameters,
@@ -150,8 +156,14 @@ class Settings:
     hot_dir: str = '/var/lib/pane-cloud/hot'
     # Points the daemon at the hot copy; /run is gone at the next boot.
     hot_dropin: str = f'/run/systemd/system/{PANE_DAEMON_UNIT}.d/hot.conf'
-    # Written into the Pane drive by the image pipeline.
-    pane_drive_version: str = '/opt/Pane/.pane-version'
+    # The Pane drive's release ({"version", "arch", "debSha256"}), written by whoever builds the drive.
+    pane_drive_release: str = '/opt/Pane/release.json'
+    # The clone unit's progress (state.json); its done marker holds the Pane's id.
+    clone_run_dir: str = '/run/pane-cloud-clone'
+    clone_state_dir: str = '/var/lib/pane-cloud-clone'
+    # The token the clone and its backfill read through their credential helper; gone when backfill ends.
+    clone_token: str = '/run/pane-cloud/clone-token'
+    pane_uid: int | None = 1000
 
 
 class System:
@@ -310,6 +322,18 @@ class Agent:
     def update_pane(self, release: dict[str, str]) -> dict[str, Any]:
         return self._install_release(release)
 
+    def retry_clone(self) -> dict[str, Any]:
+        """Runs the Session's first clone again after it failed (the app's Retry)."""
+        if os.path.exists(os.path.join(self.settings.clone_state_dir, 'done')):
+            raise OperationError('invalid_state', 'The clone already made its Pane.', 'Open that Pane.')
+        state = read_json(os.path.join(self.settings.clone_run_dir, 'state.json')) or {}
+        if state.get('state') in ('cloning', 'creating'):
+            raise OperationError('invalid_state', 'The clone is still running.', 'Wait for it to finish or fail.')
+        code, out = self.system.run(['systemctl', 'start', '--no-block', CLONE_UNIT], timeout=30)
+        if code != 0:
+            raise OperationError('internal', f'The clone could not start: {out.strip()[-300:]}', 'Run collect_diagnostics.')
+        return {'started': True}
+
     def prepare_to_stop(self) -> dict[str, Any]:
         # Pane keeps its state in SQLite in WAL mode, which is consistent on disk once synced. The memory
         # snapshot keeps the running daemon as it is, so nothing else needs to stop.
@@ -397,9 +421,10 @@ class Agent:
         except (OSError, IndexError):
             pass
         try:
-            with open(self.settings.pane_drive_version) as drive:
-                return drive.read().strip() or None
-        except OSError:
+            with open(self.settings.pane_drive_release) as drive:
+                version = json.load(drive).get('version')
+            return version if isinstance(version, str) and VERSION.fullmatch(version) else None
+        except (OSError, ValueError, AttributeError):
             return self.system.installed_pane_version()
 
     def _relay(self) -> dict[str, Any]:
@@ -716,6 +741,104 @@ class Reporter:
         return 0
 
 
+def read_json(path: str) -> Any:
+    try:
+        with open(path) as source:
+            return json.load(source)
+    except (OSError, ValueError):
+        return None
+
+
+def write_private(path: str, data: bytes, uid: int | None) -> None:
+    """Writes a file only its owner reads (0600), by rename, so no reader ever sees part of it."""
+    tmp = f'{path}.{os.getpid()}.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+        if uid is not None:
+            os.chown(tmp, uid, uid)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def unseal_github_token(settings: Settings) -> None:
+    """The one-shot unseal at first boot (D-107), as root, before the Pane daemon and the clone start.
+
+    The host wrote pane-cloud/github-token.sealed (a libsodium sealed box of the app's
+    {"token", "source", "updatedAt"}) and the slot's private key pane-cloud/seal.key, root-only, on the
+    secrets volume. This writes the record unchanged to incoming/github-token.json for the Pane daemon to
+    import into K1's store (pane, 0600, in a 0700 folder) and the token alone to the clone's token file
+    in /run (pane, 0600), then deletes both inputs. Nothing sealed (a public repository, a later boot):
+    nothing to do. The token is never logged: errors name the step, never the content.
+    """
+    sealed_dir = os.path.join(settings.secrets_mount, 'pane-cloud')
+    sealed_path = os.path.join(sealed_dir, 'github-token.sealed')
+    key_path = os.path.join(sealed_dir, 'seal.key')
+    if not os.path.exists(sealed_path):
+        return
+    from nacl.public import PrivateKey, SealedBox  # PyNaCl (python3-nacl), only needed here
+    with open(key_path, 'rb') as key, open(sealed_path, 'rb') as sealed:
+        plaintext = SealedBox(PrivateKey(key.read())).decrypt(sealed.read())
+    try:
+        record = json.loads(plaintext)
+    except ValueError:
+        raise ValueError('The sealed GitHub token is not a JSON record.') from None
+    if not isinstance(record, dict) or not isinstance(record.get('token'), str) or not record['token'].strip():
+        raise ValueError('The sealed GitHub token record has no token.')
+    incoming = os.path.join(settings.secrets_mount, 'incoming')
+    os.makedirs(incoming, mode=0o700, exist_ok=True)
+    os.chmod(incoming, 0o700)
+    if settings.pane_uid is not None:
+        os.chown(incoming, settings.pane_uid, settings.pane_uid)
+    write_private(os.path.join(incoming, 'github-token.json'), plaintext, settings.pane_uid)
+    os.makedirs(os.path.dirname(settings.clone_token), mode=0o755, exist_ok=True)
+    write_private(settings.clone_token, record['token'].strip().encode(), settings.pane_uid)
+    os.remove(sealed_path)
+    os.remove(key_path)
+
+
+def copy_clone_request(settings: Settings) -> None:
+    """Hands the clone unit (run as pane) the host's root-only pane-cloud/clone.json ({url, branch}),
+    as root, before each run of the clone. The host's copy stays for retry_clone."""
+    os.makedirs(settings.clone_run_dir, exist_ok=True)
+    with open(os.path.join(settings.secrets_mount, 'pane-cloud', 'clone.json'), 'rb') as request:
+        write_private(os.path.join(settings.clone_run_dir, 'request.json'), request.read(), settings.pane_uid)
+
+
+class CloneReporter:
+    """Reports each change in the clone unit's state.json to the host (port 1025), for the app's view."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._last: Any = None
+
+    def poll(self) -> dict[str, Any] | None:
+        state = read_json(os.path.join(self.settings.clone_run_dir, 'state.json'))
+        if not isinstance(state, dict) or state == self._last:
+            return None
+        self._last = state
+        try:
+            with open(os.path.join(self.settings.proc_root, 'sys/kernel/random/boot_id')) as boot:
+                boot_id = boot.read().strip()
+        except OSError:
+            boot_id = None
+        return {'type': 'clone', 'at': utc_now(), 'bootId': boot_id, **state}
+
+    def run(self, send: Callable[[dict[str, Any]], None]) -> None:
+        while True:
+            message = self.poll()
+            if message:
+                try:
+                    send(message)
+                except OSError:
+                    self._last = None  # the host missed it: send it again
+            time.sleep(0.25)
+
+
 def daemon_socket_path(pane_dir: str) -> str:
     """The Pane daemon's control socket, as runpane finds it (Pane's daemonClient.ts)."""
     uid = pwd.getpwnam(PANE_USER).pw_uid
@@ -797,8 +920,15 @@ def vsock_listener(port: int = VSOCK_PORT) -> socket.socket:
 
 def main() -> None:
     settings = Settings()
+    if sys.argv[1:] == ['unseal-github-token']:
+        unseal_github_token(settings)
+        return
+    if sys.argv[1:] == ['copy-clone-request']:
+        copy_clone_request(settings)
+        return
     threading.Thread(target=Reporter(settings, send_to_host).run, daemon=True).start()
     threading.Thread(target=signal_ready, args=(settings, send_to_host, daemon_socket_path(settings.pane_dir)), daemon=True).start()
+    threading.Thread(target=CloneReporter(settings).run, args=(send_to_host,), daemon=True).start()
     serve(vsock_listener(), Agent(settings))
 
 

@@ -10,8 +10,8 @@
 Description=Pane daemon
 DefaultDependencies=no
 Requires=pane-cloud-secrets.service
-Wants=pane-cloud-identity.service
-After=sysinit.target pane-cloud-secrets.service pane-cloud-identity.service
+Wants=pane-cloud-identity.service pane-cloud-unseal.service
+After=sysinit.target pane-cloud-secrets.service pane-cloud-identity.service pane-cloud-unseal.service
 Conflicts=shutdown.target
 Before=shutdown.target
 

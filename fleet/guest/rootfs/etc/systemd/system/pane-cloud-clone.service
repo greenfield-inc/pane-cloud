@@ -1,0 +1,38 @@
+# The Session's first clone (D-107), started as soon as systemd can, beside the Pane daemon: the
+# kernel's ip= argument brought the network up before systemd. The repository comes from the secrets
+# volume, where the host wrote it before launch (pane-cloud/clone.json, root-only); without it there is
+# nothing to clone. A private repository's token is the one-shot unseal's /run/pane-cloud/clone-token,
+# removed when the clone ends well. Once a clone has made its Pane, later boots skip it. retry_clone
+# starts it again after a failure.
+[Unit]
+Description=Pane Cloud: clone the Session's repository and create its Pane
+DefaultDependencies=no
+Requires=pane-cloud-secrets.service
+Wants=pane-cloud-unseal.service
+After=sysinit.target pane-cloud-secrets.service pane-cloud-identity.service pane-cloud-unseal.service
+Conflicts=shutdown.target
+Before=shutdown.target
+ConditionPathExists=/home/pane/.pane-secrets/pane-cloud/clone.json
+ConditionPathExists=!/var/lib/pane-cloud-clone/done
+
+[Service]
+Type=oneshot
+User=pane
+Group=pane
+WorkingDirectory=/home/pane
+RuntimeDirectory=pane-cloud-clone
+RuntimeDirectoryPreserve=yes
+StateDirectory=pane-cloud-clone
+Environment=HOME=/home/pane
+Environment=PANE_DIR=/home/pane/.pane
+Environment=PATH=/home/pane/.local/bin:/usr/local/bin:/usr/bin:/bin
+# As root, the guest agent's code: hand pane the request from the host's root-only folder.
+ExecStartPre=+/usr/bin/python3 -I /usr/local/lib/pane-cloud/pane_guest_agent.py copy-clone-request
+ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/clone.py
+# The token file goes when backfill ends; the Pane daemon's own sign-in takes over. After a failure it
+# stays for retry_clone (a network error); /run is gone at the next boot either way.
+ExecStopPost=+/bin/sh -c '[ "$SERVICE_RESULT" != success ] || rm -f /run/pane-cloud/clone-token'
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

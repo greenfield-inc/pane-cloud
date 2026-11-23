@@ -59,7 +59,7 @@ else
   drive="${drives[0]}"
   check "the Pane drive is labelled pane-app, with no journal" \
     bash -c "[ \"\$(e2label '$drive')\" = pane-app ] && ! dumpe2fs -h '$drive' 2>/dev/null | grep -q has_journal"
-  check "the Pane drive's version file says $PANE_VERSION" test "$(debugfs -R 'cat /.pane-version' "$drive" 2>/dev/null)" = "$PANE_VERSION"
+  check "the Pane drive's release.json says $PANE_VERSION" bash -c "debugfs -R 'cat /release.json' '$drive' 2>/dev/null | python3 -I -c 'import json,sys; sys.exit(json.load(sys.stdin)[\"version\"] != \"$PANE_VERSION\")'"
   check "the Pane drive holds Pane's executable" bash -c "debugfs -R 'stat /pane' '$drive' 2>/dev/null | grep -q 'Type: regular'"
   sandbox="$(debugfs -R 'stat /chrome-sandbox' "$drive" 2>/dev/null | grep -Eo 'Mode: +[0-7]+|User: +[0-9]+' | tr -s ' ' | tr '\n' ' ')"
   check "the Pane drive's chrome-sandbox is root's and setuid ($sandbox)" bash -c "[[ '$sandbox' =~ Mode:\ 0?4755 ]] && [[ '$sandbox' =~ User:\ 0\  ]]"
@@ -92,10 +92,10 @@ mount -o loop,ro "$image" "$lower"
 mount -t overlay overlay -o "lowerdir=$lower,upperdir=$work/upper,workdir=$work/work" "$root"
 
 lib=/usr/local/lib/pane-cloud
-for file in $lib/overlay-init $lib/identity.sh $lib/secrets-volume.sh $lib/pane_guest_agent.py; do
+for file in $lib/overlay-init $lib/identity.sh $lib/secrets-volume.sh $lib/pane_guest_agent.py $lib/clone.py $lib/git-credential-clone; do
   check "$file is executable" test -x "$lower$file"
 done
-for unit in pane-cloud-identity pane-cloud-secrets pane-daemon pane-guest-agent; do
+for unit in pane-cloud-identity pane-cloud-secrets pane-daemon pane-cloud-unseal pane-cloud-clone pane-guest-agent; do
   check "$unit.service is enabled" test -L "$lower/etc/systemd/system/multi-user.target.wants/$unit.service"
 done
 for unit in systemd-networkd systemd-networkd-wait-online systemd-resolved; do
@@ -130,6 +130,11 @@ mount -t tmpfs shm "$root/dev/shm"
 # /proc/net/pnp, which is empty here. OpenCode reaches the network even for --version.
 rm -f "$root/etc/resolv.conf" && cp /etc/resolv.conf "$root/etc/resolv.conf"
 # The agent CLIs the build installed (OpenCode, built on Bun, needs /proc).
+git_version="$(chroot "$root" /usr/local/bin/git --version | awk '{print $3}')"
+check "Git $git_version is at least 2.49, for git backfill" python3 -I -c \
+  'import sys; sys.exit(tuple(map(int, sys.argv[1].split(".")[:2])) < (2, 49))' "$git_version"
+check "Git LFS is installed for every repository" bash -c "chroot '$root' /usr/local/bin/git lfs version >/dev/null && grep -q 'filter \"lfs\"' '$lower/etc/gitconfig'"
+check "PyNaCl is there for the token's sealed box" chroot "$root" /usr/bin/python3 -I -c 'import nacl.public'
 for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gemini:gemini; do
   output="$(chroot "$root" runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \
     timeout 60 "${entry#*:}" --version </dev/null 2>&1)" && version="$(head -1 <<<"$output")" || version=""

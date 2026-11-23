@@ -36,20 +36,51 @@ mkdir -p "$disks"
 
 manifest="$(echo "$out"/pane-base-*-amd64.json)"
 manifest_get() { python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, m))' "$manifest" "$1"; }
-# The base, read-only, as the host attaches it; a hard link, so it is never copied.
-ln "$out/$(manifest_get base)" "$disks/base.ext4" 2>/dev/null || cp "$out/$(manifest_get base)" "$disks/base.ext4"
-# The Session disk: empty, formatted the way the manifest says (N3 does this on the host).
-truncate -s 16G "$disks/session.img"
-format="$(manifest_get "drives[1]['format']")"
-${format/<device>/-F $disks/session.img}
-# The secrets volume, formatted as the manifest says (N3 does this on the host too).
-truncate -s 64M "$disks/secrets.img"
-format="$(manifest_get "drives[2]['format']")"
-${format/<device>/-F $disks/secrets.img}
-# A Pane drive newer than the base's own Pane, as the host attaches the newest release's.
-ln "$(echo "$out"/pane-app-"$CI_PANE_DRIVE_VERSION"-*-amd64.ext4)" "$disks/pane.ext4" 2>/dev/null \
-  || cp "$(echo "$out"/pane-app-"$CI_PANE_DRIVE_VERSION"-*-amd64.ext4)" "$disks/pane.ext4"
-cp "$out/vmlinux-$KERNEL_VERSION" "$disks/vmlinux"
+# Dummy tokens, sealed as the app seals a real one: never valid, so the checks can look for them anywhere.
+public_token=ghp_CIpublicRepoTokenNeverUsed000000000000
+bad_token=ghp_CIbadTokenForAPrivateRepo00000000000000
+
+# make_disks <dir> <repo url> <token>: one machine's drives, as N1 and N3 prepare a slot and assign it:
+# the base (a hard link, never copied), a Session disk and secrets volume formatted the way the
+# manifest says, the Pane drive, and on the secrets volume the create request: pane-cloud/clone.json and
+# the token sealed to the slot's key (pane-cloud/github-token.sealed, pane-cloud/seal.key), root-only.
+make_disks() {
+  local dir="$1" mnt format
+  mkdir -p "$dir"
+  ln "$out/$(manifest_get base)" "$dir/base.ext4" 2>/dev/null || cp "$out/$(manifest_get base)" "$dir/base.ext4"
+  truncate -s 16G "$dir/session.img"
+  format="$(manifest_get "drives[1]['format']")"
+  ${format/<device>/-F $dir/session.img}
+  truncate -s 64M "$dir/secrets.img"
+  format="$(manifest_get "drives[2]['format']")"
+  ${format/<device>/-F $dir/secrets.img}
+  mnt="$(mktemp -d)"
+  mount -o loop "$dir/secrets.img" "$mnt"
+  install -d -o 0 -g 0 -m 700 "$mnt/pane-cloud"
+  python3 -I - "$mnt/pane-cloud" "$2" "$3" <<'PY'
+import json, os, sys
+from nacl.public import PrivateKey, SealedBox
+folder, url, token = sys.argv[1:]
+key = PrivateKey.generate()
+def write(name, data):
+    fd = os.open(f'{folder}/{name}', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(data)
+write('clone.json', json.dumps({'url': url}).encode())
+write('seal.key', bytes(key))
+record = {'token': token, 'source': 'gh', 'updatedAt': '2026-11-23T05:00:00Z'}
+write('github-token.sealed', SealedBox(key.public_key).encrypt(json.dumps(record).encode()))
+PY
+  umount "$mnt" && rmdir "$mnt"
+  ln "$(echo "$out"/pane-app-"$CI_PANE_DRIVE_VERSION"-*-amd64.ext4)" "$dir/pane.ext4" 2>/dev/null \
+    || cp "$(echo "$out"/pane-app-"$CI_PANE_DRIVE_VERSION"-*-amd64.ext4)" "$dir/pane.ext4"
+  cp "$out/vmlinux-$KERNEL_VERSION" "$dir/vmlinux"
+  chown "$uid:$uid" "$dir"/*
+}
+# Machine 1: a public repository (express, the plan's small repo), a token it never needs.
+make_disks "$disks" https://github.com/expressjs/express.git "$public_token"
+# Machine 3: a private repository with a token GitHub refuses: the clone must fail and make no Pane.
+make_disks "$base/disks3" https://github.com/greenfield-inc/pane-cloud-control.git "$bad_token"
 # The guest's own sleep, which the stand-in miner copies.
 sleep_sha="$(debugfs -R 'cat /usr/bin/sleep' "$disks/base.ext4" 2>/dev/null | sha256sum | cut -d' ' -f1)"
 
@@ -62,6 +93,7 @@ install -d -m 755 "$upper" "$upper/etc" "$upper/etc/systemd" "$upper/etc/systemd
   "$upper/etc/systemd/system/multi-user.target.wants" "$upper/etc/systemd/system/pane-daemon.service.d" \
   "$upper/var" "$upper/var/lib" "$upper/usr" "$upper/usr/local" "$upper/usr/local/bin"
 install -d -m 700 "$upper/var/lib/pane-ci"
+(umask 077 && printf '%s' "$public_token" >"$upper/var/lib/pane-ci/token")
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   (umask 077 && printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" >"$upper/var/lib/pane-ci/claude-token")
 fi
@@ -120,6 +152,24 @@ timeline+=" network_online=$(at network-online.target ActiveEnterTimestampMonoto
 say "timeline $timeline"
 say "systemd-analyze $(systemd-analyze 2>&1 | head -1)"
 say "critical-chain $(systemd-analyze critical-chain pane-daemon.service 2>&1 | grep -E '@|\+' | tr -s ' \n' ' ')"
+# The Session's first clone (D-107), which started beside the daemon: wait for it and its backfill.
+clone_state() { python3 -I -c 'import json; print(json.load(open("/run/pane-cloud-clone/state.json"))["state"])' 2>/dev/null; }
+if [ "$boot" = 1 ]; then
+  for _ in $(seq 1 3000); do case "$(clone_state)" in done|failed) break ;; esac; sleep 0.2; done
+  token="$(cat /var/lib/pane-ci/token)" repo=/home/pane/express
+  drop=/home/pane/.pane-secrets/incoming/github-token.json
+  say "clone $(python3 -I -c 'import json; s=json.load(open("/run/pane-cloud-clone/state.json")); print(" ".join(f"{k}={str(v).replace(" ", "_")[:200]}" for k, v in s.items() if k != "progress"))')" \
+    "missing=$(as_pane git -C "$repo" rev-list --objects --missing=print HEAD 2>/dev/null | grep -c '^?')" \
+    "pane_listed=$(as_pane "$runpane" panes list --json 2>/dev/null | grep -c '"express"')" \
+    "token_in_repo=$(grep -rlF "$token" "$repo" 2>/dev/null | wc -l)" \
+    "token_in_journal=$(journalctl -b --no-pager 2>/dev/null | grep -cF "$token")" \
+    "token_in_progress=$(grep -cF "$token" /run/pane-cloud-clone/state.json)" \
+    "token_in_logs=$(cat /var/log/pane-cloud/*.log | grep -cF "$token")" \
+    "sealed_gone=$([ -e /home/pane/.pane-secrets/pane-cloud/github-token.sealed ] || [ -e /home/pane/.pane-secrets/pane-cloud/seal.key ] && echo no || echo yes)" \
+    "drop=$(stat -c %U:%a "$drop" 2>/dev/null)/$(stat -c %a "$(dirname "$drop")" 2>/dev/null)" \
+    "drop_matches=$(grep -cF "$token" "$drop" 2>/dev/null)" \
+    "clone_token_gone=$([ -e /run/pane-cloud/clone-token ] && echo no || echo yes)"
+fi
 say "root $(findmnt -n -o FSTYPE,OPTIONS /) base $(findmnt -n -o SOURCE,OPTIONS /mnt/base) pane $(findmnt -n -o SOURCE,OPTIONS /opt/Pane)"
 
 if [ "$boot" = 2 ]; then
@@ -177,7 +227,13 @@ TimeoutStartSec=30min
 UNIT
 ln -s /etc/systemd/system/pane-ci-check.service "$upper/etc/systemd/system/multi-user.target.wants/pane-ci-check.service"
 umount "$layer"
-chown "$uid:$uid" "$disks/base.ext4" "$disks/session.img" "$disks/secrets.img" "$disks/vmlinux" "$disks/pane.ext4"
+# Machine 3 needs only the staging CA for its relay certificate.
+mount -o loop "$base/disks3/session.img" "$layer"
+install -d -m 755 "$layer/upper" "$layer/upper/etc" "$layer/upper/etc/systemd" "$layer/upper/etc/systemd/system" \
+  "$layer/upper/etc/systemd/system/pane-daemon.service.d"
+printf '[Service]\nEnvironment=PANE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory\n' \
+  >"$layer/upper/etc/systemd/system/pane-daemon.service.d/ci.conf"
+umount "$layer"
 
 ip tuntap add dev "$tap" mode tap user "$uid"
 ip addr add "$host_ip/30" dev "$tap"
@@ -193,11 +249,11 @@ echo '+cpu +memory +pids' >/sys/fs/cgroup/cgroup.subtree_control
 
 pids=()
 trap 'kill -KILL "${pids[@]}" 2>/dev/null || true' EXIT
-# launch <n>: boots the machine as a fleet host does, in a fresh jail n5-boot-<n>, with the same drives.
+# launch <n> <drives folder>: boots a machine as a fleet host does, in a fresh jail n5-boot-<n>.
 launch() {
   local vm="n5-boot-$1" jail="$base/firecracker/n5-boot-$1/root" file
   mkdir -p "$jail" "/sys/fs/cgroup/$vm"
-  for file in vmlinux base.ext4 session.img secrets.img pane.ext4; do ln "$disks/$file" "$jail/$file"; done
+  for file in vmlinux base.ext4 session.img secrets.img pane.ext4; do ln "$2/$file" "$jail/$file"; done
   "$bin/jailer" --id "$vm" --exec-file "$bin/firecracker" --uid "$uid" --gid "$uid" --chroot-base-dir "$base" \
     --cgroup-version 2 --parent-cgroup "$vm" --cgroup cpu.weight=100 --new-pid-ns \
     -- --api-sock /api.sock --level Warning >>"$console" 2>&1 &
@@ -248,11 +304,12 @@ PY
 # check <n> <phase>: the checks over vsock; phase "first" or "second".
 check() {
   python3 -I - "$base/firecracker/n5-boot-$1/root/v.sock" "$out" "$1" "$2" "$PANE_VERSION" "$CI_PANE_DRIVE_VERSION" \
-    "$CI_HOT_PANE_VERSION" "$CI_HOT_PANE_DEB_SHA256_amd64" "$sleep_sha" "${CLAUDE_CODE_OAUTH_TOKEN:+yes}" "$disks/session.img" <<'PY'
+    "$CI_HOT_PANE_VERSION" "$CI_HOT_PANE_DEB_SHA256_amd64" "$sleep_sha" "${CLAUDE_CODE_OAUTH_TOKEN:+yes}" "$disks/session.img" \
+    "$public_token" "$bad_token" <<'PY'
 import base64, io, json, os, re, socket, sys, tarfile, time
 
 (vsock, out, boot, phase, base_version, drive_version, hot_version, hot_sha, sleep_sha, have_token,
- session_disk) = sys.argv[1:12]
+ session_disk, public_token, bad_token) = sys.argv[1:14]
 start = float(open(f'{out}/start-{boot}').read())
 failed = False
 
@@ -315,11 +372,42 @@ if ready:
     check(f"the ready signal reached port 5000 {ready[0]['hostMonotonic'] - start:.2f} s after InstanceStart "
           f"(guest uptime {ready[0].get('uptimeSeconds')} s)", ready[0].get('type') == 'ready')
 
+def clone_reports():
+    return [r for r in jsonl(f'{out}/reports-{boot}.jsonl') if r.get('type') == 'clone']
+
+if phase == 'clone-fail':
+    # Machine 3: a private repository and a token GitHub refuses (D-107).
+    failed_first = wait_for('the clone reports a failure', 300, lambda: [r for r in clone_reports() if r['state'] == 'failed'], every=1)
+    if failed_first:
+        error = failed_first[0].get('error') or ''
+        print(f'     git said: {error[:300]!r}', flush=True)
+        check("a failed clone reports git's error", 'fatal:' in error or 'remote:' in error)
+        check('a failed clone makes no Pane', not any(r.get('paneId') for r in clone_reports()) and
+              not any(r['state'] == 'ready' for r in clone_reports()))
+        retried = call('retry_clone')
+        check('retry_clone starts the clone again', retried.get('ok') and retried['result'] == {'started': True}, json.dumps(retried)[:300])
+        again = wait_for('the retried clone reports its result', 300,
+                         lambda: len([r for r in clone_reports() if r['state'] == 'failed']) >= 2 and clone_reports(), every=1)
+        check('the retried clone fails the same way, with no Pane', bool(again) and not any(r.get('paneId') for r in again))
+    reports_text = open(f'{out}/reports-{boot}.jsonl').read()
+    check('the token appears in no report the host received', bad_token not in reports_text and public_token not in reports_text)
+    log = bootstrap_log()
+    ids = lambda text: (re.search(r'identity: hostname (\S+)', text), re.search(r'identity: pane machine id (\S+)', text))
+    first_ids, these_ids = ids(open(f'{out}/bootstrap-1.log').read()), ids(log)
+    if all(first_ids) and all(these_ids):
+        check(f'two machines from one image have different ids ({first_ids[0].group(1)} {first_ids[1].group(1)[:8]} '
+              f'and {these_ids[0].group(1)} {these_ids[1].group(1)[:8]})',
+              first_ids[0].group(1) != these_ids[0].group(1) and first_ids[1].group(1) != these_ids[1].group(1))
+    else:
+        check('both machines logged their ids', False, f'{first_ids} {these_ids}')
+    sys.exit(1 if failed else 0)
+
 needle = r' ci: claude ' if phase == 'first' else r' ci: boot2 '
 log = wait_for('the CI check finishes its boot checks', 900, lambda: (text := bootstrap_log()) and re.search(needle, text) and text, every=3)
 if not log:
     sys.exit(1)
 open(f'{out}/bootstrap.log', 'w').write(log)
+open(f'{out}/bootstrap-{boot}.log', 'w').write(log)
 timeline = dict(re.findall(r'(\w+)=(\S*)', line(log, 'timeline', int(boot)) or ''))
 f = lambda key: float(timeline[key]) if timeline.get(key, '').replace('.', '', 1).isdigit() else None
 print(f'     boot {boot} timeline, seconds since the guest kernel started:', flush=True)
@@ -343,6 +431,22 @@ check(f'the root is an overlay on the read-only base, with the Pane drive on /op
       mounts.startswith('overlay ') and bool(re.search(r'base /dev/vda ro\b', mounts)) and bool(re.search(r'pane /dev/vdd ro\b', mounts)))
 
 if phase == 'first':
+    clone = dict(re.findall(r'(\w+)=(\S*)', line(log, 'clone', 1) or ''))
+    started = [r for r in clone_reports()]
+    if started:
+        print(f"     the clone's first report reached the host {started[0]['hostMonotonic'] - start:.2f} s after InstanceStart", flush=True)
+    check(f"the clone started (guest {clone.get('startedUptime')} s) before the Pane daemon answered ({timeline.get('socket')} s)",
+          bool(clone.get('startedUptime')) and float(clone['startedUptime']) < float(timeline.get('socket') or 0))
+    check(f"the clone made the repo's Pane ({clone.get('paneId')}) and backfill finished ({clone.get('state')})",
+          clone.get('state') == 'done' and clone.get('paneId') not in (None, '', 'None') and int(clone.get('pane_listed', '0')) > 0)
+    check(f"after backfill no object of HEAD is missing ({clone.get('missing')})", clone.get('missing') == '0')
+    check('the token is in no file of the repository, the journal, the progress file or the logs',
+          all(clone.get(k) == '0' for k in ('token_in_repo', 'token_in_journal', 'token_in_progress', 'token_in_logs')),
+          json.dumps({k: clone.get(k) for k in clone if k.startswith('token_in')}))
+    check(f"the unseal wrote the drop file (pane, 0600, in a 0700 folder: {clone.get('drop')}) and deleted its sealed inputs",
+          clone.get('drop') == 'pane:600/700' and clone.get('drop_matches') == '1' and clone.get('sealed_gone') == 'yes')
+    check('the clone token file is gone once backfill ended', clone.get('clone_token_gone') == 'yes')
+    check('no report the host received carries the token', public_token not in open(f'{out}/reports-{boot}.jsonl').read())
     check(f"a terminal panel ran node -v ({timeline.get('node_out')}, {timeline.get('node_done')} s after kernel start)",
           timeline.get('node_rc') == '0' and timeline.get('pane_rc') == '0' and timeline.get('repo_rc') == '0')
     check(f'the running Pane is the Pane drive\'s {drive_version}, not the base\'s {base_version}',
@@ -411,7 +515,7 @@ report_failure() {
   exit 1
 }
 
-launch 1
+launch 1 "$disks"
 check 1 first || report_failure
 # A reboot, as a stop and start: the guest restarts (reboot=k makes Firecracker exit), then a new jail
 # boots the same drives.
@@ -419,6 +523,10 @@ curl -fsS --unix-socket "$base/firecracker/n5-boot-1/root/api.sock" -X PUT http:
   -H 'Content-Type: application/json' -d '{"action_type": "SendCtrlAltDel"}'
 for _ in $(seq 1 600); do kill -0 "${pids[0]}" 2>/dev/null || break; sleep 0.1; done
 kill -KILL "${pids[0]}" "${pids[1]}" 2>/dev/null || true
-launch 2
+launch 2 "$disks"
 check 2 second || report_failure
+kill -KILL "${pids[2]}" "${pids[3]}" 2>/dev/null || true
+# Machine 3, from the same image on its own drives: a clone that fails, and its retry.
+launch 3 "$base/disks3"
+check 3 clone-fail || report_failure
 echo "all boot checks passed"

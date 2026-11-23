@@ -1,6 +1,7 @@
 """The guest agent's protocol, driven over a real socket (AF_UNIX here, AF_VSOCK on a machine)."""
 
 import base64
+import importlib.util
 import io
 import json
 import os
@@ -14,7 +15,7 @@ import threading
 import time
 import unittest
 
-from pane_guest_agent import MACHINE_ARCH, READY_PORT, Agent, Reporter, Settings, System, serve, signal_ready
+from pane_guest_agent import MACHINE_ARCH, READY_PORT, Agent, CloneReporter, Reporter, Settings, System, copy_clone_request, serve, signal_ready, unseal_github_token
 
 SHA256_OF_ABC = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
 RELEASE = {'version': '2.4.215', 'arch': MACHINE_ARCH, 'debSha256': SHA256_OF_ABC}
@@ -96,7 +97,9 @@ class GuestAgentTest(unittest.TestCase):
             secrets_mount='/home/pane/.pane-secrets',
             hot_dir=self.path('var/lib/pane-cloud/hot'),
             hot_dropin=self.path('run/systemd/system/pane-daemon.service.d/hot.conf'),
-            pane_drive_version=self.path('opt/Pane/.pane-version'),
+            pane_drive_release=self.path('opt/Pane/release.json'),
+            clone_run_dir=self.path('run/pane-cloud-clone'),
+            clone_state_dir=self.path('var/lib/pane-cloud-clone'),
         )
         sock_path = self.path('agent.sock')
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -193,7 +196,7 @@ class GuestAgentTest(unittest.TestCase):
         self.assertEqual(os.listdir(self.path('var/lib/pane-cloud')), [])
 
     def test_bootstrap_does_nothing_when_the_pane_drive_has_the_release(self):
-        self.write('opt/Pane/.pane-version', '2.4.215\n')
+        self.write('opt/Pane/release.json', json.dumps({'version': '2.4.215', 'arch': MACHINE_ARCH, 'debSha256': SHA256_OF_ABC}))
 
         reply = self.send('bootstrap', {'release': RELEASE})
 
@@ -201,6 +204,24 @@ class GuestAgentTest(unittest.TestCase):
                                            'firstBoot': 'done'})
         self.assertEqual(self.system.downloads, [])
         self.assertEqual(self.system.restarts, 0)
+
+    # ------------------------------------------------------------ clone
+
+    def test_retry_clone_starts_the_clone_again_after_it_failed(self):
+        self.write('run/pane-cloud-clone/state.json', json.dumps({'state': 'failed', 'error': 'fatal: Authentication failed'}))
+
+        reply = self.send('retry_clone', {})
+
+        self.assertEqual(reply['result'], {'started': True})
+        self.assertIn(['systemctl', 'start', '--no-block', 'pane-cloud-clone.service'], self.system.commands)
+
+    def test_retry_clone_refuses_while_cloning_or_once_the_pane_exists(self):
+        self.write('run/pane-cloud-clone/state.json', json.dumps({'state': 'cloning'}))
+        self.assertEqual(self.send('retry_clone', {})['error']['code'], 'invalid_state')
+        self.write('var/lib/pane-cloud-clone/done', 'pane-1\n')
+        self.assertEqual(self.send('retry_clone', {})['error']['code'], 'invalid_state')
+        self.assertEqual(self.send('retry_clone', {'force': True})['error']['code'], 'invalid_request')
+        self.assertEqual(self.system.commands, [])
 
     # ------------------------------------------------------------ status
 
@@ -455,6 +476,100 @@ class ReadySignalTest(unittest.TestCase):
         signal_ready(self.settings, self.send, self.sock)
 
         self.assertEqual(len(self.sent), 1)
+
+
+class UnsealTest(unittest.TestCase):
+    """The one-shot unseal at first boot (D-107): the sealed GitHub token becomes K1's drop file and the
+    clone's token file, and its inputs are deleted."""
+
+    RECORD = {'token': 'ghp_EXAMPLE0123456789abcdefghijklmnopqrst', 'source': 'gh', 'updatedAt': '2026-11-23T05:00:00Z'}
+
+    def setUp(self):
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix='pga-unseal-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, self.root)
+        self.settings = Settings(secrets_mount=f'{self.root}/secrets', clone_token=f'{self.root}/run/pane-cloud/clone-token',
+                                 pane_uid=None)
+        os.makedirs(f'{self.root}/secrets/pane-cloud', mode=0o700)
+
+    def seal(self, plaintext):
+        from nacl.public import PrivateKey, SealedBox
+        key = PrivateKey.generate()
+        with open(f'{self.root}/secrets/pane-cloud/seal.key', 'wb') as out:
+            out.write(bytes(key))
+        with open(f'{self.root}/secrets/pane-cloud/github-token.sealed', 'wb') as out:
+            out.write(SealedBox(key.public_key).encrypt(plaintext))
+
+    def mode(self, path):
+        return os.stat(path).st_mode & 0o7777
+
+    @unittest.skipUnless(importlib.util.find_spec('nacl'), 'PyNaCl is not installed')
+    def test_writes_the_drop_file_and_the_clone_token_then_deletes_the_sealed_input(self):
+        self.seal(json.dumps(self.RECORD).encode())
+
+        unseal_github_token(self.settings)
+
+        drop = f'{self.root}/secrets/incoming/github-token.json'
+        with open(drop) as source:
+            self.assertEqual(json.load(source), self.RECORD)
+        self.assertEqual((self.mode(drop), self.mode(os.path.dirname(drop))), (0o600, 0o700))
+        with open(self.settings.clone_token) as source:
+            self.assertEqual(source.read(), self.RECORD['token'])
+        self.assertEqual(self.mode(self.settings.clone_token), 0o600)
+        self.assertEqual(os.listdir(f'{self.root}/secrets/pane-cloud'), [])
+        self.assertEqual(sorted(os.listdir(f'{self.root}/secrets/incoming')), ['github-token.json'])
+
+    @unittest.skipUnless(importlib.util.find_spec('nacl'), 'PyNaCl is not installed')
+    def test_a_record_without_a_token_writes_nothing_and_never_echoes_the_payload(self):
+        self.seal(b'{"token": "", "secret-ish": "ghp_SHOULD_NOT_APPEAR"}')
+
+        with self.assertRaises(ValueError) as refused:
+            unseal_github_token(self.settings)
+
+        self.assertNotIn('ghp_SHOULD_NOT_APPEAR', str(refused.exception))
+        self.assertFalse(os.path.exists(f'{self.root}/secrets/incoming'))
+        self.assertFalse(os.path.exists(self.settings.clone_token))
+
+    def test_hands_the_clone_its_request_and_keeps_the_hosts_copy_for_a_retry(self):
+        with open(f'{self.root}/secrets/pane-cloud/clone.json', 'w') as out:
+            out.write('{"url": "https://github.com/owner/repo.git", "branch": "main"}')
+        self.settings.clone_run_dir = f'{self.root}/run/pane-cloud-clone'
+
+        copy_clone_request(self.settings)
+
+        with open(f'{self.root}/run/pane-cloud-clone/request.json') as request:
+            self.assertEqual(json.load(request), {'url': 'https://github.com/owner/repo.git', 'branch': 'main'})
+        self.assertEqual(self.mode(f'{self.root}/run/pane-cloud-clone/request.json'), 0o600)
+        self.assertTrue(os.path.exists(f'{self.root}/secrets/pane-cloud/clone.json'))
+
+    def test_a_public_repository_has_nothing_to_unseal(self):
+        unseal_github_token(self.settings)
+
+        self.assertFalse(os.path.exists(f'{self.root}/secrets/incoming'))
+        self.assertFalse(os.path.exists(self.settings.clone_token))
+
+
+class CloneReporterTest(unittest.TestCase):
+    def setUp(self):
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix='pga-clone-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, self.root)
+        self.settings = Settings(clone_run_dir=f'{self.root}/run', proc_root=f'{self.root}/proc')
+        os.makedirs(f'{self.root}/proc/sys/kernel/random')
+        with open(f'{self.root}/proc/sys/kernel/random/boot_id', 'w') as boot:
+            boot.write('boot-1\n')
+
+    def test_reports_each_change_in_the_clone_progress_once(self):
+        reporter = CloneReporter(self.settings)
+        self.assertIsNone(reporter.poll())
+        os.makedirs(f'{self.root}/run')
+        with open(f'{self.root}/run/state.json', 'w') as state:
+            json.dump({'state': 'cloning', 'repo': 'owner/repo', 'progress': 'Receiving objects:  45% (450/1000)'}, state)
+
+        message = reporter.poll()
+
+        self.assertEqual({k: message[k] for k in ('type', 'state', 'repo', 'progress', 'bootId')},
+                         {'type': 'clone', 'state': 'cloning', 'repo': 'owner/repo',
+                          'progress': 'Receiving objects:  45% (450/1000)', 'bootId': 'boot-1'})
+        self.assertIsNone(reporter.poll())
 
 
 if __name__ == '__main__':
