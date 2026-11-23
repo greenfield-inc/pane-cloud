@@ -487,7 +487,7 @@ class UnsealTest(unittest.TestCase):
     def setUp(self):
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='pga-unseal-', dir='/tmp'))
         self.addCleanup(shutil.rmtree, self.root)
-        self.settings = Settings(secrets_mount=f'{self.root}/secrets', clone_token=f'{self.root}/secrets/clone-token',
+        self.settings = Settings(secrets_mount=f'{self.root}/secrets', clone_token=f'{self.root}/secrets/pane-cloud/clone-token',
                                  pane_uid=None)
         os.makedirs(f'{self.root}/secrets/pane-cloud', mode=0o700)
 
@@ -515,7 +515,8 @@ class UnsealTest(unittest.TestCase):
         with open(self.settings.clone_token) as source:
             self.assertEqual(source.read(), self.RECORD['token'])
         self.assertEqual(self.mode(self.settings.clone_token), 0o600)
-        self.assertEqual(os.listdir(f'{self.root}/secrets/pane-cloud'), [])
+        self.assertEqual(os.listdir(f'{self.root}/secrets/pane-cloud'), ['clone-token'])
+        self.assertEqual(self.mode(f'{self.root}/secrets/pane-cloud'), 0o710)
         self.assertEqual(sorted(os.listdir(f'{self.root}/secrets/incoming')), ['github-token.json'])
 
     @unittest.skipUnless(importlib.util.find_spec('nacl'), 'PyNaCl is not installed')

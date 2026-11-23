@@ -8,7 +8,7 @@ the newest commit of the branch and its files, with submodules the same way. Onc
 daemon are both ready it registers the repo and creates its Pane locally with runpane. Then, at low
 priority, it fetches everything behind that commit: the full history and every branch and tag, so the
 repository ends up as a plain git clone. Every git command signs in through a credential helper given
-on git's command line (git-credential-clone, reading clone-token on the secrets volume), so the token
+on git's command line (git-credential-clone, reading pane-cloud/clone-token on the secrets volume), so the token
 never reaches .git/config, the repository, this unit's output or the progress file.
 
 Progress goes to /run/pane-cloud-clone/state.json, which the guest agent reports to the host:

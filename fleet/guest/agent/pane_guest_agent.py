@@ -162,8 +162,9 @@ class Settings:
     clone_run_dir: str = '/run/pane-cloud-clone'
     clone_state_dir: str = '/var/lib/pane-cloud-clone'
     # The token the clone and its history fetch read through their credential helper, on the secrets
-    # volume so a history fetch a sleep cut short can resume at the next boot; gone when that ends.
-    clone_token: str = '/home/pane/.pane-secrets/clone-token'
+    # volume (never the Session disk) so a history fetch a sleep cut short can resume at the next boot;
+    # the clone unit deletes it when that ends.
+    clone_token: str = '/home/pane/.pane-secrets/pane-cloud/clone-token'
     pane_uid: int | None = 1000
 
 
@@ -772,8 +773,9 @@ def unseal_github_token(settings: Settings) -> None:
     The host wrote pane-cloud/github-token.sealed (a libsodium sealed box of the app's
     {"token", "source", "updatedAt"}) and the slot's private key pane-cloud/seal.key, root-only, on the
     secrets volume. This writes the record unchanged to incoming/github-token.json for the Pane daemon to
-    import into K1's store (pane, 0600, in a 0700 folder) and the token alone to the clone's token file
-    clone-token beside it on the secrets volume (pane, 0600), then deletes both inputs. Nothing sealed (a public repository, a later boot):
+    import into K1's store (pane, 0600, in a 0700 folder) and the token alone to pane-cloud/clone-token
+    (pane, 0600), then deletes both inputs. pane-cloud/ becomes root:pane 0710, so pane reaches its token
+    file and nothing else there (the host's clone.json stays root's). Nothing sealed (a public repository, a later boot):
     nothing to do. The token is never logged: errors name the step, never the content.
     """
     sealed_dir = os.path.join(settings.secrets_mount, 'pane-cloud')
@@ -799,6 +801,9 @@ def unseal_github_token(settings: Settings) -> None:
     write_private(settings.clone_token, record['token'].strip().encode(), settings.pane_uid)
     os.remove(sealed_path)
     os.remove(key_path)
+    os.chmod(sealed_dir, 0o710)
+    if settings.pane_uid is not None:
+        os.chown(sealed_dir, 0, settings.pane_uid)
 
 
 def copy_clone_request(settings: Settings) -> None:

@@ -81,6 +81,9 @@ PY
 make_disks "$disks" https://github.com/expressjs/express.git "$public_token"
 # Machine 3: a private repository with a token GitHub refuses: the clone must fail and make no Pane.
 make_disks "$base/disks3" https://github.com/greenfield-inc/pane-cloud-control.git "$bad_token"
+# Machine 4: a medium public repository (Pane's), stopped and started while its history is still
+# being fetched, so the fetch resumes at the next boot.
+make_disks "$base/disks4" https://github.com/greenfield-inc/Pane.git "$public_token"
 # The guest's own sleep, which the stand-in miner copies.
 sleep_sha="$(debugfs -R 'cat /usr/bin/sleep' "$disks/base.ext4" 2>/dev/null | sha256sum | cut -d' ' -f1)"
 
@@ -170,7 +173,7 @@ if [ "$boot" = 1 ]; then
     "sealed_gone=$([ -e /home/pane/.pane-secrets/pane-cloud/github-token.sealed ] || [ -e /home/pane/.pane-secrets/pane-cloud/seal.key ] && echo no || echo yes)" \
     "drop=$(stat -c %U:%a "$drop" 2>/dev/null)/$(stat -c %a "$(dirname "$drop")" 2>/dev/null)" \
     "drop_matches=$(grep -cF "$token" "$drop" 2>/dev/null)" \
-    "clone_token_gone=$([ -e /home/pane/.pane-secrets/clone-token ] && echo no || echo yes)"
+    "clone_token_gone=$([ -e /home/pane/.pane-secrets/pane-cloud/clone-token ] && echo no || echo yes)"
 fi
 say "root $(findmnt -n -o FSTYPE,OPTIONS /) base $(findmnt -n -o SOURCE,OPTIONS /mnt/base) pane $(findmnt -n -o SOURCE,OPTIONS /opt/Pane)"
 
@@ -229,13 +232,15 @@ TimeoutStartSec=30min
 UNIT
 ln -s /etc/systemd/system/pane-ci-check.service "$upper/etc/systemd/system/multi-user.target.wants/pane-ci-check.service"
 umount "$layer"
-# Machine 3 needs only the staging CA for its relay certificate.
-mount -o loop "$base/disks3/session.img" "$layer"
-install -d -m 755 "$layer/upper" "$layer/upper/etc" "$layer/upper/etc/systemd" "$layer/upper/etc/systemd/system" \
-  "$layer/upper/etc/systemd/system/pane-daemon.service.d"
-printf '[Service]\nEnvironment=PANE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory\n' \
-  >"$layer/upper/etc/systemd/system/pane-daemon.service.d/ci.conf"
-umount "$layer"
+# Machines 3 and 4 need only the staging CA for their relay certificates.
+for machine in disks3 disks4; do
+  mount -o loop "$base/$machine/session.img" "$layer"
+  install -d -m 755 "$layer/upper" "$layer/upper/etc" "$layer/upper/etc/systemd" "$layer/upper/etc/systemd/system" \
+    "$layer/upper/etc/systemd/system/pane-daemon.service.d"
+  printf '[Service]\nEnvironment=PANE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory\n' \
+    >"$layer/upper/etc/systemd/system/pane-daemon.service.d/ci.conf"
+  umount "$layer"
+done
 
 ip tuntap add dev "$tap" mode tap user "$uid"
 ip addr add "$host_ip/30" dev "$tap"
@@ -303,10 +308,10 @@ PY
   echo "boot $1 started at $(date -u +%FT%TZ)"
 }
 
-# check <n> <phase>: the checks over vsock; phase "first" or "second".
+# check <n> <phase> <drives folder>: the checks over vsock; phase first, second, clone-fail, resume-1, resume-2.
 check() {
   python3 -I - "$base/firecracker/n5-boot-$1/root/v.sock" "$out" "$1" "$2" "$PANE_VERSION" "$CI_PANE_DRIVE_VERSION" \
-    "$CI_HOT_PANE_VERSION" "$CI_HOT_PANE_DEB_SHA256_amd64" "$sleep_sha" "${CLAUDE_CODE_OAUTH_TOKEN:+yes}" "$disks/session.img" \
+    "$CI_HOT_PANE_VERSION" "$CI_HOT_PANE_DEB_SHA256_amd64" "$sleep_sha" "${CLAUDE_CODE_OAUTH_TOKEN:+yes}" "$3/session.img" \
     "$public_token" "$bad_token" <<'PY'
 import base64, io, json, os, re, socket, sys, tarfile, time
 
@@ -377,6 +382,45 @@ if ready:
 def clone_reports():
     return [r for r in jsonl(f'{out}/reports-{boot}.jsonl') if r.get('type') == 'clone']
 
+def on_session_disk():
+    """How often either token appears anywhere in the Session disk's raw image: every file ever written
+    there, deleted or not (D-55, D-58: the token belongs only on the secrets volume)."""
+    found, tail = 0, b''
+    with open(session_disk, 'rb') as disk:
+        while chunk := disk.read(64 * 1024 ** 2):
+            block = tail + chunk
+            found += sum(block.count(t.encode()) for t in (public_token, bad_token))
+            tail = block[-64:]
+    return found
+
+def scan(when):
+    check(f'the token is on no file of the Session disk {when}', on_session_disk() == 0)
+
+if phase in ('first', 'resume-1', 'resume-2'):
+    # The clone, from its reports: the Session disk is searched at each state the clone reaches.
+    seen = set()
+    def progressed():
+        for report in clone_reports():
+            if report['state'] not in seen:
+                seen.add(report['state'])
+                if report['state'] in ('cloning', 'history'):
+                    scan(f"while the clone is {'cloning' if report['state'] == 'cloning' else 'fetching history'}")
+        states = [r['state'] for r in clone_reports()]
+        if phase == 'resume-1':
+            return 'history' in states or 'done' in states
+        return 'done' in states or 'failed' in states
+    wait_for('the clone reaches its next stage', 900, progressed, every=0.1)
+    if phase == 'resume-1':
+        if 'done' in seen and 'history' not in seen:
+            print('skip the history fetch ended before the machine could be stopped mid-fetch', flush=True)
+        sys.exit(1 if failed else 0)
+    if phase == 'resume-2':
+        last = clone_reports()[-1] if clone_reports() else {}
+        check(f"after a stop mid-fetch, the next boot resumed the history fetch and finished it ({last.get('state')}, {last.get('error')})",
+              'history' in seen and last.get('state') == 'done' and not last.get('error') and last.get('paneId'))
+        scan('after a stop mid-fetch and the resumed fetch')
+        sys.exit(1 if failed else 0)
+
 if phase == 'clone-fail':
     # Machine 3: a private repository and a token GitHub refuses (D-107).
     failed_first = wait_for('the clone reports a failure', 300, lambda: [r for r in clone_reports() if r['state'] == 'failed'], every=1)
@@ -393,6 +437,7 @@ if phase == 'clone-fail':
         check('the retried clone fails the same way, with no Pane', bool(again) and not any(r.get('paneId') for r in again))
     reports_text = open(f'{out}/reports-{boot}.jsonl').read()
     check('the token appears in no report the host received', bad_token not in reports_text and public_token not in reports_text)
+    scan('after the failed clone and its retry')
     log = bootstrap_log()
     ids = lambda text: (re.search(r'identity: hostname (\S+)', text), re.search(r'identity: pane machine id (\S+)', text))
     first_ids, these_ids = ids(open(f'{out}/bootstrap-1.log').read()), ids(log)
@@ -504,6 +549,7 @@ else:
     check(f'after a reboot the Pane drive\'s {drive_version} runs again', call('status')['result'].get('paneVersion') == drive_version)
     check('the next boot deleted update_pane\'s hot copy', values.get('hot_gone') == 'yes')
     check('dpkg -l is unchanged at the next boot', values.get('dpkg') == open(f'{out}/dpkg-boot1').read())
+    scan('after a reboot')
     check('the Pane made on the first boot is still there', int(values.get('pane_listed', '0')) > 0)
     # The Session disk holds only what the Session wrote (D-95): its allocated blocks on the host.
     allocated = os.stat(session_disk).st_blocks * 512
@@ -520,7 +566,7 @@ report_failure() {
 }
 
 launch 1 "$disks"
-check 1 first || report_failure
+check 1 first "$disks" || report_failure
 # A reboot, as a stop and start: the guest restarts (reboot=k makes Firecracker exit), then a new jail
 # boots the same drives.
 curl -fsS --unix-socket "$base/firecracker/n5-boot-1/root/api.sock" -X PUT http://localhost/actions \
@@ -528,9 +574,19 @@ curl -fsS --unix-socket "$base/firecracker/n5-boot-1/root/api.sock" -X PUT http:
 for _ in $(seq 1 600); do kill -0 "${pids[0]}" 2>/dev/null || break; sleep 0.1; done
 kill -KILL "${pids[0]}" "${pids[1]}" 2>/dev/null || true
 launch 2 "$disks"
-check 2 second || report_failure
+check 2 second "$disks" || report_failure
 kill -KILL "${pids[2]}" "${pids[3]}" 2>/dev/null || true
 # Machine 3, from the same image on its own drives: a clone that fails, and its retry.
 launch 3 "$base/disks3"
-check 3 clone-fail || report_failure
+check 3 clone-fail "$base/disks3" || report_failure
+kill -KILL "${pids[4]}" "${pids[5]}" 2>/dev/null || true
+# Machine 4: stopped as soon as its history fetch starts, then started again on the same drives.
+launch 4 "$base/disks4"
+check 4 resume-1 "$base/disks4" || report_failure
+curl -fsS --unix-socket "$base/firecracker/n5-boot-4/root/api.sock" -X PUT http://localhost/actions \
+  -H 'Content-Type: application/json' -d '{"action_type": "SendCtrlAltDel"}'
+for _ in $(seq 1 600); do kill -0 "${pids[6]}" 2>/dev/null || break; sleep 0.1; done
+kill -KILL "${pids[6]}" "${pids[7]}" 2>/dev/null || true
+launch 5 "$base/disks4"
+check 5 resume-2 "$base/disks4" || report_failure
 echo "all boot checks passed"
