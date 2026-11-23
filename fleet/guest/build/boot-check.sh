@@ -39,6 +39,8 @@ truncate -s 16G "$jail/disk.ext4"
 truncate -s 64M "$jail/secrets.img"
 cp "$out/vmlinux-$KERNEL_VERSION" "$jail/vmlinux"
 
+echo "== processes of uid 1000 (the runner) before the boot"
+ps -o pid,etimes,args -u 1000 | cut -c1-160
 echo "== CI check unit on the throwaway disk copy"
 disk="$base/disk"
 mkdir -p "$disk"

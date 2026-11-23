@@ -43,8 +43,18 @@ work="$(mktemp -d)"
 lower="$work/lower" root="$work/root"
 mkdir -p "$lower" "$root" "$work/upper" "$work/work"
 cleanup() {
-  # Stops the daemon and everything else still running inside the image.
-  if mountpoint -q "$root"; then fuser -k -m "$root" >/dev/null 2>&1 || true; fi
+  # Stops the daemon and everything else still running inside the image: every process whose root is
+  # the image. The daemon runs as uid 1000, which on a CI runner is the runner's own user.
+  local proc left
+  for _ in 1 2 3; do
+    left=""
+    for proc in /proc/[0-9]*; do
+      [ "$(readlink "$proc/root" 2>/dev/null)" = "$root" ] && { kill -KILL "${proc#/proc/}" 2>/dev/null; left+=" ${proc#/proc/}"; }
+    done
+    [ -z "$left" ] && break
+    sleep 1
+  done
+  [ -n "$left" ] && echo "     still running in the image after cleanup:$left"
   for m in dev/shm dev/pts dev sys proc; do umount -l "$root/$m" 2>/dev/null || true; done
   umount -l "$root" "$lower" 2>/dev/null || true
   rm -rf "$work"
