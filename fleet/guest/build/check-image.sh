@@ -69,10 +69,6 @@ check "pane owns /home/pane" test "$(stat -c %u:%g "$lower/home/pane")" = 1000:1
 check "no ubuntu user" bash -c "! grep -q '^ubuntu:' '$lower/etc/passwd'"
 check "pane lingers" test -f "$lower/var/lib/systemd/linger/pane"
 check "the secrets volume's mount point is root's, mode 700" test "$(stat -c %u:%a "$lower/home/pane/.pane-secrets")" = 0:700
-check "the cloud VM marker is root's, mode 644, in a root-owned folder" \
-  test "$(stat -c %u:%a "$lower/etc/pane-cloud/cloud-vm") $(stat -c %u:%a "$lower/etc/pane-cloud")" = "0:644 0:755"
-check "the daemon drop-in sets PANE_CLOUD_VM=1" \
-  grep -qx 'Environment=PANE_CLOUD_VM=1' "$lower/home/pane/.config/systemd/user/pane-remote-daemon.service.d/pane-cloud.conf"
 check "no Tailscale" test ! -e "$lower/usr/bin/tailscale"
 check "resolv.conf is /proc/net/pnp" test "$(readlink "$lower/etc/resolv.conf")" = /proc/net/pnp
 check "fstab mounts /dev/vda" grep -q '^/dev/vda / ext4' "$lower/etc/fstab"

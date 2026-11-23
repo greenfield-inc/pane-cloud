@@ -98,11 +98,6 @@ Five system units, all enabled in the image:
    the log; every other line is replaced before it is written, so the code never touches disk.
 5. **`pane-guest-agent.service`**, the guest agent. It restarts however often it crashes.
 
-The machine marks itself as a cloud VM in both ways Pane reads (D-75, Pane `cloudVm.ts`): the
-daemon's unit sets `PANE_CLOUD_VM=1`, and the image carries `/etc/pane-cloud/cloud-vm`, owned by root,
-mode 0644, which the `pane` user can neither remove nor change. Either makes the daemon receive-only:
-it refuses to store tokens for the person's other computers.
-
 The relay key is made the first time the relay starts and kept in `~/.pane` on the Session disk, so
 the machine keeps its relay id across stops and starts. Clients pair with the id and key
 fingerprint the service vouches for (A6), which the host reads from `status`.
@@ -282,8 +277,6 @@ checks:
   and `status` reports it `mounted`;
 - the Pane daemon reaches relay `ready` with a computer id and fingerprint (certificates from Let's
   Encrypt's staging CA, so CI never spends the limits Pane's users share);
-- the Pane daemon's unit, as systemd loaded it, runs the daemon with `PANE_CLOUD_VM=1`, and the `pane` user cannot remove, rewrite, move
-  or re-mode `/etc/pane-cloud/cloud-vm`;
 - a process report names `xmrig` with the program's hash. The stand-in is a copy of `sleep` named
   `xmrig`, because GitHub forbids mining on Actions;
 - with the repository secret `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), Claude Code

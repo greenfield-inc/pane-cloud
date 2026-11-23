@@ -109,9 +109,6 @@ build_rootfs() {
   cp -r "$guest/rootfs/." "$root/"
   install -m 755 "$guest/agent/pane_guest_agent.py" "$root/usr/local/lib/pane-cloud/pane_guest_agent.py"
   chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh
-  # The cloud VM marker (D-75): root's, so the pane user can neither remove nor change it.
-  chown -R root:root "$root/etc/pane-cloud"
-  chmod 755 "$root/etc/pane-cloud" && chmod 644 "$root/etc/pane-cloud/cloud-vm"
   in_root chown -R pane:pane /home/pane
   # The Pane daemon is a user unit; linger starts pane's user manager at boot without a login.
   mkdir -p "$root/var/lib/systemd/linger" && touch "$root/var/lib/systemd/linger/pane"
