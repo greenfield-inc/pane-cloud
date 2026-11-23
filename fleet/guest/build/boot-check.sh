@@ -152,7 +152,7 @@ timeline+=" network_online=$(at network-online.target ActiveEnterTimestampMonoto
 say "timeline $timeline"
 say "systemd-analyze $(systemd-analyze 2>&1 | head -1)"
 say "critical-chain $(systemd-analyze critical-chain pane-daemon.service 2>&1 | grep -E '@|\+' | tr -s ' \n' ' ')"
-# The Session's first clone (D-107), which started beside the daemon: wait for it and its backfill.
+# The Session's first clone (D-107, D-112), which started beside the daemon: wait for it and its history.
 clone_state() { python3 -I -c 'import json; print(json.load(open("/run/pane-cloud-clone/state.json"))["state"])' 2>/dev/null; }
 if [ "$boot" = 1 ]; then
   for _ in $(seq 1 3000); do case "$(clone_state)" in done|failed) break ;; esac; sleep 0.2; done
@@ -160,6 +160,8 @@ if [ "$boot" = 1 ]; then
   drop=/home/pane/.pane-secrets/incoming/github-token.json
   say "clone $(python3 -I -c 'import json; s=json.load(open("/run/pane-cloud-clone/state.json")); print(" ".join(f"{k}={str(v).replace(" ", "_")[:200]}" for k, v in s.items() if k != "progress"))')" \
     "missing=$(as_pane git -C "$repo" rev-list --objects --missing=print HEAD 2>/dev/null | grep -c '^?')" \
+    "shallow=$(as_pane git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null)" \
+    "commits=$(as_pane git -C "$repo" rev-list --count HEAD 2>/dev/null)" \
     "pane_listed=$(as_pane "$runpane" panes list --json 2>/dev/null | grep -c '"express"')" \
     "token_in_repo=$(grep -rlF "$token" "$repo" 2>/dev/null | wc -l)" \
     "token_in_journal=$(journalctl -b --no-pager 2>/dev/null | grep -cF "$token")" \
@@ -437,15 +439,17 @@ if phase == 'first':
         print(f"     the clone's first report reached the host {started[0]['hostMonotonic'] - start:.2f} s after InstanceStart", flush=True)
     check(f"the clone started (guest {clone.get('startedUptime')} s) before the Pane daemon answered ({timeline.get('socket')} s)",
           bool(clone.get('startedUptime')) and float(clone['startedUptime']) < float(timeline.get('socket') or 0))
-    check(f"the clone made the repo's Pane ({clone.get('paneId')}) and backfill finished ({clone.get('state')})",
+    check(f"the clone made the repo's Pane ({clone.get('paneId')}) and fetched the history behind it ({clone.get('state')})",
           clone.get('state') == 'done' and clone.get('paneId') not in (None, '', 'None') and int(clone.get('pane_listed', '0')) > 0)
-    check(f"after backfill no object of HEAD is missing ({clone.get('missing')})", clone.get('missing') == '0')
+    check(f"after the history fetch the repository is a full clone: not shallow ({clone.get('shallow')}), "
+          f"{clone.get('commits')} commits, no object missing ({clone.get('missing')})",
+          clone.get('shallow') == 'false' and int(clone.get('commits') or 0) > 1 and clone.get('missing') == '0')
     check('the token is in no file of the repository, the journal, the progress file or the logs',
           all(clone.get(k) == '0' for k in ('token_in_repo', 'token_in_journal', 'token_in_progress', 'token_in_logs')),
           json.dumps({k: clone.get(k) for k in clone if k.startswith('token_in')}))
     check(f"the unseal wrote the drop file (pane, 0600, in a 0700 folder: {clone.get('drop')}) and deleted its sealed inputs",
           clone.get('drop') == 'pane:600/700' and clone.get('drop_matches') == '1' and clone.get('sealed_gone') == 'yes')
-    check('the clone token file is gone once backfill ended', clone.get('clone_token_gone') == 'yes')
+    check('the clone token file is gone once the history fetch ended', clone.get('clone_token_gone') == 'yes')
     check('no report the host received carries the token', public_token not in open(f'{out}/reports-{boot}.jsonl').read())
     check(f"a terminal panel ran node -v ({timeline.get('node_out')}, {timeline.get('node_done')} s after kernel start)",
           timeline.get('node_rc') == '0' and timeline.get('pane_rc') == '0' and timeline.get('repo_rc') == '0')

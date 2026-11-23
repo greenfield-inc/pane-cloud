@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""The Session's first clone (D-107), run as pane by pane-cloud-clone.service as soon as systemd starts,
-beside the Pane daemon's start.
+"""The Session's first clone (D-107, D-112), run as pane by pane-cloud-clone.service as soon as systemd
+starts, beside the Pane daemon's start.
 
 Reads the request the host wrote onto the secrets volume (pane-cloud/clone.json: url, optional branch and
-name; copied to /run/pane-cloud-clone/request.json by the unit's root step),
-clones blobless with submodules, and once the clone and the Pane daemon
-are both ready registers the repo and creates its Pane locally with runpane. Then it fetches the rest of
-the current branch's files with git backfill at low priority. Both sign in through a credential helper
-given on git's command line (git-credential-clone, reading /run/pane-cloud/clone-token), so the token
-never reaches .git/config, the repository, this unit's output or the progress file.
+name; copied to /run/pane-cloud-clone/request.json by the unit's root step) and makes a shallow clone:
+the newest commit of the branch and its files, with submodules the same way. Once the clone and the Pane
+daemon are both ready it registers the repo and creates its Pane locally with runpane. Then, at low
+priority, it fetches everything behind that commit: the full history and every branch and tag, so the
+repository ends up as a plain git clone. Every git command signs in through a credential helper given
+on git's command line (git-credential-clone, reading /run/pane-cloud/clone-token), so the token never
+reaches .git/config, the repository, this unit's output or the progress file.
 
 Progress goes to /run/pane-cloud-clone/state.json, which the guest agent reports to the host:
-  {"state": "cloning" | "creating" | "ready" | "backfilling" | "done" | "failed",
+  {"state": "cloning" | "creating" | "ready" | "history" | "done" | "failed",
    "repo": "owner/repo", "progress": "<git's last progress line>", "paneId": ..., "error": ...,
    "startedUptime": <guest seconds when the clone started>, "uptime": <guest seconds of this state>}
 A failed clone leaves no clone and no Pane; the guest agent's retry_clone runs this unit again. The Pane's
@@ -36,7 +37,7 @@ STATE_DIR = '/var/lib/pane-cloud-clone'
 HOME = '/home/pane'
 PANE_DIR = f'{HOME}/.pane'
 RUNPANE = f'{PANE_DIR}/bin/runpane'
-GIT = '/usr/local/bin/git'
+GIT = '/usr/bin/git'
 REQUEST = f'{RUN}/request.json'
 # A command-line credential helper: clears any configured helper, then asks only this one.
 CREDENTIALS = ['-c', 'credential.helper=', '-c', 'credential.helper=/usr/local/lib/pane-cloud/git-credential-clone']
@@ -72,12 +73,11 @@ def repo_name(url: str) -> str:
     return '/'.join(path.split('/')[-2:])
 
 
-def clone(url: str, branch: str | None, dest: str, state: State) -> str | None:
-    """Runs the blobless clone; returns git's error, or None when it worked."""
-    argv = [GIT, *CREDENTIALS, 'clone', '--progress', '--filter=blob:none', '--recurse-submodules', '--also-filter-submodules']
-    if branch:
-        argv += ['--branch', branch]
-    child = subprocess.Popen(argv + ['--', url, dest], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+def git(argv: list[str], state: State | None = None, low_priority: bool = False) -> str | None:
+    """Runs git with the clone's credential helper, passing its progress to state; returns git's error,
+    or None when it worked."""
+    prefix = ['nice', '-n', '19', 'ionice', '-c', '3'] if low_priority else []
+    child = subprocess.Popen([*prefix, GIT, *CREDENTIALS, *argv], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.PIPE, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
     lines: list[str] = []
     pending = b''
@@ -87,12 +87,30 @@ def clone(url: str, branch: str | None, dest: str, state: State) -> str | None:
         for raw in done:
             if line := raw.decode('utf-8', 'replace').strip():
                 lines = (lines + [line])[-40:]
-                state.set(force=False, progress=line)
+                if state:
+                    state.set(force=False, progress=line)
     if child.wait() == 0:
-        state.set(progress=lines[-1] if lines else None)
+        if state:
+            state.set(progress=lines[-1] if lines else None)
         return None
     errors = [line for line in lines if line.startswith(('fatal:', 'error:', 'remote:'))] or lines[-5:]
-    return '\n'.join(errors)[-2000:] or f'git clone exited {child.returncode}'
+    return '\n'.join(errors)[-2000:] or f'git {argv[0]} exited {child.returncode}'
+
+
+def clone(url: str, branch: str | None, dest: str, state: State) -> str | None:
+    """The shallow clone: the newest commit of the branch and its files, submodules alike."""
+    argv = ['clone', '--progress', '--depth=1', '--recurse-submodules', '--shallow-submodules']
+    return git(argv + (['--branch', branch] if branch else []) + ['--', url, dest], state)
+
+
+def fetch_history(dest: str, state: State) -> str | None:
+    """Everything behind the shallow clone, at the lowest CPU and disk priority: the full history of every
+    branch and every tag, then the submodules' history. Afterwards the repository is a plain clone."""
+    error = git(['-C', dest, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*'])
+    error = error or git(['-C', dest, 'fetch', '--progress', '--unshallow', '--tags', 'origin'], state, low_priority=True)
+    return error or git(['-C', dest, 'submodule', 'foreach', '--recursive',
+                         'git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true'],
+                        low_priority=True)
 
 
 def daemon_socket() -> str:
@@ -163,11 +181,9 @@ def main() -> int:
     with open(f'{STATE_DIR}/done', 'w') as done:
         done.write(pane_id + '\n')
     state.set(state='ready', paneId=pane_id)
-    # The rest of the current branch's file history, at the lowest CPU and disk priority.
-    state.set(state='backfilling')
-    backfill = subprocess.run(['nice', '-n', '19', 'ionice', '-c', '3', GIT, *CREDENTIALS, '-C', dest, 'backfill'],
-                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    state.set(state='done', error=None if backfill.returncode == 0 else f'git backfill: {backfill.stderr.strip()[-500:]}')
+    state.set(state='history', progress=None)
+    error = fetch_history(dest, state)
+    state.set(state='done', error=f'Fetching the history: {error}' if error else None)
     return 0
 
 

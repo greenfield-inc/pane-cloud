@@ -161,7 +161,7 @@ class Settings:
     # The clone unit's progress (state.json); its done marker holds the Pane's id.
     clone_run_dir: str = '/run/pane-cloud-clone'
     clone_state_dir: str = '/var/lib/pane-cloud-clone'
-    # The token the clone and its backfill read through their credential helper; gone when backfill ends.
+    # The token the clone and its history fetch read through their credential helper; gone when that ends.
     clone_token: str = '/run/pane-cloud/clone-token'
     pane_uid: int | None = 1000
 

@@ -130,10 +130,7 @@ mount -t tmpfs shm "$root/dev/shm"
 # /proc/net/pnp, which is empty here. OpenCode reaches the network even for --version.
 rm -f "$root/etc/resolv.conf" && cp /etc/resolv.conf "$root/etc/resolv.conf"
 # The agent CLIs the build installed (OpenCode, built on Bun, needs /proc).
-git_version="$(chroot "$root" /usr/local/bin/git --version | awk '{print $3}')"
-check "Git $git_version is at least 2.49, for git backfill" python3 -I -c \
-  'import sys; sys.exit(tuple(map(int, sys.argv[1].split(".")[:2])) < (2, 49))' "$git_version"
-check "Git LFS is installed for every repository" bash -c "chroot '$root' /usr/local/bin/git lfs version >/dev/null && grep -q 'filter \"lfs\"' '$lower/etc/gitconfig'"
+check "Git LFS is installed for every repository" bash -c "chroot '$root' git lfs version >/dev/null && grep -q 'filter \"lfs\"' '$lower/etc/gitconfig'"
 check "PyNaCl is there for the token's sealed box" chroot "$root" /usr/bin/python3 -I -c 'import nacl.public'
 for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gemini:gemini; do
   output="$(chroot "$root" runuser -u pane -- env -i HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \

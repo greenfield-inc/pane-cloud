@@ -106,21 +106,8 @@ build_rootfs() {
   # program run from one would have no hash in the process report.
   in_root apt-get purge -y -qq cloud-init snapd fuse3 >/dev/null 2>&1 || true
   in_root apt-get install -y -qq --no-install-recommends git git-lfs ca-certificates curl python3 python3-nacl \
-    xz-utils unzip e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg build-essential >/dev/null
+    xz-utils unzip e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg >/dev/null
 
-  say "Git $GIT_VERSION"
-  # Into /usr/local, ahead of Ubuntu's git on PATH, reading /etc/gitconfig, without Git's optional Rust
-  # parts (no Cargo in the image). The compilers stay (a development machine); the libraries' headers go.
-  fetch "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz" "$GIT_SHA256" "$root/tmp/git.tar.xz"
-  local git_dev="libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev"
-  # shellcheck disable=SC2086 # a list of packages
-  in_root apt-get install -y -qq --no-install-recommends $git_dev >/dev/null
-  in_root bash -c "cd /tmp && tar -xJf git.tar.xz && cd git-$GIT_VERSION && \
-    make -j\$(nproc) prefix=/usr/local sysconfdir=/etc NO_TCLTK=1 NO_GETTEXT=1 NO_RUST=1 INSTALL_SYMLINKS=1 all install >/dev/null"
-  # shellcheck disable=SC2086 # a list of packages
-  in_root apt-get purge -y -qq $git_dev >/dev/null
-  in_root apt-get autoremove -y -qq >/dev/null
-  rm -rf "$root/tmp/git.tar.xz" "$root/tmp/git-$GIT_VERSION"
 
   say "Node $NODE_VERSION"
   fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-${kernel_arch/x86_64/x64}.tar.xz" "$(pin NODE_SHA256)" "$work/node.tar.xz"
@@ -141,7 +128,7 @@ build_rootfs() {
   install -m 755 "$guest/agent/pane_guest_agent.py" "$root/usr/local/lib/pane-cloud/pane_guest_agent.py"
   chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh "$root"/usr/local/lib/pane-cloud/{overlay-init,clone.py,git-credential-clone}
   # Git LFS for every repository, in /etc/gitconfig.
-  in_root /usr/local/bin/git lfs install --system --skip-repo >/dev/null
+  in_root git lfs install --system --skip-repo >/dev/null
   in_root chown -R pane:pane /home/pane
   chmod 700 "$root/home/pane/.pane"
   in_root systemctl enable pane-guest-agent.service pane-cloud-secrets.service pane-cloud-identity.service \
