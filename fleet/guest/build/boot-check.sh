@@ -84,14 +84,20 @@ fi
 # Session made before it must still be there after it.
 runpane=/home/pane/.pane/bin/runpane
 for _ in $(seq 1 60); do [ -x "$runpane" ] && break; sleep 5; done
-made="$(as_pane "$runpane" sessions create --from-json - --json <<<'{"name":"ci-update-check"}' 2>&1 | tr -s ' \n' ' ')"
-say "session before update: ${made:0:300}"
+# The AppImage runtime lists the files it extracts; count those lines per stream and keep the rest.
+runtime_lines='^(/tmp/appimage_extracted_|File exists and file size matches)'
+quiet() { grep -Ev "$runtime_lines" "$1" | tr -s ' \n' ' ' | tail -c "$2"; }
+noise() { grep -Ec "$runtime_lines" "$1"; }
+as_pane "$runpane" sessions create --from-json - --json <<<'{"name":"ci-update-check"}' >/tmp/ci-out 2>/tmp/ci-err
+say "session before update: exit=$? stdout=$(quiet /tmp/ci-out 300) stderr=$(quiet /tmp/ci-err 300) runtime lines on stdout=$(noise /tmp/ci-out) stderr=$(noise /tmp/ci-err)"
 rc=0
-result="$(as_pane timeout 900 "$runpane" update --wait --json 2>&1)" || rc=$?
+as_pane timeout 900 "$runpane" update --wait --json >/tmp/ci-out 2>/tmp/ci-err || rc=$?
 kept=no
 as_pane "$runpane" sessions get --session ci-update-check --json >/dev/null 2>&1 && kept=yes
 say "session after update kept=$kept"
-say "update exit=$rc $(tr -s ' \n' ' ' <<<"$result" | tail -c 900)"
+say "update exit=$rc stdout=$(quiet /tmp/ci-out 1500) stderr=$(quiet /tmp/ci-err 1500)"
+journalctl _SYSTEMD_USER_UNIT=pane-remote-daemon.service -o cat --no-pager >/tmp/ci-journal 2>&1
+say "daemon journal: $(grep -Evi "$runtime_lines|^\s*$" /tmp/ci-journal | grep -Ei 'error|fail|fatal|exit|update|start' | tail -15 | tr -s ' \n' ' ' | tail -c 1500)"
 CHECK
 chmod 755 "$disk/var/lib/pane-ci/check.sh"
 cat >"$disk/etc/systemd/system/pane-ci-check.service" <<'UNIT'
