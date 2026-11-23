@@ -13,7 +13,7 @@ Ready, to the host (CID 2) on vsock port 5000, once per boot when the Pane daemo
 Reports, to the host (CID 2) on vsock port 1025: one JSON line per connection, nothing read back.
   {"type": "process_report", ...}   at start, then every 5 minutes
   {"type": "memory_pressure", ...}  when the kernel shows memory pressure, checked every 5 seconds
-  {"type": "clone", "state": ...}    each change in the Session's first clone (pane-cloud-clone.service)
+  {"type": "clone", "status": <CloneStatus>, "history": ...}  each change in the Session's first clone
 Run as `pane_guest_agent.py unseal-github-token`, it unseals the GitHub token once at first boot
 (pane-cloud-unseal.service; see unseal_github_token).
 Python 3 standard library only.
@@ -81,6 +81,7 @@ DIAGNOSTIC_FILES = (
 
 VERSION = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+')
 SHA256 = re.compile(r'[0-9a-f]{64}')
+BASE64URL = re.compile(r'[A-Za-z0-9_-]+')
 REQUEST_ID = re.compile(r'[A-Za-z0-9_.:-]{1,128}')
 
 
@@ -124,10 +125,25 @@ def check_release_parameters(parameters: Any) -> dict[str, Any]:
     return {'release': {'version': version, 'arch': arch, 'debSha256': sha}}
 
 
+def check_retry_parameters(parameters: Any) -> dict[str, Any]:
+    """retry_clone: nothing, or a fresh sealed GitHub token with the VM's own sealing key (both base64url),
+    for a clone that failed to sign in."""
+    next_step = 'Send {} or exactly {"sealedGitHubToken": "<base64url>", "sealingKey": "<base64url>"}.'
+    if parameters == {}:
+        return {}
+    if not isinstance(parameters, dict) or set(parameters) != {'sealedGitHubToken', 'sealingKey'}:
+        raise OperationError('invalid_request', 'retry_clone takes nothing, or a sealed token with its key.', next_step)
+    sealed, key = parameters['sealedGitHubToken'], parameters['sealingKey']
+    if not (isinstance(sealed, str) and 66 <= len(sealed) <= 8192 and BASE64URL.fullmatch(sealed)) or \
+            not (isinstance(key, str) and len(key) == 43 and BASE64URL.fullmatch(key)):
+        raise OperationError('invalid_request', 'The sealed token and key must be base64url without padding.', next_step)
+    return {'sealed': sealed, 'key': key}
+
+
 PARAMETER_CHECKS: dict[str, Callable[[Any], dict[str, Any]]] = {
     'bootstrap': check_release_parameters,
     'update_pane': check_release_parameters,
-    'retry_clone': check_no_parameters,
+    'retry_clone': check_retry_parameters,
     'prepare_to_stop': check_no_parameters,
     'collect_diagnostics': check_no_parameters,
     'status': check_no_parameters,
@@ -324,13 +340,17 @@ class Agent:
     def update_pane(self, release: dict[str, str]) -> dict[str, Any]:
         return self._install_release(release)
 
-    def retry_clone(self) -> dict[str, Any]:
-        """Runs the Session's first clone again after it failed (the app's Retry)."""
-        if os.path.exists(os.path.join(self.settings.clone_state_dir, 'done')):
-            raise OperationError('invalid_state', 'The clone already made its Pane.', 'Open that Pane.')
-        state = read_json(os.path.join(self.settings.clone_run_dir, 'state.json')) or {}
-        if state.get('state') in ('cloning', 'creating'):
-            raise OperationError('invalid_state', 'The clone is still running.', 'Wait for it to finish or fail.')
+    def retry_clone(self, sealed: str | None = None, key: str | None = None) -> dict[str, Any]:
+        """Runs the Session's first clone again after it failed (the app's Retry), with a fresh GitHub
+        token when the host sends one."""
+        status = (read_json(os.path.join(self.settings.clone_run_dir, 'state.json')) or {}).get('status') or {}
+        if os.path.exists(os.path.join(self.settings.clone_state_dir, 'done')) or status.get('state') != 'failed':
+            raise OperationError('invalid_state', 'Only a failed clone can be retried.', 'Read the clone in status.')
+        if sealed is not None:
+            try:
+                store_github_token(self.settings, sealed.encode(), key.encode())
+            except ValueError as refusal:
+                raise OperationError('invalid_request', str(refusal), 'Seal the token to this VM\'s own sealing key.')
         code, out = self.system.run(['systemctl', 'start', '--no-block', CLONE_UNIT], timeout=30)
         if code != 0:
             raise OperationError('internal', f'The clone could not start: {out.strip()[-300:]}', 'Run collect_diagnostics.')
@@ -344,6 +364,7 @@ class Agent:
 
     def status(self) -> dict[str, Any]:
         return {'paneVersion': self._pane_version(),
+                'clone': (read_json(os.path.join(self.settings.clone_run_dir, 'state.json')) or {}).get('status'),
                 'relay': self._relay(),
                 'secretsVolume': self._secrets_volume(),
                 'activity': self._activity()}
@@ -767,25 +788,28 @@ def write_private(path: str, data: bytes, uid: int | None) -> None:
         raise
 
 
-def unseal_github_token(settings: Settings) -> None:
-    """The one-shot unseal at first boot (D-107), as root, before the Pane daemon and the clone start.
+def b64url_or_raw(data: bytes) -> bytes:
+    """A sealed token or key as the contract carries it (base64url without padding), or its raw bytes."""
+    try:
+        text = data.decode('ascii').strip()
+        if BASE64URL.fullmatch(text):
+            return base64.urlsafe_b64decode(text + '=' * (-len(text) % 4))
+    except (UnicodeDecodeError, ValueError):
+        pass
+    return data
 
-    The host wrote pane-cloud/github-token.sealed (a libsodium sealed box of the app's
-    {"token", "source", "updatedAt"}) and the slot's private key pane-cloud/seal.key, root-only, on the
-    secrets volume. This writes the record unchanged to incoming/github-token.json for the Pane daemon to
-    import into K1's store (pane, 0600, in a 0700 folder) and the token alone to pane-cloud/clone-token
-    (pane, 0600), then deletes both inputs. pane-cloud/ becomes root:pane 0710, so pane reaches its token
-    file and nothing else there (the host's clone.json stays root's). Nothing sealed (a public repository, a later boot):
-    nothing to do. The token is never logged: errors name the step, never the content.
-    """
-    sealed_dir = os.path.join(settings.secrets_mount, 'pane-cloud')
-    sealed_path = os.path.join(sealed_dir, 'github-token.sealed')
-    key_path = os.path.join(sealed_dir, 'seal.key')
-    if not os.path.exists(sealed_path):
-        return
+
+def store_github_token(settings: Settings, sealed: bytes, key: bytes) -> None:
+    """Opens a sealed GitHub token record ({"token", "source", "updatedAt"}, D-107) and writes the record
+    unchanged to incoming/github-token.json for the Pane daemon to import into K1's store (pane, 0600, in a
+    0700 folder) and the token alone to pane-cloud/clone-token for the clone (pane, 0600). Errors name the
+    step, never the content, so the token is never logged."""
+    from nacl.exceptions import CryptoError
     from nacl.public import PrivateKey, SealedBox  # PyNaCl (python3-nacl), only needed here
-    with open(key_path, 'rb') as key, open(sealed_path, 'rb') as sealed:
-        plaintext = SealedBox(PrivateKey(key.read())).decrypt(sealed.read())
+    try:
+        plaintext = SealedBox(PrivateKey(b64url_or_raw(key))).decrypt(b64url_or_raw(sealed))
+    except (CryptoError, ValueError, TypeError):
+        raise ValueError('The sealed GitHub token does not open with this sealing key.') from None
     try:
         record = json.loads(plaintext)
     except ValueError:
@@ -798,12 +822,32 @@ def unseal_github_token(settings: Settings) -> None:
     if settings.pane_uid is not None:
         os.chown(incoming, settings.pane_uid, settings.pane_uid)
     write_private(os.path.join(incoming, 'github-token.json'), plaintext, settings.pane_uid)
+    token_dir = os.path.dirname(settings.clone_token)
+    os.makedirs(token_dir, mode=0o710, exist_ok=True)
+    os.chmod(token_dir, 0o710)
+    if settings.pane_uid is not None:
+        os.chown(token_dir, 0, settings.pane_uid)
     write_private(settings.clone_token, record['token'].strip().encode(), settings.pane_uid)
+
+
+def unseal_github_token(settings: Settings) -> None:
+    """The one-shot unseal at first boot (D-107), as root, before the Pane daemon and the clone start.
+
+    The host wrote pane-cloud/github-token.sealed (the app's sealed record) and the slot's private key
+    pane-cloud/seal.key, root-only, on the secrets volume. This stores the token (store_github_token) and
+    deletes both inputs. pane-cloud/ becomes root:pane 0710, so pane reaches its token file and nothing
+    else there (the host's clone.json stays root's). Nothing sealed (a public repository, a later boot):
+    nothing to do.
+    """
+    sealed_dir = os.path.join(settings.secrets_mount, 'pane-cloud')
+    sealed_path = os.path.join(sealed_dir, 'github-token.sealed')
+    key_path = os.path.join(sealed_dir, 'seal.key')
+    if not os.path.exists(sealed_path):
+        return
+    with open(key_path, 'rb') as key, open(sealed_path, 'rb') as sealed:
+        store_github_token(settings, sealed.read(), key.read())
     os.remove(sealed_path)
     os.remove(key_path)
-    os.chmod(sealed_dir, 0o710)
-    if settings.pane_uid is not None:
-        os.chown(sealed_dir, 0, settings.pane_uid)
 
 
 def copy_clone_request(settings: Settings) -> None:
@@ -823,7 +867,7 @@ class CloneReporter:
 
     def poll(self) -> dict[str, Any] | None:
         state = read_json(os.path.join(self.settings.clone_run_dir, 'state.json'))
-        if not isinstance(state, dict) or state == self._last:
+        if not isinstance(state, dict) or not isinstance(state.get('status'), dict) or state == self._last:
             return None
         self._last = state
         try:
@@ -831,7 +875,7 @@ class CloneReporter:
                 boot_id = boot.read().strip()
         except OSError:
             boot_id = None
-        return {'type': 'clone', 'at': utc_now(), 'bootId': boot_id, **state}
+        return {'type': 'clone', 'at': utc_now(), 'bootId': boot_id, 'status': state['status'], 'history': state.get('history')}
 
     def run(self, send: Callable[[dict[str, Any]], None]) -> None:
         while True:

@@ -12,9 +12,10 @@ on git's command line (git-credential-clone, reading pane-cloud/clone-token on t
 never reaches .git/config, the repository, this unit's output or the progress file.
 
 Progress goes to /run/pane-cloud-clone/state.json, which the guest agent reports to the host:
-  {"state": "cloning" | "creating" | "ready" | "history" | "done" | "failed",
-   "repo": "owner/repo", "progress": "<git's last progress line>", "paneId": ..., "error": ...,
-   "startedUptime": <guest seconds when the clone started>, "uptime": <guest seconds of this state>}
+  {"status": <the contract's CloneStatus: repo, branch, state cloning|ready|failed, phase, percent, line,
+              startedAt, finishedAt, error {message}, paneId>,
+   "history": "fetching" | "done" | "failed" | null, "startedUptime": <guest seconds at the start>}
+Anything that looks like a credential, and the clone token itself, is stripped from git's lines.
 A failed clone leaves no clone and no Pane; the guest agent's retry_clone runs this unit again. Once the
 Pane exists, /var/lib/pane-cloud-clone/done holds its id and the clone's folder, so a later boot does not
 clone again: if a sleep cut the history fetch short, it only resumes that, and history-done ends it all.
@@ -42,8 +43,30 @@ GIT = '/usr/bin/git'
 REQUEST = f'{RUN}/request.json'
 # A command-line credential helper: clears any configured helper, then asks only this one.
 CREDENTIALS = ['-c', 'credential.helper=', '-c', 'credential.helper=/usr/local/lib/pane-cloud/git-credential-clone']
+TOKEN = f'{HOME}/.pane-secrets/pane-cloud/clone-token'
 # git's progress lines end in \r while they update and \n when they finish.
 LINE_END = re.compile(rb'[\r\n]')
+PHASES = (('Receiving objects', 'receiving'), ('Resolving deltas', 'resolving'),
+          ('Updating files', 'checking_out'), ('Checking out files', 'checking_out'))
+CREDENTIAL_LIKE = re.compile(r'(?<=://)[^/\s@]+@|\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}|x-access-token:\S+')
+
+
+def redact(text: str | None) -> str | None:
+    """Removes the clone token and anything credential-like from a line git printed."""
+    if text is None:
+        return None
+    try:
+        with open(TOKEN) as token_file:
+            token = token_file.read().strip()
+        if token:
+            text = text.replace(token, '***')
+    except OSError:
+        pass
+    return CREDENTIAL_LIKE.sub('***', text)
+
+
+def utc_now() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
 
 def uptime() -> float:
@@ -52,18 +75,37 @@ def uptime() -> float:
 
 
 class State:
-    def __init__(self, repo: str):
-        self.value = {'state': 'cloning', 'repo': repo, 'progress': None, 'paneId': None, 'error': None,
-                      'startedUptime': uptime()}
+    """The clone's CloneStatus and the history fetch after it, written for the guest agent to report."""
+
+    def __init__(self, repo: str, branch: str | None):
+        self.status = {'repo': repo, 'branch': branch or 'HEAD', 'state': 'cloning', 'phase': None, 'percent': None,
+                       'line': None, 'startedAt': utc_now(), 'finishedAt': None, 'error': None, 'paneId': None}
+        self.history: str | None = None
+        self.started = uptime()
         self.written = 0.0
 
-    def set(self, force: bool = True, **changes) -> None:
-        self.value.update(changes, uptime=uptime())
+    def set(self, force: bool = True, history: str | None = None, error: str | None = None, line: str | None = None,
+            **changes) -> None:
+        if history is not None:
+            self.history = history
+        if line is not None:
+            line = redact(line)[-300:]
+            changes['line'] = line
+            phase = next((name for prefix, name in PHASES if line.startswith(prefix)), None)
+            percent = re.search(r'(\d{1,3})%', line)
+            if phase and self.status['state'] == 'cloning':
+                changes.update(phase=phase, percent=min(100, int(percent.group(1))) if percent else None)
+        if error is not None:
+            changes['error'] = {'message': redact(error)[-4000:] or 'The clone failed.'}
+        if changes.get('state') in ('ready', 'failed'):
+            changes.setdefault('finishedAt', utc_now())
+            changes.setdefault('phase', None)
+        self.status.update(changes)
         if not force and time.monotonic() - self.written < 0.25:
             return
         tmp = f'{RUN}/state.json.tmp'
         with open(tmp, 'w') as out:
-            json.dump(self.value, out)
+            json.dump({'status': self.status, 'history': self.history, 'startedUptime': self.started}, out)
         os.replace(tmp, f'{RUN}/state.json')
         self.written = time.monotonic()
 
@@ -89,10 +131,10 @@ def git(argv: list[str], state: State | None = None, low_priority: bool = False)
             if line := raw.decode('utf-8', 'replace').strip():
                 lines = (lines + [line])[-40:]
                 if state:
-                    state.set(force=False, progress=line)
+                    state.set(force=False, line=line)
     if child.wait() == 0:
-        if state:
-            state.set(progress=lines[-1] if lines else None)
+        if state and lines:
+            state.set(line=lines[-1])
         return None
     errors = [line for line in lines if line.startswith(('fatal:', 'error:', 'remote:'))] or lines[-5:]
     return '\n'.join(errors)[-2000:] or f'git {argv[0]} exited {child.returncode}'
@@ -157,13 +199,13 @@ def create_pane(dest: str, name: str) -> tuple[str | None, str | None]:
 
 
 def finish_history(dest: str, state: State) -> int:
-    state.set(state='history', progress=None)
-    error = fetch_history(dest, state)
-    if error:
-        state.set(state='done', error=f'Fetching the history: {error}')  # resumes at the next boot
+    """The history behind the shallow clone; the CloneStatus stays ready, with the Pane open."""
+    state.set(history='fetching')
+    if fetch_history(dest, None):
+        state.set(history='failed')  # resumes at the next boot
         return 0
     open(f'{STATE_DIR}/history-done', 'w').close()
-    state.set(state='done', error=None)
+    state.set(history='done')
     return 0
 
 
@@ -175,13 +217,13 @@ def main() -> int:
         with open(f'{STATE_DIR}/done') as done:
             made = json.load(done)
     if made:  # a later boot: the Pane exists, only the history fetch is left
-        state = State(repo_name(request['url']))
-        state.set(state='ready', paneId=made['paneId'])
+        state = State(repo_name(request['url']), request.get('branch'))
+        state.set(state='ready', paneId=made['paneId'], percent=100)
         return finish_history(made['dest'], state)
     url, branch = request['url'], request.get('branch') or None
     name = request.get('name') or repo_name(url).split('/')[-1]
     dest = f'{HOME}/{name}'
-    state = State(repo_name(url))
+    state = State(repo_name(url), branch)
     state.set()
     if os.path.lexists(dest):
         shutil.rmtree(dest)  # a clone a failed attempt left behind
@@ -190,7 +232,7 @@ def main() -> int:
         shutil.rmtree(dest, ignore_errors=True)
         state.set(state='failed', error=error)
         return 1
-    state.set(state='creating')
+    state.set(phase='creating_pane', percent=None, line=None)
     if not wait_for_daemon():
         shutil.rmtree(dest, ignore_errors=True)
         state.set(state='failed', error='The Pane daemon did not start within 5 minutes.')
@@ -202,7 +244,7 @@ def main() -> int:
         return 1
     with open(f'{STATE_DIR}/done', 'w') as done:
         json.dump({'paneId': pane_id, 'dest': dest}, done)
-    state.set(state='ready', paneId=pane_id)
+    state.set(state='ready', paneId=pane_id, percent=100)
     return finish_history(dest, state)
 
 

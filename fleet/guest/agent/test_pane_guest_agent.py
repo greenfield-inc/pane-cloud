@@ -100,6 +100,8 @@ class GuestAgentTest(unittest.TestCase):
             pane_drive_release=self.path('opt/Pane/release.json'),
             clone_run_dir=self.path('run/pane-cloud-clone'),
             clone_state_dir=self.path('var/lib/pane-cloud-clone'),
+            clone_token=self.path('home/pane/.pane-secrets/pane-cloud/clone-token'),
+            pane_uid=None,
         )
         sock_path = self.path('agent.sock')
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -207,18 +209,44 @@ class GuestAgentTest(unittest.TestCase):
 
     # ------------------------------------------------------------ clone
 
+    def failed_clone(self):
+        self.write('run/pane-cloud-clone/state.json', json.dumps({'status': {
+            'repo': 'owner/repo', 'branch': 'main', 'state': 'failed', 'phase': None, 'percent': None, 'line': None,
+            'startedAt': '2026-11-23T05:00:00Z', 'finishedAt': '2026-11-23T05:00:03Z',
+            'error': {'message': 'remote: Invalid username or token.'}, 'paneId': None}, 'history': None}))
+
     def test_retry_clone_starts_the_clone_again_after_it_failed(self):
-        self.write('run/pane-cloud-clone/state.json', json.dumps({'state': 'failed', 'error': 'fatal: Authentication failed'}))
+        self.failed_clone()
 
         reply = self.send('retry_clone', {})
 
         self.assertEqual(reply['result'], {'started': True})
         self.assertIn(['systemctl', 'start', '--no-block', 'pane-cloud-clone.service'], self.system.commands)
+        self.assertEqual(self.send('status', {})['result']['clone']['error'], {'message': 'remote: Invalid username or token.'})
 
-    def test_retry_clone_refuses_while_cloning_or_once_the_pane_exists(self):
-        self.write('run/pane-cloud-clone/state.json', json.dumps({'state': 'cloning'}))
+    @unittest.skipUnless(importlib.util.find_spec('nacl'), 'PyNaCl is not installed')
+    def test_retry_clone_takes_a_fresh_token_sealed_to_the_vms_own_key(self):
+        from nacl.public import PrivateKey, SealedBox
+        self.failed_clone()
+        self.settings.secrets_mount = self.path('home/pane/.pane-secrets')
+        key = PrivateKey.generate()
+        record = {'token': 'ghp_FRESHtoken0123456789abcdefghijklmn', 'source': 'mac', 'updatedAt': '2026-11-23T06:00:00Z'}
+        sealed = base64.urlsafe_b64encode(SealedBox(key.public_key).encrypt(json.dumps(record).encode())).decode().rstrip('=')
+
+        reply = self.send('retry_clone', {'sealedGitHubToken': sealed,
+                                          'sealingKey': base64.urlsafe_b64encode(bytes(key)).decode().rstrip('=')})
+
+        self.assertEqual(reply.get('result'), {'started': True}, reply)
+        with open(self.settings.clone_token) as token:
+            self.assertEqual(token.read(), record['token'])
+        self.assertNotIn(record['token'], open(self.settings.log_path).read())
+
+    def test_retry_clone_refuses_unless_the_clone_failed(self):
         self.assertEqual(self.send('retry_clone', {})['error']['code'], 'invalid_state')
-        self.write('var/lib/pane-cloud-clone/done', 'pane-1\n')
+        self.write('run/pane-cloud-clone/state.json', json.dumps({'status': {'state': 'cloning'}, 'history': None}))
+        self.assertEqual(self.send('retry_clone', {})['error']['code'], 'invalid_state')
+        self.failed_clone()
+        self.write('var/lib/pane-cloud-clone/done', '{"paneId": "p-1", "dest": "/home/pane/repo"}')
         self.assertEqual(self.send('retry_clone', {})['error']['code'], 'invalid_state')
         self.assertEqual(self.send('retry_clone', {'force': True})['error']['code'], 'invalid_request')
         self.assertEqual(self.system.commands, [])
@@ -230,6 +258,7 @@ class GuestAgentTest(unittest.TestCase):
 
         self.assertEqual(reply['result'], {
             'paneVersion': '2.4.214',
+            'clone': None,
             'relay': {'status': 'unreachable', 'id': None, 'address': None, 'fingerprint': None},
             'secretsVolume': 'missing',
             'activity': {'agentsRunning': 0, 'clientsConnected': 0, 'lastActivityAt': None},
@@ -496,8 +525,8 @@ class UnsealTest(unittest.TestCase):
         key = PrivateKey.generate()
         with open(f'{self.root}/secrets/pane-cloud/seal.key', 'wb') as out:
             out.write(bytes(key))
-        with open(f'{self.root}/secrets/pane-cloud/github-token.sealed', 'wb') as out:
-            out.write(SealedBox(key.public_key).encrypt(plaintext))
+        with open(f'{self.root}/secrets/pane-cloud/github-token.sealed', 'w') as out:
+            out.write(base64.urlsafe_b64encode(SealedBox(key.public_key).encrypt(plaintext)).decode().rstrip('='))
 
     def mode(self, path):
         return os.stat(path).st_mode & 0o7777
@@ -563,14 +592,61 @@ class CloneReporterTest(unittest.TestCase):
         self.assertIsNone(reporter.poll())
         os.makedirs(f'{self.root}/run')
         with open(f'{self.root}/run/state.json', 'w') as state:
-            json.dump({'state': 'cloning', 'repo': 'owner/repo', 'progress': 'Receiving objects:  45% (450/1000)'}, state)
+            json.dump({'status': {'state': 'cloning', 'repo': 'owner/repo', 'phase': 'receiving', 'percent': 45},
+                       'history': None, 'startedUptime': 1.4}, state)
 
         message = reporter.poll()
 
-        self.assertEqual({k: message[k] for k in ('type', 'state', 'repo', 'progress', 'bootId')},
-                         {'type': 'clone', 'state': 'cloning', 'repo': 'owner/repo',
-                          'progress': 'Receiving objects:  45% (450/1000)', 'bootId': 'boot-1'})
+        self.assertEqual({k: message[k] for k in ('type', 'status', 'history', 'bootId')},
+                         {'type': 'clone', 'status': {'state': 'cloning', 'repo': 'owner/repo', 'phase': 'receiving', 'percent': 45},
+                          'history': None, 'bootId': 'boot-1'})
         self.assertIsNone(reporter.poll())
+
+
+class CloneProgressTest(unittest.TestCase):
+    """clone.py's progress file: the contract's CloneStatus, with credentials stripped from git's lines."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../rootfs/usr/local/lib/pane-cloud'))
+        import clone
+        self.clone = clone
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix='pga-progress-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, self.root)
+        os.makedirs(f'{self.root}/pane-cloud')
+        with open(f'{self.root}/pane-cloud/clone-token', 'w') as token:
+            token.write('ghp_REALtoken0123456789abcdefghijklmnop')
+        for name, value in (('RUN', self.root), ('TOKEN', f'{self.root}/pane-cloud/clone-token')):
+            self.addCleanup(setattr, clone, name, getattr(clone, name))
+            setattr(clone, name, value)
+        self.addCleanup(setattr, clone, 'uptime', clone.uptime)
+        clone.uptime = lambda: 1.5
+
+    def written(self):
+        with open(f'{self.root}/state.json') as state:
+            return json.load(state)
+
+    def test_reports_phase_and_percent_from_gits_progress(self):
+        state = self.clone.State('owner/repo', 'main')
+        state.set(line='Receiving objects:  45% (450/1000), 1.20 MiB | 3.00 MiB/s')
+        status = self.written()['status']
+        self.assertEqual((status['state'], status['phase'], status['percent']), ('cloning', 'receiving', 45))
+        state.set(line='Resolving deltas: 100% (80/80), done.')
+        self.assertEqual((self.written()['status']['phase'], self.written()['status']['percent']), ('resolving', 100))
+
+    def test_no_credential_reaches_the_progress_file(self):
+        state = self.clone.State('owner/repo', 'main')
+        state.set(line='Cloning https://x-access-token:ghp_REALtoken0123456789abcdefghijklmnop@github.com/owner/repo')
+        state.set(state='failed', error='fatal: could not read from https://bob:hunter2@github.com/owner/repo '
+                                         'with ghp_REALtoken0123456789abcdefghijklmnop and github_pat_ABCDEFGH12345678')
+
+        text = open(f'{self.root}/state.json').read()
+
+        for secret in ('ghp_REALtoken', 'hunter2', 'github_pat_ABCDEFGH', 'bob:'):
+            self.assertNotIn(secret, text)
+        status = self.written()['status']
+        self.assertEqual(status['state'], 'failed')
+        self.assertTrue(status['error']['message'].startswith('fatal: could not read from'))
+        self.assertIsNotNone(status['finishedAt'])
 
 
 if __name__ == '__main__':

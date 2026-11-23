@@ -156,12 +156,18 @@ say "timeline $timeline"
 say "systemd-analyze $(systemd-analyze 2>&1 | head -1)"
 say "critical-chain $(systemd-analyze critical-chain pane-daemon.service 2>&1 | grep -E '@|\+' | tr -s ' \n' ' ')"
 # The Session's first clone (D-107, D-112), which started beside the daemon: wait for it and its history.
-clone_state() { python3 -I -c 'import json; print(json.load(open("/run/pane-cloud-clone/state.json"))["state"])' 2>/dev/null; }
+# The clone's stage from its progress file: cloning, ready, failed, or done once the history is fetched.
+clone_stage() {
+  python3 -I -c 'import json; s = json.load(open("/run/pane-cloud-clone/state.json")); print("done" if s["history"] in ("done", "failed") else s["status"]["state"])' 2>/dev/null
+}
 if [ "$boot" = 1 ]; then
-  for _ in $(seq 1 3000); do case "$(clone_state)" in done|failed) break ;; esac; sleep 0.2; done
+  for _ in $(seq 1 3000); do case "$(clone_stage)" in done|failed) break ;; esac; sleep 0.2; done
   token="$(cat /var/lib/pane-ci/token)" repo=/home/pane/express
   drop=/home/pane/.pane-secrets/incoming/github-token.json
-  say "clone $(python3 -I -c 'import json; s=json.load(open("/run/pane-cloud-clone/state.json")); print(" ".join(f"{k}={str(v).replace(" ", "_")[:200]}" for k, v in s.items() if k != "progress"))')" \
+  say "clone $(python3 -I -c 'import json; s = json.load(open("/run/pane-cloud-clone/state.json")); st = s["status"]
+fields = {"state": "done" if s["history"] == "done" else st["state"], "history": s["history"], "paneId": st["paneId"],
+          "startedUptime": s["startedUptime"], "error": (st["error"] or {}).get("message")}
+print(" ".join(f"{k}={str(v).replace(chr(32), chr(95))[:200]}" for k, v in fields.items()))')" \
     "missing=$(as_pane git -C "$repo" rev-list --objects --missing=print HEAD 2>/dev/null | grep -c '^?')" \
     "shallow=$(as_pane git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null)" \
     "commits=$(as_pane git -C "$repo" rev-list --count HEAD 2>/dev/null)" \
@@ -380,7 +386,18 @@ if ready:
           f"(guest uptime {ready[0].get('uptimeSeconds')} s)", ready[0].get('type') == 'ready')
 
 def clone_reports():
-    return [r for r in jsonl(f'{out}/reports-{boot}.jsonl') if r.get('type') == 'clone']
+    """The guest's clone reports (CloneStatus plus the history fetch), each with the stage the checks
+    follow: cloning, ready, history (fetching it), done (history fetched) or failed."""
+    stages = []
+    for report in jsonl(f'{out}/reports-{boot}.jsonl'):
+        if report.get('type') != 'clone':
+            continue
+        status, history = report['status'], report.get('history')
+        stage = status['state'] if status['state'] in ('cloning', 'failed') else \
+            {'fetching': 'history', 'done': 'done'}.get(history, 'ready')
+        stages.append({**report, 'state': stage, 'paneId': status.get('paneId'),
+                       'error': (status.get('error') or {}).get('message') or (history == 'failed' and 'history fetch failed') or None})
+    return stages
 
 def on_session_disk():
     """How often either token appears anywhere in the Session disk's raw image: every file ever written
