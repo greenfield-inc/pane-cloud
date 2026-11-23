@@ -59,11 +59,10 @@ else
   drive="${drives[0]}"
   check "the Pane drive is labelled pane-app, with no journal" \
     bash -c "[ \"\$(e2label '$drive')\" = pane-app ] && ! dumpe2fs -h '$drive' 2>/dev/null | grep -q has_journal"
-  check "the Pane drive holds Pane $PANE_VERSION, its version file and a setuid root chrome-sandbox" bash -c "
-    [ \"\$(debugfs -R 'cat /.pane-version' '$drive' 2>/dev/null)\" = '$PANE_VERSION' ] &&
-    debugfs -R 'stat /pane' '$drive' 2>/dev/null | grep -q 'Type: regular' &&
-    debugfs -R 'stat /chrome-sandbox' '$drive' 2>/dev/null | grep -Eq 'Mode: +04755' &&
-    debugfs -R 'stat /chrome-sandbox' '$drive' 2>/dev/null | grep -q 'User: +0 '"
+  check "the Pane drive's version file says $PANE_VERSION" test "$(debugfs -R 'cat /.pane-version' "$drive" 2>/dev/null)" = "$PANE_VERSION"
+  check "the Pane drive holds Pane's executable" bash -c "debugfs -R 'stat /pane' '$drive' 2>/dev/null | grep -q 'Type: regular'"
+  sandbox="$(debugfs -R 'stat /chrome-sandbox' "$drive" 2>/dev/null | grep -Eo 'Mode: +[0-7]+|User: +[0-9]+' | tr -s ' ' | tr '\n' ' ')"
+  check "the Pane drive's chrome-sandbox is root's and setuid ($sandbox)" bash -c "[[ '$sandbox' =~ Mode:\ 0?4755 ]] && [[ '$sandbox' =~ User:\ 0\  ]]"
   check "the Pane drive's manifest names it and its SHA-256" python3 -I -c '
 import hashlib, json, os, sys
 m = json.load(open(sys.argv[1][:-5] + ".json"))
@@ -132,9 +131,9 @@ mount -t tmpfs shm "$root/dev/shm"
 rm -f "$root/etc/resolv.conf" && cp /etc/resolv.conf "$root/etc/resolv.conf"
 # The agent CLIs the build installed (OpenCode, built on Bun, needs /proc).
 for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gemini:gemini; do
-  version="$(chroot "$root" runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \
-    timeout 60 "${entry#*:}" --version </dev/null 2>/dev/null | head -1 || true)"
-  check "${entry%%:*} is in the image: ${version:-missing}" test -n "$version"
+  output="$(chroot "$root" runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \
+    timeout 60 "${entry#*:}" --version </dev/null 2>&1)" && version="$(head -1 <<<"$output")" || version=""
+  check "${entry%%:*} is in the image: ${version:-missing: $(tail -c 300 <<<"$output" | tr '\n' ' ')}" test -n "$version"
 done
 # As pane-daemon.service runs it, with the image's own config.json. The relay certificate comes from
 # Let's Encrypt's staging CA, so checks never spend the limits Pane's users share.

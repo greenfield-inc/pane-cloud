@@ -28,7 +28,9 @@ bytes="$(blockdev --getsize64 "$DEV")"
 [ "$bytes" -le "$MAX_BYTES" ] || refuse "$bytes bytes is not a secrets volume"
 fs="$(blkid -p -o value -s TYPE "$DEV" || true)"
 label="$(blkid -p -o value -s LABEL "$DEV" || true)"
-[ "$fs" = ext4 ] && [ "$label" = pane-secrets ] || refuse "it holds ${fs:-nothing a probe recognises} ${label:+labelled $label}, not the pane-secrets ext4"
+if [ "$fs" != ext4 ] || [ "$label" != pane-secrets ]; then
+  refuse "it holds ${fs:-nothing a probe recognises} ${label:+labelled $label}, not the pane-secrets ext4"
+fi
 # e2fsck -p exits 1 when it fixed something, which still leaves a mountable filesystem.
 rc=0; e2fsck -p "$DEV" >/dev/null || rc=$?
 [ "$rc" -le 1 ] || refuse "e2fsck exited $rc"
