@@ -109,14 +109,14 @@ build_rootfs() {
     xz-utils unzip e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg build-essential >/dev/null
 
   say "Git $GIT_VERSION"
-  # Into /usr/local, ahead of Ubuntu's git on PATH, reading /etc/gitconfig. The compilers stay (a
-  # development machine); the libraries' headers go.
+  # Into /usr/local, ahead of Ubuntu's git on PATH, reading /etc/gitconfig, without Git's optional Rust
+  # parts (no Cargo in the image). The compilers stay (a development machine); the libraries' headers go.
   fetch "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz" "$GIT_SHA256" "$root/tmp/git.tar.xz"
   local git_dev="libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev"
   # shellcheck disable=SC2086 # a list of packages
   in_root apt-get install -y -qq --no-install-recommends $git_dev >/dev/null
   in_root bash -c "cd /tmp && tar -xJf git.tar.xz && cd git-$GIT_VERSION && \
-    make -j\$(nproc) prefix=/usr/local sysconfdir=/etc NO_TCLTK=1 NO_GETTEXT=1 INSTALL_SYMLINKS=1 all install >/dev/null"
+    make -j\$(nproc) prefix=/usr/local sysconfdir=/etc NO_TCLTK=1 NO_GETTEXT=1 NO_RUST=1 INSTALL_SYMLINKS=1 all install >/dev/null"
   # shellcheck disable=SC2086 # a list of packages
   in_root apt-get purge -y -qq $git_dev >/dev/null
   in_root apt-get autoremove -y -qq >/dev/null

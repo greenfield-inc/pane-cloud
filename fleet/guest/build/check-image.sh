@@ -136,7 +136,7 @@ check "Git $git_version is at least 2.49, for git backfill" python3 -I -c \
 check "Git LFS is installed for every repository" bash -c "chroot '$root' /usr/local/bin/git lfs version >/dev/null && grep -q 'filter \"lfs\"' '$lower/etc/gitconfig'"
 check "PyNaCl is there for the token's sealed box" chroot "$root" /usr/bin/python3 -I -c 'import nacl.public'
 for entry in claude:claude codex:codex cursor:cursor-agent opencode:opencode gemini:gemini; do
-  output="$(chroot "$root" runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \
+  output="$(chroot "$root" runuser -u pane -- env -i HOME=/home/pane PATH=/home/pane/.local/bin:/home/pane/.opencode/bin:/usr/local/bin:/usr/bin:/bin \
     timeout 60 "${entry#*:}" --version </dev/null 2>&1)" && version="$(head -1 <<<"$output")" || version=""
   check "${entry%%:*} is in the image: ${version:-missing: $(tail -c 300 <<<"$output" | tr '\n' ' ')}" test -n "$version"
 done
