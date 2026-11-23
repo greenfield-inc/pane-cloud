@@ -90,17 +90,14 @@ build_rootfs() {
   in_root apt-get purge -y -qq cloud-init snapd >/dev/null 2>&1 || true
   in_root apt-get install -y -qq --no-install-recommends git ca-certificates curl python3 xz-utils unzip \
     e2fsprogs iproute2 iptables less nano sudo openssh-client gnupg >/dev/null
+  # What Pane's .deb depends on (Pane package.json build.deb.depends), plus libgbm and libasound, which its
+  # Electron binary links too. The AppImage carries Pane, not these. No FUSE: the AppImage runs extracted.
+  in_root apt-get install -y -qq --no-install-recommends libgtk-3-0t64 libnotify4 libnss3 libxss1 libxtst6 \
+    xdg-utils libatspi2.0-0t64 libuuid1 libgbm1 libasound2t64 >/dev/null
 
   say "Node $NODE_VERSION"
   fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-${kernel_arch/x86_64/x64}.tar.xz" "$(pin NODE_SHA256)" "$work/node.tar.xz"
   tar -xJf "$work/node.tar.xz" -C "$root/usr/local" --strip-components=1 --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md
-
-  say "Pane $PANE_VERSION"
-  fetch "https://github.com/greenfield-inc/Pane/releases/download/v$PANE_VERSION/Pane-$PANE_VERSION-linux-$arch.deb" \
-    "$(pin PANE_DEB_SHA256)" "$root/tmp/pane.deb"
-  # The .deb's Depends miss two libraries its Electron binary links: libgbm and libasound.
-  in_root apt-get install -y -qq /tmp/pane.deb libgbm1 libasound2t64 >/dev/null
-  rm -f "$root/tmp/pane.deb"
 
   say "pane user, Pane Cloud units and the guest agent"
   # Ubuntu's images may carry an `ubuntu` user at uid 1000; the machine has only `pane`.
@@ -109,11 +106,21 @@ build_rootfs() {
   cp -r "$guest/rootfs/." "$root/"
   install -m 755 "$guest/agent/pane_guest_agent.py" "$root/usr/local/lib/pane-cloud/pane_guest_agent.py"
   chmod 755 "$root"/usr/local/lib/pane-cloud/*.sh
+  say "Pane $PANE_VERSION"
+  # The release AppImage, owned by pane, where Pane's own update replaces it; ~/.local/bin/pane is the
+  # first place Pane looks for itself on Linux.
+  mkdir -p "$root/home/pane/Applications" "$root/home/pane/.local/bin" "$root/home/pane/.config/systemd/user/default.target.wants"
+  fetch "https://github.com/greenfield-inc/Pane/releases/download/v$PANE_VERSION/Pane-$PANE_VERSION-linux-${arch/amd64/x86_64}.AppImage" \
+    "$(pin PANE_APPIMAGE_SHA256)" "$root/home/pane/Applications/Pane.AppImage"
+  chmod 755 "$root/home/pane/Applications/Pane.AppImage"
+  ln -s ../../Applications/Pane.AppImage "$root/home/pane/.local/bin/pane"
+  ln -s ../pane-remote-daemon.service "$root/home/pane/.config/systemd/user/default.target.wants/pane-remote-daemon.service"
   in_root chown -R pane:pane /home/pane
+  chmod 700 "$root/home/pane/.pane"
   # The Pane daemon is a user unit; linger starts pane's user manager at boot without a login.
   mkdir -p "$root/var/lib/systemd/linger" && touch "$root/var/lib/systemd/linger/pane"
   in_root systemctl enable pane-guest-agent.service pane-cloud-secrets.service pane-cloud-identity.service \
-    pane-cloud-firstboot.service pane-cloud-daemon.service
+    pane-cloud-firstboot.service
   # The secrets volume's mount point; pane-cloud-secrets.service makes it immutable until the volume is on it.
   install -d -m 700 "$root/home/pane/.pane-secrets"
 

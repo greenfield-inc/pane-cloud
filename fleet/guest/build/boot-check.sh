@@ -8,8 +8,10 @@
 #   - the secrets volume is formatted and mounted no-exec,
 #   - the Pane daemon answers with relay pairing ready: a computer id, a certificate and a fingerprint,
 #   - the process report names a program called xmrig, with its hash,
-#   - Claude Code answers a prompt, when CLAUDE_CODE_OAUTH_TOKEN is set.
-# The last three need something run inside the guest, which the guest agent never does: this script
+#   - Claude Code answers a prompt, when CLAUDE_CODE_OAUTH_TOKEN is set,
+#   - Pane's own update (`runpane update`, what Update Pane runs) moves the machine from the image's
+#     Pane to the latest release, and the daemon comes back on it with relay pairing ready.
+# The last four need something run inside the guest, which the guest agent never does: this script
 # adds a CI-only check unit to its own throwaway copy of the disk before booting it. The image is
 # never changed. Relay certificates come from Let's Encrypt's staging CA, so CI never spends the
 # limits Pane's users share.
@@ -54,7 +56,9 @@ cat >"$disk/var/lib/pane-ci/check.sh" <<'CHECK'
 # Runs once inside the guest after first boot; writes "ci: ..." lines to bootstrap.log.
 exec >>/var/log/pane-cloud/bootstrap.log 2>&1
 say() { echo "$(date -u +%FT%TZ) ci: $*"; }
-as_pane() { runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/usr/local/bin:/usr/bin:/bin "$@"; }
+# pane's environment as its services get it (environment.d), plus its user manager for systemd-run --user.
+as_pane() { runuser -u pane -- env HOME=/home/pane PATH=/home/pane/.local/bin:/usr/local/bin:/usr/bin:/bin \
+  APPIMAGE_EXTRACT_AND_RUN=1 NO_CLEANUP=1 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "$@"; }
 
 # A stand-in miner: a copy of sleep named xmrig, so no real miner runs on CI.
 install -o pane -g pane -m 755 /usr/bin/sleep /home/pane/xmrig
@@ -75,6 +79,12 @@ if [ -s /var/lib/pane-ci/claude-token ]; then
 else
   say "claude skipped: no token"
 fi
+
+# Update Pane, as a person or agent on the machine runs it: Pane's own update, from Pane's runpane.
+for _ in $(seq 1 60); do [ -x /home/pane/.pane/bin/runpane ] && break; sleep 5; done
+rc=0
+result="$(as_pane timeout 900 /home/pane/.pane/bin/runpane update --wait --json 2>&1)" || rc=$?
+say "update exit=$rc $(tr -s ' \n' ' ' <<<"$result" | tail -c 900)"
 CHECK
 chmod 755 "$disk/var/lib/pane-ci/check.sh"
 cat >"$disk/etc/systemd/system/pane-ci-check.service" <<'UNIT'
@@ -84,7 +94,7 @@ After=pane-cloud-firstboot.service pane-cloud-secrets.service network-online.tar
 [Service]
 Type=oneshot
 ExecStart=/var/lib/pane-ci/check.sh
-TimeoutStartSec=10min
+TimeoutStartSec=30min
 UNIT
 ln -s /etc/systemd/system/pane-ci-check.service "$disk/etc/systemd/system/multi-user.target.wants/pane-ci-check.service"
 umount "$disk"
@@ -141,7 +151,7 @@ api /actions '{"action_type": "InstanceStart"}'
 echo "booted at $(date -u +%FT%TZ)"
 
 if python3 -I - "$jail/v.sock" "$out" "$PANE_VERSION" "$sleep_sha" "${CLAUDE_CODE_OAUTH_TOKEN:+yes}" <<'PY'
-import base64, calendar, io, json, re, socket, sys, tarfile, time
+import base64, calendar, io, json, re, socket, sys, tarfile, time, urllib.request
 
 vsock, out, pane_version, sleep_sha, have_token = sys.argv[1:6]
 started = time.monotonic()
@@ -199,7 +209,6 @@ if not status:
 check('the guest agent answers status', True)
 print(f'     guest agent ready {time.monotonic() - started:.1f}s after InstanceStart', flush=True)
 print('     status:', json.dumps(status['result']), flush=True)
-check(f'paneVersion is {pane_version}', status['result'].get('paneVersion') == pane_version)
 first = wait_for('a process report arrives on port 1025', 60, lambda: reports('process_report'), every=1)
 if first:
     check(f'a process report arrives on port 1025 ({len(first[0]["processes"])} processes)', True)
@@ -233,10 +242,24 @@ if log:
 
 check('status reports the secrets volume mounted', call('status')['result'].get('secretsVolume') == 'mounted')
 
+# Update Pane: the CI check ran Pane's own update after the checks above.
+with urllib.request.urlopen('https://api.github.com/repos/greenfield-inc/Pane/releases/latest', timeout=30) as answer:
+    latest = json.load(answer)['tag_name'].lstrip('v')
+update = wait_for('the CI check ran runpane update', 1200,
+                  lambda: re.search(r' ci: update (.*)$', bootstrap_log(), re.M), every=15)
+if update:
+    print(f'     runpane update: {update.group(1)[:900]}', flush=True)
+    if latest == pane_version:
+        print(f'skip Update Pane moves the machine to a newer release: the image has the latest, {latest}', flush=True)
+        check(f'the daemon answers on Pane {pane_version}', bool(wait_for('the daemon answers', 300, lambda: call('status')['result']['paneVersion'] == pane_version, every=5)))
+    else:
+        moved = wait_for(f'the daemon answers on Pane {latest}', 300, lambda: call('status')['result']['paneVersion'] == latest, every=5)
+        check(f'Update Pane moved the machine from Pane {pane_version} to {latest} (runpane update, exit {update.group(1).split()[0]})', bool(moved))
+
 relay = wait_for('the Pane daemon has relay pairing ready', 300,
                  lambda: (r := call('status')['result']['relay'])['status'] == 'ready' and r['fingerprint'] and r, every=5)
 if relay:
-    check(f'the Pane daemon has relay pairing ready ({relay["id"]}, {relay["address"]})', len(relay['id']) == 16)
+    check(f'after the update, the Pane daemon has relay pairing ready ({relay["id"]}, {relay["address"]})', len(relay['id']) == 16)
 
 def xmrig():
     for report in reports('process_report'):

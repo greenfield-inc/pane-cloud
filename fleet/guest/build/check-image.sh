@@ -11,6 +11,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=versions.env
 source "$here/versions.env"
 arch="$(dpkg --print-architecture)"
+appimage_sha="PANE_APPIMAGE_SHA256_$arch"
 image="$out/pane-guest-$UBUNTU_RELEASE-pane-$PANE_VERSION-$arch.ext4"
 config="$out/config-$KERNEL_VERSION"
 failures=0
@@ -54,16 +55,18 @@ mount -o loop,ro "$image" "$lower"
 mount -t overlay overlay -o "lowerdir=$lower,upperdir=$work/upper,workdir=$work/work" "$root"
 
 lib=/usr/local/lib/pane-cloud
-for file in $lib/identity.sh $lib/firstboot.sh $lib/secrets-volume.sh $lib/pane-daemon.sh $lib/install-agent-clis.sh $lib/pane_guest_agent.py; do
+for file in $lib/identity.sh $lib/firstboot.sh $lib/secrets-volume.sh $lib/install-agent-clis.sh $lib/pane_guest_agent.py; do
   check "$file is executable" test -x "$lower$file"
 done
-for unit in pane-cloud-identity pane-cloud-firstboot pane-cloud-secrets pane-cloud-daemon pane-guest-agent; do
+for unit in pane-cloud-identity pane-cloud-firstboot pane-cloud-secrets pane-guest-agent; do
   check "$unit.service is enabled" test -L "$lower/etc/systemd/system/multi-user.target.wants/$unit.service"
 done
 for unit in systemd-networkd systemd-networkd-wait-online systemd-resolved; do
   check "$unit.service is masked" test "$(readlink "$lower/etc/systemd/system/$unit.service")" = /dev/null
 done
-check "the daemon drop-in is in place" test -f "$lower/home/pane/.config/systemd/user/pane-remote-daemon.service.d/pane-cloud.conf"
+check "pane's user manager enables the Pane daemon" \
+  test "$(readlink "$lower/home/pane/.config/systemd/user/default.target.wants/pane-remote-daemon.service")" = ../pane-remote-daemon.service
+check "pane's services run AppImages extracted" grep -qx 'APPIMAGE_EXTRACT_AND_RUN=1' "$lower/home/pane/.config/environment.d/50-appimage.conf"
 check "pane is uid 1000" grep -q '^pane:x:1000:1000:' "$lower/etc/passwd"
 check "pane owns /home/pane" test "$(stat -c %u:%g "$lower/home/pane")" = 1000:1000
 check "no ubuntu user" bash -c "! grep -q '^ubuntu:' '$lower/etc/passwd'"
@@ -75,7 +78,11 @@ check "fstab mounts /dev/vda" grep -q '^/dev/vda / ext4' "$lower/etc/fstab"
 check "machine-id is empty" test ! -s "$lower/etc/machine-id"
 check "root is locked" grep -q '^root:!' "$lower/etc/shadow"
 check "no cloud-init" test ! -e "$lower/usr/bin/cloud-init"
-check "Pane is at /opt/Pane/pane" test -x "$lower/opt/Pane/pane"
+check "Pane is the $PANE_VERSION AppImage, pane's own" \
+  test "$(sha256sum <"$lower/home/pane/Applications/Pane.AppImage" | cut -d' ' -f1) $(stat -c %U:%a "$lower/home/pane/Applications/Pane.AppImage")" = "${!appimage_sha} pane:755"
+check "/home/pane/.local/bin/pane is the AppImage" test "$(readlink "$lower/home/pane/.local/bin/pane")" = ../../Applications/Pane.AppImage
+check "no FUSE: pane cannot mount a filesystem root can't read" bash -c "! compgen -G '$lower/usr/bin/fusermount*'"
+check "no /opt/Pane" test ! -e "$lower/opt/Pane"
 check "Node $NODE_VERSION" test "$(chroot "$root" /usr/local/bin/node --version)" = "$NODE_VERSION"
 
 echo "== Pane daemon and guest agent status"
@@ -84,12 +91,12 @@ mount -t sysfs sys "$root/sys"
 mount --bind /dev "$root/dev"
 mount --bind /dev/pts "$root/dev/pts"
 mount -t tmpfs shm "$root/dev/shm"
-# As pane-daemon.sh leaves it: workspaces and the relay on in /home/pane/.pane. The relay certificate
-# comes from Let's Encrypt's staging CA, so checks never spend the limits Pane's users share.
-chroot "$root" runuser -u pane -- sh -c 'mkdir -p /home/pane/.pane && echo "{\"workspaces\":{\"enabled\":true},\"remoteDaemon\":{\"relay\":{\"enabled\":true}}}" >/home/pane/.pane/config.json'
+# As pane-remote-daemon.service runs it, with the image's config.json (workspaces and the relay on).
+# The relay certificate comes from Let's Encrypt's staging CA, so checks never spend the limits Pane's
+# users share.
 chroot "$root" runuser -u pane -- env -i HOME=/home/pane PATH=/usr/local/bin:/usr/bin:/bin ELECTRON_OZONE_PLATFORM_HINT=headless \
-  PANE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory \
-  /opt/Pane/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane >"$work/daemon.log" 2>&1 &
+  APPIMAGE_EXTRACT_AND_RUN=1 NO_CLEANUP=1 PANE_DIR=/home/pane/.pane PANE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory \
+  /home/pane/.local/bin/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane >"$work/daemon.log" 2>&1 &
 for _ in $(seq 1 90); do compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null && break; sleep 1; done
 if ! compgen -G "$root/tmp/pane-daemon-1000-*/daemon.sock" >/dev/null; then
   fail "the Pane daemon opened its control socket"; tail -40 "$work/daemon.log"
@@ -140,6 +147,10 @@ print('     status:', json.dumps(reply))
 result = reply.get('result') or {}
 check('status answers', reply.get('ok') is True)
 check(f'paneVersion is {sys.argv[1]}', result.get('paneVersion') == sys.argv[1])
+# runpane update replaces the file the running Pane names; it refuses anything but a Linux AppImage.
+host = system.pane_daemon_call('/home/pane/.pane', 'runpane:update:host', [])
+check('Pane names its AppImage as its executable, so Update Pane can replace it',
+      host.get('executable') == '/home/pane/Applications/Pane.AppImage', json.dumps(host)[:400])
 relay = result.get('relay') or {}
 check('the relay is on and has a computer id', relay.get('status') not in (None, 'off', 'unreachable') and len(relay.get('id') or '') == 16, json.dumps(relay))
 check('secretsVolume is missing outside a machine', result.get('secretsVolume') == 'missing')
@@ -147,8 +158,9 @@ check('activity counts no agents and no clients',
       {k: result.get('activity', {}).get(k) for k in ('agentsRunning', 'clientsConnected')} == {'agentsRunning': 0, 'clientsConnected': 0})
 
 report = pga.Reporter(pga.Settings(), send=lambda message: None).process_report()
-pane_sha = hashlib.sha256(open('/opt/Pane/pane', 'rb').read()).hexdigest()
-daemons = [p for p in report['processes'] if p['exe'] == '/opt/Pane/pane' and p['uid'] == 1000]
+# The daemon runs from the AppImage's extracted copy in /tmp, a file root can read.
+daemons = [p for p in report['processes'] if (p['exe'] or '').startswith('/tmp/appimage_extracted_') and p['uid'] == 1000]
+pane_sha = daemons and hashlib.sha256(open(daemons[0]['exe'], 'rb').read()).hexdigest()
 print(f"     process report: {len(report['processes'])} processes, {len(json.dumps(report))} bytes")
 check('the process report names the Pane daemon with its program hash', bool(daemons) and all(p['sha256'] == pane_sha for p in daemons),
       json.dumps(daemons[:2]))

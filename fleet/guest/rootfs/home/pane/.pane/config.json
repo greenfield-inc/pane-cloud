@@ -1,0 +1,4 @@
+{
+  "workspaces": { "enabled": true },
+  "remoteDaemon": { "relay": { "enabled": true } }
+}
