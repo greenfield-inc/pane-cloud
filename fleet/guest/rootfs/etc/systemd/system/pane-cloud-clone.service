@@ -1,9 +1,9 @@
 # The Session's first clone (D-107), started as soon as systemd can, beside the Pane daemon: the
 # kernel's ip= argument brought the network up before systemd. The repository comes from the secrets
 # volume, where the host wrote it before launch (pane-cloud/clone.json, root-only); without it there is
-# nothing to clone. A private repository's token is the one-shot unseal's /run/pane-cloud/clone-token,
-# removed when the clone ends well. Once a clone has made its Pane, later boots skip it. retry_clone
-# starts it again after a failure.
+# nothing to clone. A private repository's token is the one-shot unseal's clone-token on the secrets
+# volume. Once the clone has made its Pane, a later boot only resumes the history fetch if a sleep cut it
+# short, and skips the unit once that is done. retry_clone starts it again after a failed clone.
 [Unit]
 Description=Pane Cloud: clone the Session's repository and create its Pane
 DefaultDependencies=no
@@ -13,7 +13,7 @@ After=sysinit.target pane-cloud-secrets.service pane-cloud-identity.service pane
 Conflicts=shutdown.target
 Before=shutdown.target
 ConditionPathExists=/home/pane/.pane-secrets/pane-cloud/clone.json
-ConditionPathExists=!/var/lib/pane-cloud-clone/done
+ConditionPathExists=!/var/lib/pane-cloud-clone/history-done
 
 [Service]
 Type=oneshot
@@ -29,9 +29,9 @@ Environment=PATH=/home/pane/.local/bin:/usr/local/bin:/usr/bin:/bin
 # As root, the guest agent's code: hand pane the request from the host's root-only folder.
 ExecStartPre=+/usr/bin/python3 -I /usr/local/lib/pane-cloud/pane_guest_agent.py copy-clone-request
 ExecStart=/usr/bin/python3 -I /usr/local/lib/pane-cloud/clone.py
-# The token file goes when the history fetch ends; the Pane daemon's own sign-in takes over. After a failure it
-# stays for retry_clone (a network error); /run is gone at the next boot either way.
-ExecStopPost=+/bin/sh -c '[ "$SERVICE_RESULT" != success ] || rm -f /run/pane-cloud/clone-token'
+# The token file goes once the history fetch is done; the Pane daemon's own sign-in takes over. Until then
+# it stays, for retry_clone after a network error and for a history fetch resumed after a sleep.
+ExecStopPost=+/bin/sh -c '[ ! -e /var/lib/pane-cloud-clone/history-done ] || rm -f /home/pane/.pane-secrets/clone-token'
 TimeoutStartSec=infinity
 
 [Install]

@@ -8,15 +8,16 @@ the newest commit of the branch and its files, with submodules the same way. Onc
 daemon are both ready it registers the repo and creates its Pane locally with runpane. Then, at low
 priority, it fetches everything behind that commit: the full history and every branch and tag, so the
 repository ends up as a plain git clone. Every git command signs in through a credential helper given
-on git's command line (git-credential-clone, reading /run/pane-cloud/clone-token), so the token never
-reaches .git/config, the repository, this unit's output or the progress file.
+on git's command line (git-credential-clone, reading clone-token on the secrets volume), so the token
+never reaches .git/config, the repository, this unit's output or the progress file.
 
 Progress goes to /run/pane-cloud-clone/state.json, which the guest agent reports to the host:
   {"state": "cloning" | "creating" | "ready" | "history" | "done" | "failed",
    "repo": "owner/repo", "progress": "<git's last progress line>", "paneId": ..., "error": ...,
    "startedUptime": <guest seconds when the clone started>, "uptime": <guest seconds of this state>}
-A failed clone leaves no clone and no Pane; the guest agent's retry_clone runs this unit again. The Pane's
-id is kept in /var/lib/pane-cloud-clone/done, so a later boot does not clone again.
+A failed clone leaves no clone and no Pane; the guest agent's retry_clone runs this unit again. Once the
+Pane exists, /var/lib/pane-cloud-clone/done holds its id and the clone's folder, so a later boot does not
+clone again: if a sleep cut the history fetch short, it only resumes that, and history-done ends it all.
 Python 3 standard library only.
 """
 
@@ -106,11 +107,13 @@ def clone(url: str, branch: str | None, dest: str, state: State) -> str | None:
 def fetch_history(dest: str, state: State) -> str | None:
     """Everything behind the shallow clone, at the lowest CPU and disk priority: the full history of every
     branch and every tag, then the submodules' history. Afterwards the repository is a plain clone."""
-    error = git(['-C', dest, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*'])
-    error = error or git(['-C', dest, 'fetch', '--progress', '--unshallow', '--tags', 'origin'], state, low_priority=True)
+    error = git(['-C', dest, 'remote', 'set-branches', 'origin', '*'])
+    if not error and subprocess.run([GIT, '-C', dest, 'rev-parse', '--is-shallow-repository'], capture_output=True,
+                                    text=True).stdout.strip() == 'true':
+        error = git(['-C', dest, 'fetch', '--progress', '--unshallow', '--tags', 'origin'], state, low_priority=True)
     return error or git(['-C', dest, 'submodule', 'foreach', '--recursive',
-                         'git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true'],
-                        low_priority=True)
+                         'git remote set-branches origin "*" && { [ "$(git rev-parse --is-shallow-repository)" = false ] '
+                         '|| git fetch --unshallow --tags origin; }'], low_priority=True)
 
 
 def daemon_socket() -> str:
@@ -153,9 +156,28 @@ def create_pane(dest: str, name: str) -> tuple[str | None, str | None]:
     return (pane_id, None) if pane_id else (None, f'runpane panes create: {out.strip()[-1000:]}')
 
 
+def finish_history(dest: str, state: State) -> int:
+    state.set(state='history', progress=None)
+    error = fetch_history(dest, state)
+    if error:
+        state.set(state='done', error=f'Fetching the history: {error}')  # resumes at the next boot
+        return 0
+    open(f'{STATE_DIR}/history-done', 'w').close()
+    state.set(state='done', error=None)
+    return 0
+
+
 def main() -> int:
     with open(REQUEST) as request_file:
         request = json.load(request_file)
+    made = None
+    if os.path.exists(f'{STATE_DIR}/done'):
+        with open(f'{STATE_DIR}/done') as done:
+            made = json.load(done)
+    if made:  # a later boot: the Pane exists, only the history fetch is left
+        state = State(repo_name(request['url']))
+        state.set(state='ready', paneId=made['paneId'])
+        return finish_history(made['dest'], state)
     url, branch = request['url'], request.get('branch') or None
     name = request.get('name') or repo_name(url).split('/')[-1]
     dest = f'{HOME}/{name}'
@@ -179,12 +201,9 @@ def main() -> int:
         state.set(state='failed', error=error)
         return 1
     with open(f'{STATE_DIR}/done', 'w') as done:
-        done.write(pane_id + '\n')
+        json.dump({'paneId': pane_id, 'dest': dest}, done)
     state.set(state='ready', paneId=pane_id)
-    state.set(state='history', progress=None)
-    error = fetch_history(dest, state)
-    state.set(state='done', error=f'Fetching the history: {error}' if error else None)
-    return 0
+    return finish_history(dest, state)
 
 
 if __name__ == '__main__':

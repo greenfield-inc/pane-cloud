@@ -487,7 +487,7 @@ class UnsealTest(unittest.TestCase):
     def setUp(self):
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='pga-unseal-', dir='/tmp'))
         self.addCleanup(shutil.rmtree, self.root)
-        self.settings = Settings(secrets_mount=f'{self.root}/secrets', clone_token=f'{self.root}/run/pane-cloud/clone-token',
+        self.settings = Settings(secrets_mount=f'{self.root}/secrets', clone_token=f'{self.root}/secrets/clone-token',
                                  pane_uid=None)
         os.makedirs(f'{self.root}/secrets/pane-cloud', mode=0o700)
 

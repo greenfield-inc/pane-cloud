@@ -161,8 +161,9 @@ class Settings:
     # The clone unit's progress (state.json); its done marker holds the Pane's id.
     clone_run_dir: str = '/run/pane-cloud-clone'
     clone_state_dir: str = '/var/lib/pane-cloud-clone'
-    # The token the clone and its history fetch read through their credential helper; gone when that ends.
-    clone_token: str = '/run/pane-cloud/clone-token'
+    # The token the clone and its history fetch read through their credential helper, on the secrets
+    # volume so a history fetch a sleep cut short can resume at the next boot; gone when that ends.
+    clone_token: str = '/home/pane/.pane-secrets/clone-token'
     pane_uid: int | None = 1000
 
 
@@ -772,7 +773,7 @@ def unseal_github_token(settings: Settings) -> None:
     {"token", "source", "updatedAt"}) and the slot's private key pane-cloud/seal.key, root-only, on the
     secrets volume. This writes the record unchanged to incoming/github-token.json for the Pane daemon to
     import into K1's store (pane, 0600, in a 0700 folder) and the token alone to the clone's token file
-    in /run (pane, 0600), then deletes both inputs. Nothing sealed (a public repository, a later boot):
+    clone-token beside it on the secrets volume (pane, 0600), then deletes both inputs. Nothing sealed (a public repository, a later boot):
     nothing to do. The token is never logged: errors name the step, never the content.
     """
     sealed_dir = os.path.join(settings.secrets_mount, 'pane-cloud')
@@ -795,7 +796,6 @@ def unseal_github_token(settings: Settings) -> None:
     if settings.pane_uid is not None:
         os.chown(incoming, settings.pane_uid, settings.pane_uid)
     write_private(os.path.join(incoming, 'github-token.json'), plaintext, settings.pane_uid)
-    os.makedirs(os.path.dirname(settings.clone_token), mode=0o755, exist_ok=True)
     write_private(settings.clone_token, record['token'].strip().encode(), settings.pane_uid)
     os.remove(sealed_path)
     os.remove(key_path)

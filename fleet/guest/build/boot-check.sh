@@ -170,7 +170,7 @@ if [ "$boot" = 1 ]; then
     "sealed_gone=$([ -e /home/pane/.pane-secrets/pane-cloud/github-token.sealed ] || [ -e /home/pane/.pane-secrets/pane-cloud/seal.key ] && echo no || echo yes)" \
     "drop=$(stat -c %U:%a "$drop" 2>/dev/null)/$(stat -c %a "$(dirname "$drop")" 2>/dev/null)" \
     "drop_matches=$(grep -cF "$token" "$drop" 2>/dev/null)" \
-    "clone_token_gone=$([ -e /run/pane-cloud/clone-token ] && echo no || echo yes)"
+    "clone_token_gone=$([ -e /home/pane/.pane-secrets/clone-token ] && echo no || echo yes)"
 fi
 say "root $(findmnt -n -o FSTYPE,OPTIONS /) base $(findmnt -n -o SOURCE,OPTIONS /mnt/base) pane $(findmnt -n -o SOURCE,OPTIONS /opt/Pane)"
 
