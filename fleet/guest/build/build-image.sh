@@ -95,7 +95,7 @@ build_rootfs() {
   mount -t sysfs sys "$root/sys"
   mount --bind /dev "$root/dev"
   mount --bind /dev/pts "$root/dev/pts"
-  trap 'umount -l "$work/rootfs/dev/pts" "$work/rootfs/dev" "$work/rootfs/sys" "$work/rootfs/proc" 2>/dev/null || true' EXIT
+  trap 'umount -l "$work/rootfs/dev/shm" "$work/rootfs/dev/pts" "$work/rootfs/dev" "$work/rootfs/sys" "$work/rootfs/proc" 2>/dev/null || true' EXIT
   rm -f "$root/etc/resolv.conf" && cp /etc/resolv.conf "$root/etc/resolv.conf"
   # Services must not start inside the build.
   printf '#!/bin/sh\nexit 101\n' >"$root/usr/sbin/policy-rc.d" && chmod 755 "$root/usr/sbin/policy-rc.d"
@@ -149,6 +149,8 @@ build_rootfs() {
   # (identity.sh) and analytics ids (Pane, on demand); the image keeps no Session, repo or log.
   cp "$root/home/pane/.pane/config.json" "$work/pane-config.json"
   echo '{"workspaces": {"enabled": true}}' >"$root/home/pane/.pane/config.json"
+  # Chromium needs /dev/shm, which the bind of /dev leaves out.
+  mount -t tmpfs -o mode=1777 shm "$root/dev/shm"
   in_root runuser -u pane -- env HOME=/home/pane PANE_DIR=/home/pane/.pane ELECTRON_OZONE_PLATFORM_HINT=headless \
     /opt/Pane/pane --ozone-platform=headless --disable-gpu --daemon-headless --pane-dir /home/pane/.pane >"$work/pane-first-start.log" 2>&1 &
   local waited=0
@@ -158,6 +160,7 @@ build_rootfs() {
   done
   sleep 10  # the skill bundles finish after the socket listens
   stop_image_processes "$root"
+  umount "$root/dev/shm"
   python3 - "$root/home/pane/.pane/config.json" "$work/pane-config.json" <<'PY'
 import json, sys
 config = json.load(open(sys.argv[1]))
